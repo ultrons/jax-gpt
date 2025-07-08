@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JAX-nanoGPT-vLLM Project Plan</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        h1, h2, h3 {
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+            margin-top: 40px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+            vertical-align: top;
+        }
+        th {
+            background-color: #f8f8f8;
+            font-weight: bold;
+        }
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+        code {
+            background-color: #eef;
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        }
+        .phase-objective {
+            font-style: italic;
+            color: #555;
+            margin-top: -10px;
+        }
+        .summary-table th {
+            width: 20%;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Project Plan: JAX-nanoGPT-vLLM</h1>
+    <p>A step-by-step guide to building a GPT model in JAX/Flax NNX, structured for advanced distribution and efficient inference.</p>
+
+    <h2>Phase 1: The Foundational Model (`model.py`)</h2>
+    <p class="phase-objective">Objective: Build a robust, self-contained <code>GPT</code> module that is aware of distribution and KV caching from day one.</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Step</th>
+                <th>Task</th>
+                <th>Description</th>
+                <th>Verification</th>
+                <th>Est. Time</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>1.1</td>
+                <td><strong>Configuration</strong></td>
+                <td>Create the <code>GPTConfig</code> dataclass to hold all model hyperparameters (<code>n_layer</code>, <code>n_head</code>, <code>n_embd</code>, etc.).</td>
+                <td>Instantiate the config object and access its attributes.</td>
+                <td>15-30 mins</td>
+            </tr>
+            <tr>
+                <td>1.2</td>
+                <td><strong>LayerNorm Module</strong></td>
+                <td>Implement a <code>LayerNorm</code> module using <code>nnx.Module</code>.</td>
+                <td>Test its forward pass on a dummy tensor to ensure numerical stability.</td>
+                <td>30-45 mins</td>
+            </tr>
+            <tr>
+                <td>1.3</td>
+                <td><strong>MLP Block</strong></td>
+                <td>Implement the <code>MLP</code> module (<code>Linear</code> -> <code>GELU</code> -> <code>Linear</code> -> <code>Dropout</code>).</td>
+                <td>Test its forward pass on a dummy tensor.</td>
+                <td>30-45 mins</td>
+            </tr>
+            <tr>
+                <td>1.4</td>
+                <td><strong>Causal Self-Attention</strong></td>
+                <td>Implement <code>CausalSelfAttention</code>. Crucially, design its <code>__call__</code> to accept an optional <code>cache</code> argument. If <code>cache</code> is present, it should perform incremental decoding. If not, it computes the full attention mask for training.</td>
+                <td>Test both modes: with and without passing a cache, and check output shapes.</td>
+                <td>2-3 hours</td>
+            </tr>
+            <tr>
+                <td>1.5</td>
+                <td><strong>Transformer Block</strong></td>
+                <td>Combine <code>LayerNorm</code> and <code>CausalSelfAttention</code> into a single <code>Block</code> module with residual connections. The <code>__call__</code> method must also pass the <code>cache</code> argument down to the attention layer.</td>
+                <td>Test its forward pass, checking for correct shapes and residual addition.</td>
+                <td>30 mins</td>
+            </tr>
+            <tr>
+                <td>1.6</td>
+                <td><strong>Vectorized Blocks</strong></td>
+                <td>Use <code>nnx.vmap</code> to create a <code>VmappedBlock</code> that stacks <code>Block</code> <code>n_layer</code> times. This is the key step for enabling future distribution.</td>
+                <td>Instantiate it with <code>length=n_layer</code> and check the parameter shapes to confirm the new "layers" axis.</td>
+                <td>1-2 hours</td>
+            </tr>
+            <tr>
+                <td>1.7</td>
+                <td><strong>GPT Module Assembly</strong></td>
+                <td>Create the main <code>GPT</code> module. In <code>__init__</code>, assemble the embeddings (<code>wte</code>, <code>wpe</code>), the <code>VmappedBlock</code>, and the final <code>LayerNorm</code>.</td>
+                <td>Instantiate the full model without errors.</td>
+                <td>30 mins</td>
+            </tr>
+            <tr>
+                <td>1.8</td>
+                <td><strong>Sequential Forward Pass</strong></td>
+                <td>Implement the <code>GPT.__call__</code> method. Use <code>jax.lax.scan</code> to iterate over the <code>VmappedBlock</code>. This is the correct functional way to handle a sequential chain of layers with residual connections and is compatible with JAX transformations.</td>
+                <td>Test the full forward pass with a dummy input and verify the final output shape.</td>
+                <td>2-3 hours</td>
+            </tr>
+            <tr>
+                <td>1.9</td>
+                <td><strong>Weight Initialization</strong></td>
+                <td>Add a private <code>_init_weights</code> method to the <code>GPT</code> class that correctly initializes all parameters according to GPT-2 conventions and call it from <code>__init__</code>.</td>
+                <td>Inspect parameter values after initialization to ensure they are not all zeros or ones.</td>
+                <td>1 hour</td>
+            </tr>
+            <tr>
+                <td>1.10</td>
+                <td><strong>Inference Method</strong></td>
+                <td>Add the <code>generate(self, idx, ...)</code> method to the <code>GPT</code> class. This method will initialize the KV cache and loop, calling the model's <code>__call__</code> method with the cache at each step. It must handle the JAX random key for sampling.</td>
+                <td>Generate a few tokens from the un-trained model to ensure the loop runs.</td>
+                <td>1.5-2 hours</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2>Phase 2: Training Infrastructure (`train.py`, `utils.py`)</h2>
+    <p class="phase-objective">Objective: Build the scripts and utilities required to train the model, following JAX best practices.</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Step</th>
+                <th>Task</th>
+                <th>Description</th>
+                <th>Verification</th>
+                <th>Est. Time</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>2.1</td>
+                <td><strong>Configuration</strong></td>
+                <td>Add a <code>TrainConfig</code> dataclass to <code>config.py</code> for training hyperparameters (<code>learning_rate</code>, <code>batch_size</code>, etc.).</td>
+                <td>Instantiate the training config object.</td>
+                <td>15 mins</td>
+            </tr>
+            <tr>
+                <td>2.2</td>
+                <td><strong>Data Loading</strong></td>
+                <td>Create a <code>get_batch</code> function in <code>train.py</code> to read tokenized data from a memory-mapped binary file.</td>
+                <td>The function should return batches of the correct shape from <code>train.bin</code> and <code>val.bin</code>.</td>
+                <td>1 hour</td>
+            </tr>
+            <tr>
+                <td>2.3</td>
+                <td><strong>TrainState Definition</strong></td>
+                <td>In <code>utils.py</code>, define a <code>TrainState</code> dataclass to hold the <code>step</code>, <code>model</code>, <code>optimizer</code>, and <code>optimizer_state</code>.</td>
+                <td>Instantiate it with a model and a basic optimizer.</td>
+                <td>30 mins</td>
+            </tr>
+            <tr>
+                <td>2.4</td>
+                <td><strong>Optimizer Definition</strong></td>
+                <td>In <code>utils.py</code>, create a <code>create_optimizer</code> function. This function will implement the logic to separate parameters for weight decay (kernels) from those without (biases, norms) and use <code>optax.multi_transform</code>.</td>
+                <td>The function should return a valid <code>optax</code> optimizer without errors.</td>
+                <td>2-3 hours</td>
+            </tr>
+            <tr>
+                <td>2.5</td>
+                <td><strong>Training Step</strong></td>
+                <td>In <code>train.py</code>, create the <code>@jax.jit</code>-decorated <code>train_step</code> function. It will take the <code>TrainState</code> and a batch, define the loss function internally, and use <code>jax.value_and_grad</code> to get gradients and update the state.</td>
+                <td>Run a single <code>train_step</code> with a dummy batch and see the loss value and updated parameters.</td>
+                <td>2-3 hours</td>
+            </tr>
+            <tr>
+                <td>2.6</td>
+                <td><strong>Evaluation Helper</strong></td>
+                <td>In <code>train.py</code>, create an <code>estimate_loss</code> function to calculate the average loss over multiple batches for the train and validation sets.</td>
+                <td>Run it on the un-trained model; it should return a loss value close to <code>-ln(1/vocab_size)</code>.</td>
+                <td>1 hour</td>
+            </tr>
+            <tr>
+                <td>2.7</td>
+                <td><strong>Checkpointing</strong></td>
+                <td>In <code>train.py</code>, integrate <code>orbax.checkpoint</code> to save and restore the <code>TrainState</code>. This is crucial for long training runs.</td>
+                <td>Save a checkpoint and then load it back successfully, verifying the step number is correct.</td>
+                <td>1-2 hours</td>
+            </tr>
+            <tr>
+                <td>2.8</td>
+                <td><strong>Main Training Loop</strong></td>
+                <td>In <code>train.py</code>, write the main script body that initializes everything and runs the training loop, calling <code>train_step</code>, <code>estimate_loss</code>, and saving checkpoints.</td>
+                <td>Run training for ~100 iterations and see the loss measurably decrease.</td>
+                <td>1 hour</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2>Phase 3: Distribution Strategies (Advanced)</h2>
+    <p class="phase-objective">Objective: Extend the training script to support data and model parallelism on multi-device hardware (TPU/GPU).</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Step</th>
+                <th>Task</th>
+                <th>Description</th>
+                <th>Verification</th>
+                <th>Est. Time</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>3.1</td>
+                <td><strong>Device Mesh</strong></td>
+                <td>In <code>utils.py</code>, create a function to define a <code>jax.sharding.Mesh</code> based on the available devices.</td>
+                <td>The mesh should correctly identify the device topology (e.g., a 1D array of 8 devices).</td>
+                <td>30 mins</td>
+            </tr>
+            <tr>
+                <td>3.2</td>
+                <td><strong>Sharding Rules</strong></td>
+                <td>In <code>utils.py</code>, define sharding rules (<code>PartitionSpec</code>). Create a spec for data parallelism (replicating model, sharding data) and another for model parallelism (sharding the "layers" axis of the <code>VmappedBlock</code>).</td>
+                <td>The partition specs should be valid JAX objects.</td>
+                <td>1-2 hours</td>
+            </tr>
+            <tr>
+                <td>3.3</td>
+                <td><strong>Distributed TrainState</strong></td>
+                <td>Modify the <code>TrainState</code> creation to apply these sharding rules to the initial model parameters and optimizer state using <code>jax.device_put</code>.</td>
+                <td>Inspect the <code>sharding</code> attribute of the JAX arrays in the state to confirm they are sharded.</td>
+                <td>1-2 hours</td>
+            </tr>
+            <tr>
+                <td>3.4</td>
+                <td><strong>Distributed Training</strong></td>
+                <td>The <code>train_step</code> function should now correctly handle distributed inputs and outputs. JAX's <code>jit</code> will automatically use the sharding information from the <code>TrainState</code> to perform the distributed computation.</td>
+                <td>Run training on multiple devices and observe the speedup and device memory usage.</td>
+                <td>1 hour</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2>Phase 4: Application and vLLM-style Inference (Advanced)</h2>
+    <p class="phase-objective">Objective: Use the trained model and implement a more advanced, high-throughput inference strategy.</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Step</th>
+                <th>Task</th>
+                <th>Description</th>
+                <th>Verification</th>
+                <th>Est. Time</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>4.1</td>
+                <td><strong>Data Preparation</strong></td>
+                <td>Create <code>prepare.py</code> by adapting the script from nanoGPT to download and tokenize a dataset (e.g., Shakespeare) using <code>tiktoken</code>.</td>
+                <td>The script should produce <code>train.bin</code> and <code>val.bin</code> files.</td>
+                <td>1 hour</td>
+            </tr>
+            <tr>
+                <td>4.2</td>
+                <td><strong>Basic Sampling</strong></td>
+                <td>Create <code>sample.py</code> to load a trained checkpoint and use the <code>model.generate</code> method to produce text.</td>
+                <td>Generate coherent-looking text from your trained model.</td>
+                <td>1 hour</td>
+            </tr>
+            <tr>
+                <td>4.3</td>
+                <td><strong>PagedAttention (vLLM)</strong></td>
+                <td><strong>(Highly Advanced)</strong> This is a research-level task. The goal is to replace the dense KV cache with a paged memory system. This involves creating a block manager, and a custom attention kernel (likely via JAX's pallas or custom calls) that can read from non-contiguous memory blocks based on a block table.</td>
+                <td>The new attention module should produce numerically identical results to the original attention but with significantly better memory usage for batched inference with varied sequence lengths.</td>
+                <td>10-20+ hours</td>
+            </tr>
+            <tr>
+                <td>4.4</td>
+                <td><strong>Inference Server</strong></td>
+                <td>Create <code>server.py</code>. This will be a simple web server (e.g., using FastAPI) that exposes an endpoint for text generation. It will manage a queue of requests and use the <code>PagedAttention</code> model to serve them in batches for high throughput.</td>
+                <td>Send multiple concurrent requests to the server and receive correct, generated text.</td>
+                <td>2-3 hours</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <hr>
+
+    <h2>Summary Table</h2>
+    <table class="summary-table">
+        <thead>
+            <tr>
+                <th>Phase</th>
+                <th>Objective</th>
+                <th>Total Estimated Time</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Phase 1</strong></td>
+                <td>Core Model Implementation</td>
+                <td>9 - 15 hours</td>
+            </tr>
+            <tr>
+                <td><strong>Phase 2</strong></td>
+                <td>Training Infrastructure</td>
+                <td>8.5 - 13.5 hours</td>
+            </tr>
+            <tr>
+                <td><strong>Phase 3</strong></td>
+                <td>Distribution Strategies</td>
+                <td>3.5 - 5.5 hours</td>
+            </tr>
+            <tr>
+                <td><strong>Phase 4</strong></td>
+                <td>Application & vLLM-style Inference</td>
+                <td>14 - 25+ hours</td>
+            </tr>
+            <tr>
+                <td><strong>Total</strong></td>
+                <td><strong>End-to-End Project</strong></td>
+                <td><strong>~35 - 59+ hours</strong></td>
+            </tr>
+        </tbody>
+    </table>
+
+</body>
+</html>
