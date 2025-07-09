@@ -10,5 +10,6 @@ class GPTConfig:
     d_context: int = 256
     n_head: int = 8
     n_kv_head: int = 8
-    n_layer: int = 4
+    n_layers: int = 4
     use_bias: bool = False
+    dropout: int = 0.2
