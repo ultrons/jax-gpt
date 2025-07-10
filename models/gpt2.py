@@ -1,3 +1,4 @@
+import math
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -137,45 +138,41 @@ class Block(nnx.Module):
         x = x + mlp_output
         return x, updated_cache
 
-# Creating a vmapped block for vectorize block stacking
-VmappedBlock = nnx.vmap(
-    Block,
-    variable_axes={'params': 0},
-    split_rngs={'params': True},
-)
+
 
 # Putting it all together
 class GPT(nnx.Module):
     def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs):
         super().__init__()
         self.config = config
-        self.wte = nnx.Embedding(config.vocab_size, config.d_model, rngs=rngs)
-        self.wpe = nnx.Embedding(config.d_context, config.d_model, rngs=rngs)
-        self.h = VmappedBlock(
-            config,
-            rngs=rngs,
-            length=config.n_layers
-        )
+        self.wte = nnx.Embed(config.vocab_size, config.d_model, rngs=rngs)
+        self.wpe = nnx.Embed(config.d_context, config.d_model, rngs=rngs)
+        self.h = [Block(config, rngs=rngs) for _ in range(config.n_layers)]
         self.drop = nnx.Dropout(config.dropout)
         self.ln_f = LayerNorm(config.d_model, config.use_bias, rngs=rngs)
         self._init_weights(rngs=rngs)
 
-    def __call__(self, x: jax.Array, *, deterministic: bool):
+    def __call__(self, x: jax.Array, *, deterministic: bool, cache: list[KVCache] | None = None):
         B, T = x.shape
         embed = self.wte(x)
-        pos = self.wpe(jnp.arange(T))
+        
+        pos_idx = cache[0].pos if cache is not None else 0
+        pos = self.wpe(jnp.arange(pos_idx, pos_idx + T))
+        
         x = embed + pos
         x = self.drop(x, deterministic=deterministic)
 
-        def layer_fn(carry, block_layer):
-            new_carry, _ = block_layer(carry, deterministic=deterministic, cache=None)
-            return new_carry, None
-
-        x, _ = jax.lax.scan(layer_fn, x, self.h)
+        new_cache = []
+        for i, block in enumerate(self.h):
+            layer_cache = cache[i] if cache is not None else None
+            x, updated_layer_cache = block(x, deterministic=deterministic, cache=layer_cache)
+            if updated_layer_cache is not None:
+                new_cache.append(updated_layer_cache)
 
         x = self.ln_f(x)
         logits = x @ self.wte.embedding.value.T
-        return logits
+        
+        return logits, new_cache if cache is not None else None
 
     def _init_weights(self, *, rngs: nnx.Rngs):
         initializer_fn = jax.nn.initializers.normal(stddev=0.02)
@@ -190,7 +187,7 @@ class GPT(nnx.Module):
             self.wpe.embedding.value.dtype,
         )
         for path, module in self.iter_modules():
-            if is_instance(module, nnx.Linear):
+            if isinstance(module, nnx.Linear):
                 module.kernel.value = initializer_fn(
                     rngs(),
                     module.kernel.value.shape,
@@ -199,8 +196,8 @@ class GPT(nnx.Module):
                 if module.bias is not None:
                     module.bias.value = jax.nn.initializers.zeros(
                         rngs(),
-                        self.config = config
-                        module.bias.value.shape
+                        module.bias.value.shape,
+                        module.bias.value.dtype
                     )
         for block in self.h:
             scaled_initializer = jax.nn.initializers.normal(
@@ -217,8 +214,46 @@ class GPT(nnx.Module):
                 rngs(),
                 mlp_proj_kernel.value.shape,
                 mlp_proj_kernel.value.dtype,
+            )
 
+    def generate(self, idx: jax.Array, new_tokens: int, temperature: float = 1.0, top_k: int | None = None, *, rngs: nnx.Rngs):
+        #1. Initialize KVCache
+        B = idx.shape[0]
+        cache_shape = (B, self.config.d_context, self.config.n_head, self.config.d_head)
+        initial_keys = jnp.zeros((self.config.n_layers, *cache_shape), dtype=jnp.float32)
+        initial_values = jnp.zeros((self.config.n_layers, *cache_shape), dtype=jnp.float32)
+        cache = [
+            KVCache(key=initial_keys[i], value=initial_values[i], pos=0)
+            for i in range(self.config.n_layers)
+        ]
+        #2. Generation Loop
+        for _ in range(new_tokens):
+            # --- A. Crop Context ---
+            # The input to the model should only be the most recent token.
+            # The context is handled by the KV cache.
+            idx_cond = idx[:, -1:]
 
+            # --- B. Forward Pass ---
+            # Call the model with the single token and the cache.
+            logits, cache = self(idx_cond, deterministic=True, cache=cache)
+            # get the logit for the last token
+            logits = logits[:, -1, :] # [B, C]
+            # -- C. Apply temperature
+            logits = logits / temperature
+            # -- D. top_k filtering
+            if top_k is not None:
+                top_k_logits, top_k_indices = jax.lax.top_k(logits, k=top_k)
+                # Create a mask to set the rest to -inf
+                mask = jnp.full_like(logits, -jnp.inf).at[:, top_k_indices].set(top_k_logits)
+                logits = mask
+
+            # -- E. Sample new token
+            key = rngs()
+            idx_next = jax.random.categorical(key, logits, axis=-1)
+            idx_next = idx_next[:, None] #[B, 1] for concatenation
+            idx = jnp.concatenate([idx, idx_next], axis=1)
+
+        return idx
 
 
 
@@ -248,5 +283,3 @@ class GPT(nnx.Module):
 # Step 1.9: Weight Initialization
 # TODO: Implement the _init_weights private method for GPT-2 style initialization.
 
-# Step 1.10: Inference Method
-# TODO: Implement the generate() method for autoregressive text generation.
