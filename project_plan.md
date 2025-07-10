@@ -4,7 +4,7 @@ A step-by-step guide to building a GPT model in JAX/Flax NNX, structured for adv
 
 ## Phase 1: The Foundational Model (`model.py`)
 
-*Objective: Build a robust, self-contained `GPT` module that is aware of distribution and KV caching from day one.*
+*Objective: Build a robust, self-contained `GPT` module that is aware of distribution and KV caching from day one, and verify its correctness against established benchmarks.*
 
 | Step | Task | Description | Verification | Est. Time |
 | :--- | :--- | :--- | :--- | :--- |
@@ -18,6 +18,8 @@ A step-by-step guide to building a GPT model in JAX/Flax NNX, structured for adv
 | 1.8 | **Sequential Forward Pass** | Implement the `GPT.__call__` method. Use `jax.lax.scan` to iterate over the `VmappedBlock`. This is the correct functional way to handle a sequential chain of layers with residual connections and is compatible with JAX transformations. | Test the full forward pass with a dummy input and verify the final output shape. | 2-3 hours |
 | 1.9 | **Weight Initialization** | Add a private `_init_weights` method to the `GPT` class that correctly initializes all parameters according to GPT-2 conventions and call it from `__init__`. | Inspect parameter values after initialization to ensure they are not all zeros or ones. | 1 hour |
 | 1.10| **Inference Method** | Add the `generate(self, idx, ...)` method to the `GPT` class. This method will initialize the KV cache and loop, calling the model's `__call__` method with the cache at each step. It must handle the JAX random key for sampling. | Generate a few tokens from an un-trained model to ensure the loop runs. | 1.5-2 hours |
+| 1.11| **`from_pretrained` Method** | Implement a class method `from_pretrained(model_type)` that downloads GPT-2 weights from Hugging Face and loads them into the JAX model. This will involve mapping Hugging Face parameter names to the JAX model's parameter names. | Load weights for `gpt2` and run the `generate` method to produce coherent text, confirming the weights were loaded correctly. | 2-3 hours |
+| 1.12| **Evaluation Harness** | Integrate a standard evaluation framework like `lm-evaluation-harness`. Create an adapter to make the JAX model compatible with the harness. Phase 1 is complete only when the score is satisfactory. | Successfully run the harness on a benchmark like Hellaswag and get a score comparable to the reference GPT-2 model. | 3-5 hours |
 
 ## Phase 2: Training Infrastructure (`train.py`, `utils.py`)
 
@@ -62,8 +64,8 @@ A step-by-step guide to building a GPT model in JAX/Flax NNX, structured for adv
 
 | Phase | Objective | Total Estimated Time |
 | :--- | :--- | :--- |
-| **Phase 1** | Core Model Implementation | 9 - 15 hours |
+| **Phase 1** | Core Model Implementation | 14 - 23 hours |
 | **Phase 2** | Training Infrastructure | 8.5 - 13.5 hours |
 | **Phase 3** | Distribution Strategies | 3.5 - 5.5 hours |
 | **Phase 4** | Application & vLLM-style Inference | 14 - 25+ hours |
-| **Total** | **End-to-End Project** | **~35 - 59+ hours** |
+| **Total** | **End-to-End Project** | **~40 - 67+ hours** |
