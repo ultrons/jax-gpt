@@ -22,3 +22,6 @@ dist/
 
 # Log files
 *.log
+
+# macOS
+.DS_Store
