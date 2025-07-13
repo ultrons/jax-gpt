@@ -1,15 +1,10 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-import sys
-import os
 from dataclasses import dataclass
 
-# Add the project root to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from models.gpt2 import Block, KVCache
-from models.config import GPTConfig
+from jax_gpt.models.gpt2.model import Block, KVCache
+from jax_gpt.models.gpt2.config import GPTConfig
 
 def test_block_forward_pass():
     """
