@@ -102,7 +102,9 @@ class CausalSelfAttention(nnx.Module):
         att = (q @ k.transpose(0, 1, 3, 2)) * (1.0 / jnp.sqrt(d_head))
         if cache is None: # Apply causal mask only during training/prompt processing
             causal_mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_)).reshape(1, 1, T, T)
-            att = jnp.where(causal_mask == 0, -jnp.inf, att)
+        else:
+            causal_mask = (jnp.arange(self.config.d_context) <= cache.pos).reshape(1,1,1,-1)
+        att = jnp.where(~causal_mask, -jnp.inf, att)
 
         att = jax.nn.softmax(att, axis=-1)
         att = self.attn_dropout(att, deterministic=deterministic)
@@ -111,43 +113,7 @@ class CausalSelfAttention(nnx.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y), deterministic=deterministic)
-        # --- End: Corrected Attention Logic ---
 
-        # # --- Start: Old Incorrect Attention Logic ---
-        # q, k, v = jnp.split(self.c_attn(x), 3, axis=-1)
-        # q = jnp.reshape(q, (B, T, n_head, d_head))
-        # k = jnp.reshape(k, (B, T, n_kv_head, d_head))
-        # v = jnp.reshape(v, (B, T, n_kv_head, d_head))
-
-        # if cache is not None:
-        #     pos = cache.pos
-        #     # Update the cache
-        #     new_key = cache.key.at[:, pos:pos+T, :, : ].set(k)
-        #     new_value = cache.value.at[:, pos:pos+T, :, : ].set(v)
-        #     updated_cache = KVCache(key=new_key, value=new_value, pos=pos+T)
-        #     k, v = new_key, new_value
-        # else:
-        #     updated_cache = None
-
-        # # Attention score
-        # # 'bqhd,bkhd->bhqk'
-        # att = jnp.einsum('bqhd,bkhd->bhqk', q, k)
-        # att = att * (1 / jnp.sqrt(d_head))
-        # # Apply causal mask only if when not using the cache
-        # if cache is None:
-        #     causal_mask = jnp.tril(jnp.ones((T,T))).reshape(1, 1, T, T)
-        #     att = jnp.where(causal_mask == 0, -jnp.inf, att)
-        # att = jax.nn.softmax(att, axis=-1)
-        # att = self.attn_dropout(att, deterministic=deterministic)
-
-        # # Elementwise Multiplication with value projection
-        # #'bhqk,bkhd=>bqhd'
-        # y = jnp.einsum('bhqk,bkhd->bqhd', att, v)
-        # y = y.reshape(B, T, C)
-
-        # y = self.c_proj(y)
-        # y = self.resid_dropout(y, deterministic=deterministic)
-        # # --- End: Old Incorrect Attention Logic ---
         return y, updated_cache
 
 class Block(nnx.Module):
@@ -172,7 +138,7 @@ class Block(nnx.Module):
         if return_activations:
             activations[f"block_{block_idx}_mlp_output_pre_residual"] = mlp_output
         x = x + mlp_output
-        
+
         if return_activations:
             return x, updated_cache, activations
         return x, updated_cache
@@ -286,23 +252,44 @@ class GPT(nnx.Module):
             )
 
     def generate(self, idx: jax.Array, new_tokens: int, temperature: float = 1.0, top_k: int | None = None, *, rngs: nnx.Rngs):
+        # 1. Initialize KVCache
         B = idx.shape[0]
+        cache_shape = (B, self.config.n_head, self.config.d_context, self.config.d_head)
+        initial_keys = jnp.zeros((self.config.n_layers, *cache_shape), dtype=jnp.float32)
+        initial_values = jnp.zeros((self.config.n_layers, *cache_shape), dtype=jnp.float32)
+        cache = [
+            KVCache(key=initial_keys[i], value=initial_values[i], pos=0)
+            for i in range(self.config.n_layers)
+        ]
+
+        # --- 2. Process the prompt and get the first prediction ---
+        # This "warms up" the cache with the prompt context.
+        logits, cache = self(idx, deterministic=True, cache=cache)
+        # Use the logits for the very last token of the prompt to predict the next one.
+        logits = logits[:, -1, :] # [B, C]
+
+        # --- 3. Generation Loop ---
+        # The idx tensor will be built up during the loop.
         for _ in range(new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.shape[1] <= self.config.d_context else idx[:, -self.config.d_context:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond, deterministic=True)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+            # -- A. Apply temperature
+            logits = logits / temperature
+            # -- B. top_k filtering
             if top_k is not None:
                 v, _ = jax.lax.top_k(logits, k=jnp.minimum(top_k, logits.shape[-1]))
                 logits = jnp.where(logits < v[:, [-1]], -jnp.inf, logits)
-            # sample from the distribution
+
+            # -- C. Sample new token
             key = rngs()
             idx_next = jax.random.categorical(key, logits, axis=-1)
-            # append sampled index to the running sequence and continue
-            idx = jnp.concatenate([idx, idx_next[:, None]], axis=1)
+            idx_next = idx_next[:, None] # [B, 1] for concatenation
+
+            # -- D. Append the new token
+            idx = jnp.concatenate([idx, idx_next], axis=1)
+
+            # -- E. Get logits for the *next* token
+            # The input to the model now is only the most recently generated token.
+            logits, cache = self(idx_next, deterministic=True, cache=cache)
+            logits = logits[:, -1, :] # [B, C]
 
         return idx
     @classmethod
