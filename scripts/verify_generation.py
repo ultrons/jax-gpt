@@ -2,8 +2,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 import tiktoken
-from models.gpt2 import GPT
-from models.config import GPTConfig
+from jax_gpt.models.gpt2.model import GPT
+from jax_gpt.models.gpt2.config import GPTConfig
 
 # 1. Load the pre-trained model
 print("Loading pre-trained GPT-2 model...")
