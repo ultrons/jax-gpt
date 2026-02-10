@@ -2,7 +2,7 @@ import math
 from flax import nnx
 import jax
 import jax.numpy as jnp
-from dataclasses import dataclass
+from flax import struct
 
 from .config import GPTConfig
 import torch
@@ -49,7 +49,7 @@ class MLP(nnx.Module):
 # Step 1.4: Causal Self-Attention Module
 # TODO: Implement the CausalSelfAttention nnx.Module.
 # TODO: Ensure the __call__ method accepts an optional 'cache' argument for inference.
-@dataclass
+@struct.dataclass
 class KVCache:
     key: jax.Array
     value: jax.Array
@@ -124,19 +124,19 @@ class Block(nnx.Module):
         self.ln_2 = LayerNorm(config.d_model, config.use_bias, rngs=rngs)
         self.mlp = MLP(config, rngs=rngs)
 
-    def __call__(self, x: jax.Array, *, deterministic: bool = True, cache: KVCache | None = None, block_idx: int, return_activations: bool = False):
+    def __call__(self, x: jax.Array, *, deterministic: bool = True, cache: KVCache | None = None, return_activations: bool = False):
         activations = {}
         ln1_output = self.ln_1(x)
         if return_activations:
-            activations[f"block_{block_idx}_ln1_output"] = ln1_output
+            activations["ln1_output"] = ln1_output
         attn_output , updated_cache = self.attn(ln1_output, deterministic=deterministic, cache=cache)
         if return_activations:
-            activations[f"block_{block_idx}_attn_output_pre_residual"] = attn_output
+            activations["attn_output_pre_residual"] = attn_output
         x = x + attn_output
         mlp_input_for_ln2 = self.ln_2(x)
         mlp_output = self.mlp(mlp_input_for_ln2, deterministic=deterministic)
         if return_activations:
-            activations[f"block_{block_idx}_mlp_output_pre_residual"] = mlp_output
+            activations["mlp_output_pre_residual"] = mlp_output
         x = x + mlp_output
 
         if return_activations:
@@ -152,7 +152,10 @@ class GPT(nnx.Module):
         self.config = config
         self.wte = nnx.Embed(config.vocab_size, config.d_model, rngs=rngs)
         self.wpe = nnx.Embed(config.d_context, config.d_model, rngs=rngs)
-        self.h = [Block(config, rngs=rngs) for _ in range(config.n_layers)]
+        @nnx.vmap(in_axes=(None, None), out_axes=0, axis_size=config.n_layers)
+        def create_blocks(config_arg, rngs_arg):
+            return Block(config_arg, rngs=rngs_arg)
+        self.h = create_blocks(config, rngs)
         self.drop = nnx.Dropout(config.dropout)
         self.ln_f = LayerNorm(config.d_model, config.use_bias, rngs=rngs)
         self.lm_head = nnx.Linear(config.d_model, config.vocab_size, use_bias=False, rngs=rngs)
@@ -160,11 +163,11 @@ class GPT(nnx.Module):
         #self.lm_head.kernel.value = self.wte.embedding.value.T
         self._init_weights(rngs=rngs)
 
-    def __call__(self, x: jax.Array, *, deterministic: bool, cache: list[KVCache] | None = None, return_activations: bool = False):
+    def __call__(self, x: jax.Array, *, deterministic: bool, cache: KVCache | None = None, return_activations: bool = False):
         B, T = x.shape
         tok_emb = self.wte(x) # token embeddings of shape (B, T, C)
 
-        pos_idx = cache[0].pos if cache is not None else 0
+        pos_idx = cache.pos if cache is not None else 0
         pos_emb = self.wpe(jnp.arange(pos_idx, pos_idx + T)) # position embeddings of shape (T, C)
 
         x = tok_emb + pos_emb
@@ -174,16 +177,49 @@ class GPT(nnx.Module):
         if return_activations:
             all_activations["initial_embedding"] = x
 
-        new_cache = []
-        for i, block in enumerate(self.h):
-            layer_cache = cache[i] if cache is not None else None
-            if return_activations:
-                x, updated_layer_cache, block_activations = block(x, deterministic=deterministic, cache=layer_cache, block_idx=i, return_activations=True)
-                all_activations.update(block_activations)
+        if cache is not None:
+            c_k, c_v, c_pos = cache.key, cache.value, cache.pos
+        else:
+            c_k, c_v, c_pos = None, None, None
+
+        if return_activations:
+            if cache is not None:
+                @nnx.scan(in_axes=(nnx.Carry, 0, 0, None, 0), out_axes=(nnx.Carry, 0, 0, 0))
+                def scan_fn_act(x_c, k_c, v_c, det, blocks_):
+                    c_in = KVCache(key=k_c, value=v_c, pos=c_pos)
+                    x_out, c_out, a_out = blocks_(x_c, deterministic=det, cache=c_in, return_activations=True)
+                    return x_out, c_out.key, c_out.value, a_out
+                x, k_out, v_out, a_stacked = scan_fn_act(x, c_k, c_v, deterministic, self.h)
             else:
-                x, updated_layer_cache = block(x, deterministic=deterministic, cache=layer_cache, block_idx=i)
-            if updated_layer_cache is not None:
-                new_cache.append(updated_layer_cache)
+                @nnx.scan(in_axes=(nnx.Carry, None, 0), out_axes=(nnx.Carry, 0))
+                def scan_fn_act_no_cache(x_c, det, blocks_):
+                    x_out, c_out, a_out = blocks_(x_c, deterministic=det, cache=None, return_activations=True)
+                    return x_out, a_out
+                x, a_stacked = scan_fn_act_no_cache(x, deterministic, self.h)
+                k_out, v_out = None, None
+            for k_act, v_act in a_stacked.items():
+                for i_layer in range(self.config.n_layers):
+                    all_activations[f"block_{i_layer}_{k_act}"] = v_act[i_layer]
+        else:
+            if cache is not None:
+                @nnx.scan(in_axes=(nnx.Carry, 0, 0, None, 0), out_axes=(nnx.Carry, 0, 0))
+                def scan_fn(x_c, k_c, v_c, det, blocks_):
+                    c_in = KVCache(key=k_c, value=v_c, pos=c_pos)
+                    x_out, c_out = blocks_(x_c, deterministic=det, cache=c_in)
+                    return x_out, c_out.key, c_out.value
+                x, k_out, v_out = scan_fn(x, c_k, c_v, deterministic, self.h)
+            else:
+                @nnx.scan(in_axes=(nnx.Carry, None, 0), out_axes=nnx.Carry)
+                def scan_fn_no_cache(x_c, det, blocks_):
+                    x_out, c_out = blocks_(x_c, deterministic=det, cache=None)
+                    return x_out
+                x = scan_fn_no_cache(x, deterministic, self.h)
+                k_out, v_out = None, None
+        
+        if cache is not None:
+            new_cache = KVCache(key=k_out, value=v_out, pos=cache.pos + x.shape[1])
+        else:
+            new_cache = None
 
         x = self.ln_f(x)
         if return_activations:
@@ -194,8 +230,8 @@ class GPT(nnx.Module):
             all_activations["final_logits"] = logits
 
         if return_activations:
-            return logits, new_cache if cache is not None else None, all_activations
-        return logits, new_cache if cache is not None else None
+            return logits, new_cache, all_activations
+        return logits, new_cache
 
     def _init_weights(self, *, rngs: nnx.Rngs):
         initializer_fn = jax.nn.initializers.normal(stddev=0.02)
@@ -234,22 +270,21 @@ class GPT(nnx.Module):
                         module.layer_norm.bias.value.shape,
                         module.layer_norm.bias.value.dtype
                     )
-        for block in self.h:
-            scaled_initializer = jax.nn.initializers.normal(
-                stddev = 0.02 / math.sqrt(2 * self.config.n_layers)
-            )
-            attn_proj_kernel = block.attn.c_proj.kernel
-            attn_proj_kernel.value = scaled_initializer(
-                rngs(),
-                attn_proj_kernel.value.shape,
-                attn_proj_kernel.value.dtype,
-            )
-            mlp_proj_kernel = block.mlp.c_proj.kernel
-            mlp_proj_kernel.value = scaled_initializer(
-                rngs(),
-                mlp_proj_kernel.value.shape,
-                mlp_proj_kernel.value.dtype,
-            )
+        scaled_initializer = jax.nn.initializers.normal(
+            stddev = 0.02 / math.sqrt(2 * self.config.n_layers)
+        )
+        attn_proj_kernel = self.h.attn.c_proj.kernel
+        attn_proj_kernel.value = scaled_initializer(
+            rngs(),
+            attn_proj_kernel.value.shape,
+            attn_proj_kernel.value.dtype,
+        )
+        mlp_proj_kernel = self.h.mlp.c_proj.kernel
+        mlp_proj_kernel.value = scaled_initializer(
+            rngs(),
+            mlp_proj_kernel.value.shape,
+            mlp_proj_kernel.value.dtype,
+        )
 
     def generate(self, idx: jax.Array, new_tokens: int, temperature: float = 1.0, top_k: int | None = None, *, rngs: nnx.Rngs):
         # 1. Initialize KVCache
@@ -257,10 +292,7 @@ class GPT(nnx.Module):
         cache_shape = (B, self.config.n_head, self.config.d_context, self.config.d_head)
         initial_keys = jnp.zeros((self.config.n_layers, *cache_shape), dtype=jnp.float32)
         initial_values = jnp.zeros((self.config.n_layers, *cache_shape), dtype=jnp.float32)
-        cache = [
-            KVCache(key=initial_keys[i], value=initial_values[i], pos=0)
-            for i in range(self.config.n_layers)
-        ]
+        cache = KVCache(key=initial_keys, value=initial_values, pos=0)
 
         # --- 2. Process the prompt and get the first prediction ---
         # This "warms up" the cache with the prompt context.
@@ -318,19 +350,18 @@ class GPT(nnx.Module):
         model.wte.embedding.value = jnp.asarray(wte_hf)
         model.wpe.embedding.value = jnp.asarray(sd_hf['transformer.wpe.weight'])
 
-        for i in range(config.n_layers):
-            model.h[i].ln_1.layer_norm.scale.value = jnp.asarray(sd_hf[f'transformer.h.{i}.ln_1.weight'])
-            model.h[i].ln_1.layer_norm.bias.value = jnp.asarray(sd_hf[f'transformer.h.{i}.ln_1.bias'])
-            model.h[i].attn.c_attn.kernel.value = jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_attn.weight'])
-            model.h[i].attn.c_attn.bias.value = jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_attn.bias'])
-            model.h[i].attn.c_proj.kernel.value = jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_proj.weight'])
-            model.h[i].attn.c_proj.bias.value = jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_proj.bias'])
-            model.h[i].ln_2.layer_norm.scale.value = jnp.asarray(sd_hf[f'transformer.h.{i}.ln_2.weight'])
-            model.h[i].ln_2.layer_norm.bias.value = jnp.asarray(sd_hf[f'transformer.h.{i}.ln_2.bias'])
-            model.h[i].mlp.c_fc.kernel.value = jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_fc.weight'])
-            model.h[i].mlp.c_fc.bias.value = jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_fc.bias'])
-            model.h[i].mlp.c_proj.kernel.value = jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_proj.weight'])
-            model.h[i].mlp.c_proj.bias.value = jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_proj.bias'])
+        model.h.ln_1.layer_norm.scale.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_1.weight']) for i in range(config.n_layers)])
+        model.h.ln_1.layer_norm.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_1.bias']) for i in range(config.n_layers)])
+        model.h.attn.c_attn.kernel.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_attn.weight']) for i in range(config.n_layers)])
+        model.h.attn.c_attn.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_attn.bias']) for i in range(config.n_layers)])
+        model.h.attn.c_proj.kernel.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_proj.weight']) for i in range(config.n_layers)])
+        model.h.attn.c_proj.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_proj.bias']) for i in range(config.n_layers)])
+        model.h.ln_2.layer_norm.scale.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_2.weight']) for i in range(config.n_layers)])
+        model.h.ln_2.layer_norm.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_2.bias']) for i in range(config.n_layers)])
+        model.h.mlp.c_fc.kernel.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_fc.weight']) for i in range(config.n_layers)])
+        model.h.mlp.c_fc.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_fc.bias']) for i in range(config.n_layers)])
+        model.h.mlp.c_proj.kernel.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_proj.weight']) for i in range(config.n_layers)])
+        model.h.mlp.c_proj.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_proj.bias']) for i in range(config.n_layers)])
 
         model.ln_f.layer_norm.scale.value = jnp.asarray(sd_hf['transformer.ln_f.weight'])
         model.ln_f.layer_norm.bias.value = jnp.asarray(sd_hf['transformer.ln_f.bias'])
