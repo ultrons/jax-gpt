@@ -65,14 +65,11 @@ def test_gpt_model_sanity():
     # --- 3. Inference Forward Pass (Single Step) ---
     print("\nTesting Single-Step Inference Pass...")
     try:
-        # Initialize an empty cache
-        cache_shape = (B, config.d_context, config.n_head, config.d_head)
+        # Initialize a stacked KVCache (n_layers leading axis)
+        cache_shape = (B, config.n_head, config.d_context, config.d_head)
         initial_keys = jnp.zeros((config.n_layers, *cache_shape), dtype=jnp.float32)
         initial_values = jnp.zeros((config.n_layers, *cache_shape), dtype=jnp.float32)
-        initial_cache = [
-            KVCache(key=initial_keys[i], value=initial_values[i], pos=0)
-            for i in range(config.n_layers)
-        ]
+        initial_cache = KVCache(key=initial_keys, value=initial_values, pos=0)
 
         single_token_input = dummy_input[:, :1]
         logits, updated_cache = model(single_token_input, deterministic=True, cache=initial_cache)
@@ -82,7 +79,7 @@ def test_gpt_model_sanity():
         print(f"✅ Single-token inference produced correct logit shape: {logits.shape}")
 
         assert updated_cache is not None, "Updated cache should not be None"
-        assert updated_cache[0].pos == 1, f"Expected updated cache position to be 1, got {updated_cache[0].pos}"
+        assert updated_cache.pos == 1, f"Expected updated cache position to be 1, got {updated_cache.pos}"
         print("✅ Cache position was correctly updated.")
 
     except Exception as e:
