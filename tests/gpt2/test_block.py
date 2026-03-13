@@ -23,7 +23,7 @@ def test_block_forward_pass():
         d_context=256,
         n_head=4,
         n_kv_head=4,
-        n_layer=2,
+        n_layers=2,
         use_bias=True,
         dropout=0.1
     )

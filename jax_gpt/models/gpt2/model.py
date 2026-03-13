@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import math
+from typing import TYPE_CHECKING
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -8,6 +11,16 @@ from .config import GPTConfig
 import torch
 from transformers import GPT2LMHeadModel
 # Phase 1: The Foundational Model
+
+if TYPE_CHECKING:
+    from jax_gpt.trainer.sharding import activation_sharding_constraint
+
+
+def _sharding_constraint(x, spec, mesh):
+    if mesh is None:
+        return x
+    from jax_gpt.trainer.sharding import activation_sharding_constraint
+    return activation_sharding_constraint(x, spec, mesh)
 
 # Step 1.2: LayerNorm Module
 # TODO: Implement the LayerNorm nnx.Module.
@@ -40,9 +53,12 @@ class MLP(nnx.Module):
         )
         self.dropout = nnx.Dropout(config.dropout)
 
-    def __call__(self, x: jax.Array, *, deterministic: bool):
+    def __call__(self, x: jax.Array, *, deterministic: bool, mesh=None):
+        from jax.sharding import PartitionSpec as P
         x = self.c_fc(x)
         x = jax.nn.gelu(x)
+        # TP: shard d_ff dimension; allreduce happens at c_proj (row-parallel)
+        x = _sharding_constraint(x, P('dp', None, 'tp'), mesh)
         x = self.c_proj(x)
         return self.dropout(x, deterministic=deterministic)
 
@@ -74,7 +90,8 @@ class CausalSelfAttention(nnx.Module):
         self.resid_dropout = nnx.Dropout(config.dropout)
         self.config = config
 
-    def __call__(self, x: jax.Array, *, deterministic: bool, cache: KVCache | None = None):
+    def __call__(self, x: jax.Array, *, deterministic: bool, cache: KVCache | None = None, mesh=None):
+        from jax.sharding import PartitionSpec as P
         B, T, C = x.shape
         d_head = self.config.d_head
         n_head = self.config.n_head
@@ -86,6 +103,10 @@ class CausalSelfAttention(nnx.Module):
         q = q.reshape(B, T, n_head, d_head).transpose(0, 2, 1, 3) # (B, n_head, T, d_head)
         k = k.reshape(B, T, n_kv_head, d_head).transpose(0, 2, 1, 3) # (B, n_head, T, d_head)
         v = v.reshape(B, T, n_kv_head, d_head).transpose(0, 2, 1, 3) # (B, n_head, T, d_head)
+        # SP: shard sequence dimension over 'sp' axis
+        q = _sharding_constraint(q, P('dp', 'tp', 'sp', None), mesh)
+        k = _sharding_constraint(k, P('dp', 'tp', 'sp', None), mesh)
+        v = _sharding_constraint(v, P('dp', 'tp', 'sp', None), mesh)
 
         if cache is not None:
             # The cache logic needs to be updated to match the new tensor shapes
@@ -124,17 +145,17 @@ class Block(nnx.Module):
         self.ln_2 = LayerNorm(config.d_model, config.use_bias, rngs=rngs)
         self.mlp = MLP(config, rngs=rngs)
 
-    def __call__(self, x: jax.Array, *, deterministic: bool = True, cache: KVCache | None = None, return_activations: bool = False):
+    def __call__(self, x: jax.Array, *, deterministic: bool = True, cache: KVCache | None = None, return_activations: bool = False, mesh=None):
         activations = {}
         ln1_output = self.ln_1(x)
         if return_activations:
             activations["ln1_output"] = ln1_output
-        attn_output , updated_cache = self.attn(ln1_output, deterministic=deterministic, cache=cache)
+        attn_output, updated_cache = self.attn(ln1_output, deterministic=deterministic, cache=cache, mesh=mesh)
         if return_activations:
             activations["attn_output_pre_residual"] = attn_output
         x = x + attn_output
         mlp_input_for_ln2 = self.ln_2(x)
-        mlp_output = self.mlp(mlp_input_for_ln2, deterministic=deterministic)
+        mlp_output = self.mlp(mlp_input_for_ln2, deterministic=deterministic, mesh=mesh)
         if return_activations:
             activations["mlp_output_pre_residual"] = mlp_output
         x = x + mlp_output
@@ -152,10 +173,11 @@ class GPT(nnx.Module):
         self.config = config
         self.wte = nnx.Embed(config.vocab_size, config.d_model, rngs=rngs)
         self.wpe = nnx.Embed(config.d_context, config.d_model, rngs=rngs)
-        @nnx.vmap(in_axes=(None, None), out_axes=0, axis_size=config.n_layers)
         def create_blocks(config_arg, rngs_arg):
             return Block(config_arg, rngs=rngs_arg)
-        self.h = create_blocks(config, rngs)
+        self.h = nnx.vmap(
+            create_blocks, in_axes=(None, None), out_axes=0, axis_size=config.n_layers
+        )(config, rngs)
         self.drop = nnx.Dropout(config.dropout)
         self.ln_f = LayerNorm(config.d_model, config.use_bias, rngs=rngs)
         self.lm_head = nnx.Linear(config.d_model, config.vocab_size, use_bias=False, rngs=rngs)
@@ -163,7 +185,7 @@ class GPT(nnx.Module):
         #self.lm_head.kernel.value = self.wte.embedding.value.T
         self._init_weights(rngs=rngs)
 
-    def __call__(self, x: jax.Array, *, deterministic: bool, cache: KVCache | None = None, return_activations: bool = False):
+    def __call__(self, x: jax.Array, *, deterministic: bool, cache: KVCache | None = None, return_activations: bool = False, mesh=None):
         B, T = x.shape
         tok_emb = self.wte(x) # token embeddings of shape (B, T, C)
 
@@ -182,38 +204,53 @@ class GPT(nnx.Module):
         else:
             c_k, c_v, c_pos = None, None, None
 
+        # mesh is captured as a closure variable (Python object, not JAX array)
+        _mesh = mesh
+
+        # nnx.scan flax 0.8.5 API: nnx.scan(f, in_axes=..., carry_argnum=0, scan_output=...)
+        # carry_argnum=0 → first arg is carry (no nnx.Carry sentinel needed)
+        # in_axes tuple length = number of non-carry args
+        # scan_output=False → function returns only carry (no stacked output)
+
+        # deterministic and _mesh are Python values captured via closure —
+        # they must NOT be passed as scan args (would become traced JAX arrays).
+
         if return_activations:
             if cache is not None:
-                @nnx.scan(in_axes=(nnx.Carry, 0, 0, None, 0), out_axes=(nnx.Carry, 0, 0, 0))
-                def scan_fn_act(x_c, k_c, v_c, det, blocks_):
+                def _scan_act(x_c, k_c, v_c, blocks_):
                     c_in = KVCache(key=k_c, value=v_c, pos=c_pos)
-                    x_out, c_out, a_out = blocks_(x_c, deterministic=det, cache=c_in, return_activations=True)
-                    return x_out, c_out.key, c_out.value, a_out
-                x, k_out, v_out, a_stacked = scan_fn_act(x, c_k, c_v, deterministic, self.h)
+                    x_out, c_out, a_out = blocks_(x_c, deterministic=deterministic, cache=c_in, return_activations=True, mesh=_mesh)
+                    return x_out, (c_out.key, c_out.value, a_out)
+                x, (k_out, v_out, a_stacked) = nnx.scan(
+                    _scan_act, in_axes=(None, 0, 0, 0), carry_argnum=0
+                )(x, c_k, c_v, self.h)
             else:
-                @nnx.scan(in_axes=(nnx.Carry, None, 0), out_axes=(nnx.Carry, 0))
-                def scan_fn_act_no_cache(x_c, det, blocks_):
-                    x_out, c_out, a_out = blocks_(x_c, deterministic=det, cache=None, return_activations=True)
+                def _scan_act_no_cache(x_c, blocks_):
+                    x_out, _, a_out = blocks_(x_c, deterministic=deterministic, cache=None, return_activations=True, mesh=_mesh)
                     return x_out, a_out
-                x, a_stacked = scan_fn_act_no_cache(x, deterministic, self.h)
+                x, a_stacked = nnx.scan(
+                    _scan_act_no_cache, in_axes=(None, 0), carry_argnum=0
+                )(x, self.h)
                 k_out, v_out = None, None
             for k_act, v_act in a_stacked.items():
                 for i_layer in range(self.config.n_layers):
                     all_activations[f"block_{i_layer}_{k_act}"] = v_act[i_layer]
         else:
             if cache is not None:
-                @nnx.scan(in_axes=(nnx.Carry, 0, 0, None, 0), out_axes=(nnx.Carry, 0, 0))
-                def scan_fn(x_c, k_c, v_c, det, blocks_):
+                def _scan(x_c, k_c, v_c, blocks_):
                     c_in = KVCache(key=k_c, value=v_c, pos=c_pos)
-                    x_out, c_out = blocks_(x_c, deterministic=det, cache=c_in)
-                    return x_out, c_out.key, c_out.value
-                x, k_out, v_out = scan_fn(x, c_k, c_v, deterministic, self.h)
+                    x_out, c_out = blocks_(x_c, deterministic=deterministic, cache=c_in, mesh=_mesh)
+                    return x_out, (c_out.key, c_out.value)
+                x, (k_out, v_out) = nnx.scan(
+                    _scan, in_axes=(None, 0, 0, 0), carry_argnum=0
+                )(x, c_k, c_v, self.h)
             else:
-                @nnx.scan(in_axes=(nnx.Carry, None, 0), out_axes=nnx.Carry)
-                def scan_fn_no_cache(x_c, det, blocks_):
-                    x_out, c_out = blocks_(x_c, deterministic=det, cache=None)
+                def _scan_no_cache(x_c, blocks_):
+                    x_out, _ = blocks_(x_c, deterministic=deterministic, cache=None, mesh=_mesh)
                     return x_out
-                x = scan_fn_no_cache(x, deterministic, self.h)
+                x = nnx.scan(
+                    _scan_no_cache, in_axes=(None, 0), carry_argnum=0, scan_output=False
+                )(x, self.h)
                 k_out, v_out = None, None
         
         if cache is not None:
@@ -252,7 +289,7 @@ class GPT(nnx.Module):
                     module.kernel.value.shape,
                     module.kernel.value.dtype,
                 )
-                if module.bias is not None:
+                if module.bias.value is not None:
                     module.bias.value = jax.nn.initializers.zeros(
                         rngs(),
                         module.bias.value.shape,
@@ -264,7 +301,7 @@ class GPT(nnx.Module):
                     module.layer_norm.scale.value.shape,
                     module.layer_norm.scale.value.dtype,
                 )
-                if module.layer_norm.bias is not None:
+                if module.layer_norm.bias is not None and module.layer_norm.bias.value is not None:
                     module.layer_norm.bias.value = jax.nn.initializers.zeros(
                         rngs(),
                         module.layer_norm.bias.value.shape,
