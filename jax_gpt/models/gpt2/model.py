@@ -122,11 +122,12 @@ class CausalSelfAttention(nnx.Module):
         v = _sharding_constraint(v, P('dp', 'tp', 'sp', None), mesh)
 
         if cache is not None:
-            # The cache logic needs to be updated to match the new tensor shapes
             pos = cache.pos
             # The cache shape is (B, n_head, d_context, d_head)
-            new_key = cache.key.at[:, :, pos:pos+T, :].set(k)
-            new_value = cache.value.at[:, :, pos:pos+T, :].set(v)
+            # Use dynamic_update_slice so pos can be a traced value (e.g. inside lax.scan).
+            # Static slicing (cache.key.at[:,:,pos:pos+T,:].set(k)) fails when pos is traced.
+            new_key = jax.lax.dynamic_update_slice(cache.key, k, (0, 0, pos, 0))
+            new_value = jax.lax.dynamic_update_slice(cache.value, v, (0, 0, pos, 0))
             updated_cache = KVCache(key=new_key, value=new_value, pos=pos+T)
             k, v = new_key, new_value
         else:
@@ -215,7 +216,10 @@ class GPT(nnx.Module):
         tok_emb = self.wte(x) # token embeddings of shape (B, T, C)
 
         pos_idx = cache.pos if cache is not None else 0
-        pos_emb = self.wpe(jnp.arange(pos_idx, pos_idx + T)) # position embeddings of shape (T, C)
+        # Use arange(T) + offset so pos_idx can be a traced value (e.g. inside lax.scan).
+        # jnp.arange(start, stop) requires concrete args, but arange(T) is fine
+        # since T is a static Python int (from x.shape).
+        pos_emb = self.wpe(jnp.arange(T) + pos_idx) # position embeddings of shape (T, C)
 
         x = tok_emb + pos_emb
         x = self.drop(x, deterministic=True)
