@@ -9,7 +9,8 @@ from jax_gpt.models.gpt2.config import GPTConfig
 from jax_gpt.models.gpt2.model import GPT
 from jax_gpt.trainer.config import TrainConfig
 from jax_gpt.trainer.train_state import create_train_state
-from jax_gpt.trainer.sharding import make_mesh, shard_train_state
+from jax_gpt.trainer.sharding import make_mesh, shard_train_state, logical_to_physical
+from jax.sharding import PartitionSpec as P
 import optax
 
 
@@ -48,6 +49,60 @@ def test_unsharded_equals_trivially_sharded():
     np.testing.assert_allclose(
         np.array(logits_ref), np.array(logits_sharded), rtol=1e-5
     )
+
+
+def test_logical_specs_extracted_correctly():
+    """Verify that nnx.with_partitioning annotations produce expected logical specs."""
+    cfg = tiny_config()
+    model = GPT(cfg, rngs=nnx.Rngs(0))
+
+    params = nnx.state(model, nnx.Param)
+    logical_specs = nnx.get_partition_spec(params)
+
+    # Collect (name, logical_spec, ndim) tuples
+    results = {}
+    def collect(path, leaf, spec):
+        name = '.'.join(
+            str(k).strip("[].'\"") for k in path
+            if str(k).strip("[].'\"") not in ('raw_value', 'value')
+        )
+        if isinstance(spec, P):
+            results[name] = (spec, leaf.ndim)
+        return leaf
+    jax.tree_util.tree_map_with_path(collect, params, logical_specs)
+
+    # Check logical annotations
+    assert results['wte.embedding'][0] == P('vocab', 'embed')
+    assert results['wpe.embedding'][0] == P('context', 'embed')
+    assert results['h.attn.c_attn.kernel'][0] == P('embed', 'joined_heads')
+    assert results['h.attn.c_attn.bias'][0] == P('joined_heads',)
+    assert results['h.attn.c_proj.kernel'][0] == P('heads', 'embed')
+    assert results['h.attn.c_proj.bias'][0] == P('embed',)
+    assert results['h.mlp.c_fc.kernel'][0] == P('embed', 'mlp')
+    assert results['h.mlp.c_fc.bias'][0] == P('mlp',)
+    assert results['h.mlp.c_proj.kernel'][0] == P('mlp', 'embed')
+    assert results['h.mlp.c_proj.bias'][0] == P('embed',)
+    assert results['h.ln_1.layer_norm.scale'][0] == P('embed',)
+    assert results['h.ln_2.layer_norm.scale'][0] == P('embed',)
+    assert results['ln_f.layer_norm.scale'][0] == P('embed',)
+    assert results['lm_head.kernel'][0] == P('embed', 'vocab')
+
+    # Check logical→physical mapping for vmapped params (ndim=3, spec len=2)
+    spec, ndim = results['h.attn.c_attn.kernel']
+    assert logical_to_physical(spec, ndim) == P(None, None, 'tp')
+
+    spec, ndim = results['h.attn.c_proj.kernel']
+    assert logical_to_physical(spec, ndim) == P(None, 'tp', None)
+
+    spec, ndim = results['h.mlp.c_fc.kernel']
+    assert logical_to_physical(spec, ndim) == P(None, None, 'tp')
+
+    # Check non-vmapped params
+    spec, ndim = results['wte.embedding']
+    assert logical_to_physical(spec, ndim) == P('tp', None)
+
+    spec, ndim = results['ln_f.layer_norm.scale']
+    assert logical_to_physical(spec, ndim) == P(None,)
 
 
 @pytest.mark.skipif(
