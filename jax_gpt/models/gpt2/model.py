@@ -22,15 +22,29 @@ def _sharding_constraint(x, spec, mesh):
     from jax_gpt.trainer.sharding import activation_sharding_constraint
     return activation_sharding_constraint(x, spec, mesh)
 
+
+def _partitioned(initializer, sharding, mesh=None):
+    """Wrap initializer with nnx.with_partitioning, passing mesh for newer Flax.
+
+    Newer Flax (post-FLIP 4844) eagerly applies sharding at variable creation
+    time, which requires a mesh. Older Flax just stores sharding as metadata.
+    Passing mesh=None works on older Flax; passing an explicit mesh works on
+    both old and new.
+    """
+    kwargs = {'sharding': sharding}
+    if mesh is not None:
+        kwargs['mesh'] = mesh
+    return nnx.with_partitioning(initializer, **kwargs)
+
 # Step 1.2: LayerNorm Module
 # TODO: Implement the LayerNorm nnx.Module.
 class LayerNorm(nnx.Module):
-    def __init__(self, num_features: int, use_bias: bool, *, rngs: nnx.Rngs):
+    def __init__(self, num_features: int, use_bias: bool, *, rngs: nnx.Rngs, init_mesh=None):
         super().__init__()
         self.layer_norm = nnx.LayerNorm(
             num_features, use_bias=use_bias, epsilon=1e-5,
-            scale_init=nnx.with_partitioning(nnx.initializers.ones, sharding=('embed',)),
-            bias_init=nnx.with_partitioning(nnx.initializers.zeros, sharding=('embed',)),
+            scale_init=_partitioned(nnx.initializers.ones, ('embed',), init_mesh),
+            bias_init=_partitioned(nnx.initializers.zeros, ('embed',), init_mesh),
             rngs=rngs,
         )
 
@@ -40,15 +54,15 @@ class LayerNorm(nnx.Module):
 # Step 1.3: MLP Block
 # TODO: Implement the MLP nnx.Module.
 class MLP(nnx.Module):
-    def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs):
+    def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs, init_mesh=None):
         super().__init__()
         # Expansion layer weights
         self.c_fc = nnx.Linear(
             in_features=config.d_model,
             out_features=config.d_ff,
             use_bias=config.use_bias,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), sharding=('embed', 'mlp')),
-            bias_init=nnx.with_partitioning(nnx.initializers.zeros, sharding=('mlp',)),
+            kernel_init=_partitioned(nnx.initializers.lecun_normal(), ('embed', 'mlp'), init_mesh),
+            bias_init=_partitioned(nnx.initializers.zeros, ('mlp',), init_mesh),
             rngs=rngs,
         )
         # Contraction layer weights
@@ -56,8 +70,8 @@ class MLP(nnx.Module):
             in_features=config.d_ff,
             out_features=config.d_model,
             use_bias=config.use_bias,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), sharding=('mlp', 'embed')),
-            bias_init=nnx.with_partitioning(nnx.initializers.zeros, sharding=('embed',)),
+            kernel_init=_partitioned(nnx.initializers.lecun_normal(), ('mlp', 'embed'), init_mesh),
+            bias_init=_partitioned(nnx.initializers.zeros, ('embed',), init_mesh),
             rngs=rngs,
         )
         self.dropout = nnx.Dropout(config.dropout)
@@ -81,22 +95,22 @@ class KVCache:
     pos: int = 0
 
 class CausalSelfAttention(nnx.Module):
-    def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs):
+    def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs, init_mesh=None):
         super().__init__()
         self.c_attn = nnx.Linear(
             in_features=config.d_model,
             out_features=3 * config.d_model,
             use_bias=config.use_bias,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), sharding=('embed', 'joined_heads')),
-            bias_init=nnx.with_partitioning(nnx.initializers.zeros, sharding=('joined_heads',)),
+            kernel_init=_partitioned(nnx.initializers.lecun_normal(), ('embed', 'joined_heads'), init_mesh),
+            bias_init=_partitioned(nnx.initializers.zeros, ('joined_heads',), init_mesh),
             rngs=rngs,
         )
         self.c_proj = nnx.Linear(
             in_features=config.d_model,
             out_features=config.d_model,
             use_bias=config.use_bias,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), sharding=('heads', 'embed')),
-            bias_init=nnx.with_partitioning(nnx.initializers.zeros, sharding=('embed',)),
+            kernel_init=_partitioned(nnx.initializers.lecun_normal(), ('heads', 'embed'), init_mesh),
+            bias_init=_partitioned(nnx.initializers.zeros, ('embed',), init_mesh),
             rngs=rngs,
         )
         self.attn_dropout = nnx.Dropout(config.dropout)
@@ -152,12 +166,12 @@ class CausalSelfAttention(nnx.Module):
         return y, updated_cache
 
 class Block(nnx.Module):
-    def __init__(self, config: GPTConfig, *, rngs:nnx.Rngs):
+    def __init__(self, config: GPTConfig, *, rngs:nnx.Rngs, init_mesh=None):
         super().__init__()
-        self.ln_1 = LayerNorm(config.d_model, config.use_bias, rngs=rngs)
-        self.attn = CausalSelfAttention(config, rngs=rngs)
-        self.ln_2 = LayerNorm(config.d_model, config.use_bias, rngs=rngs)
-        self.mlp = MLP(config, rngs=rngs)
+        self.ln_1 = LayerNorm(config.d_model, config.use_bias, rngs=rngs, init_mesh=init_mesh)
+        self.attn = CausalSelfAttention(config, rngs=rngs, init_mesh=init_mesh)
+        self.ln_2 = LayerNorm(config.d_model, config.use_bias, rngs=rngs, init_mesh=init_mesh)
+        self.mlp = MLP(config, rngs=rngs, init_mesh=init_mesh)
 
     def __call__(self, x: jax.Array, *, deterministic: bool = True, cache: KVCache | None = None, return_activations: bool = False, mesh=None):
         activations = {}
@@ -182,29 +196,30 @@ class Block(nnx.Module):
 
 # Putting it all together
 class GPT(nnx.Module):
-    def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs):
+    def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs, init_mesh=None):
         super().__init__()
         self.config = config
         self.wte = nnx.Embed(
             config.vocab_size, config.d_model,
-            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), sharding=('vocab', 'embed')),
+            embedding_init=_partitioned(nnx.initializers.normal(stddev=1.0), ('vocab', 'embed'), init_mesh),
             rngs=rngs,
         )
         self.wpe = nnx.Embed(
             config.d_context, config.d_model,
-            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), sharding=('context', 'embed')),
+            embedding_init=_partitioned(nnx.initializers.normal(stddev=1.0), ('context', 'embed'), init_mesh),
             rngs=rngs,
         )
+        _mesh = init_mesh  # capture for closure
         def create_blocks(config_arg, rngs_arg):
-            return Block(config_arg, rngs=rngs_arg)
+            return Block(config_arg, rngs=rngs_arg, init_mesh=_mesh)
         self.h = nnx.vmap(
             create_blocks, in_axes=(None, None), out_axes=0, axis_size=config.n_layers
         )(config, rngs)
         self.drop = nnx.Dropout(config.dropout)
-        self.ln_f = LayerNorm(config.d_model, config.use_bias, rngs=rngs)
+        self.ln_f = LayerNorm(config.d_model, config.use_bias, rngs=rngs, init_mesh=init_mesh)
         self.lm_head = nnx.Linear(
             config.d_model, config.vocab_size, use_bias=False,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), sharding=('embed', 'vocab')),
+            kernel_init=_partitioned(nnx.initializers.lecun_normal(), ('embed', 'vocab'), init_mesh),
             rngs=rngs,
         )
         # Weight tying
