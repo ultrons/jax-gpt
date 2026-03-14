@@ -27,7 +27,12 @@ def _sharding_constraint(x, spec, mesh):
 class LayerNorm(nnx.Module):
     def __init__(self, num_features: int, use_bias: bool, *, rngs: nnx.Rngs):
         super().__init__()
-        self.layer_norm = nnx.LayerNorm(num_features, use_bias=use_bias, epsilon=1e-5, rngs=rngs)
+        self.layer_norm = nnx.LayerNorm(
+            num_features, use_bias=use_bias, epsilon=1e-5,
+            scale_init=nnx.with_partitioning(nnx.initializers.ones, sharding=('embed',)),
+            bias_init=nnx.with_partitioning(nnx.initializers.zeros, sharding=('embed',)),
+            rngs=rngs,
+        )
 
     def __call__(self, x: jax.Array):
         return self.layer_norm(x)
@@ -42,14 +47,18 @@ class MLP(nnx.Module):
             in_features=config.d_model,
             out_features=config.d_ff,
             use_bias=config.use_bias,
-            rngs=rngs
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), sharding=('embed', 'mlp')),
+            bias_init=nnx.with_partitioning(nnx.initializers.zeros, sharding=('mlp',)),
+            rngs=rngs,
         )
         # Contraction layer weights
         self.c_proj = nnx.Linear(
             in_features=config.d_ff,
             out_features=config.d_model,
             use_bias=config.use_bias,
-            rngs=rngs
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), sharding=('mlp', 'embed')),
+            bias_init=nnx.with_partitioning(nnx.initializers.zeros, sharding=('embed',)),
+            rngs=rngs,
         )
         self.dropout = nnx.Dropout(config.dropout)
 
@@ -78,13 +87,17 @@ class CausalSelfAttention(nnx.Module):
             in_features=config.d_model,
             out_features=3 * config.d_model,
             use_bias=config.use_bias,
-            rngs=rngs
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), sharding=('embed', 'joined_heads')),
+            bias_init=nnx.with_partitioning(nnx.initializers.zeros, sharding=('joined_heads',)),
+            rngs=rngs,
         )
         self.c_proj = nnx.Linear(
             in_features=config.d_model,
             out_features=config.d_model,
             use_bias=config.use_bias,
-            rngs=rngs
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), sharding=('heads', 'embed')),
+            bias_init=nnx.with_partitioning(nnx.initializers.zeros, sharding=('embed',)),
+            rngs=rngs,
         )
         self.attn_dropout = nnx.Dropout(config.dropout)
         self.resid_dropout = nnx.Dropout(config.dropout)
@@ -171,8 +184,16 @@ class GPT(nnx.Module):
     def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs):
         super().__init__()
         self.config = config
-        self.wte = nnx.Embed(config.vocab_size, config.d_model, rngs=rngs)
-        self.wpe = nnx.Embed(config.d_context, config.d_model, rngs=rngs)
+        self.wte = nnx.Embed(
+            config.vocab_size, config.d_model,
+            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), sharding=('vocab', 'embed')),
+            rngs=rngs,
+        )
+        self.wpe = nnx.Embed(
+            config.d_context, config.d_model,
+            embedding_init=nnx.with_partitioning(nnx.initializers.normal(stddev=1.0), sharding=('context', 'embed')),
+            rngs=rngs,
+        )
         def create_blocks(config_arg, rngs_arg):
             return Block(config_arg, rngs=rngs_arg)
         self.h = nnx.vmap(
@@ -180,7 +201,11 @@ class GPT(nnx.Module):
         )(config, rngs)
         self.drop = nnx.Dropout(config.dropout)
         self.ln_f = LayerNorm(config.d_model, config.use_bias, rngs=rngs)
-        self.lm_head = nnx.Linear(config.d_model, config.vocab_size, use_bias=False, rngs=rngs)
+        self.lm_head = nnx.Linear(
+            config.d_model, config.vocab_size, use_bias=False,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), sharding=('embed', 'vocab')),
+            rngs=rngs,
+        )
         # Weight tying
         #self.lm_head.kernel.value = self.wte.embedding.value.T
         self._init_weights(rngs=rngs)
