@@ -181,28 +181,27 @@ def moe_layer(
     M = B * T
     x_flat = x.reshape(M, D)
 
-    # Route
-    expert_indices, expert_weights, sorted_token_ids, group_sizes = moe_routing(
-        x_flat, params['gate_weight'], n_experts_per_token,
-    )
+    with jax.named_scope('moe_routing'):
+        expert_indices, expert_weights, sorted_token_ids, group_sizes = moe_routing(
+            x_flat, params['gate_weight'], n_experts_per_token,
+        )
 
-    # Routed experts
-    routed_out = expert_forward(
-        x_flat, sorted_token_ids, group_sizes,
-        expert_indices, expert_weights,
-        params['gate_proj'], params['up_proj'], params['down_proj'],
-    )
+    with jax.named_scope('moe_experts'):
+        routed_out = expert_forward(
+            x_flat, sorted_token_ids, group_sizes,
+            expert_indices, expert_weights,
+            params['gate_proj'], params['up_proj'], params['down_proj'],
+        )
 
-    # Shared expert with sigmoid gate
-    shared_out = shared_expert_forward(
-        x_flat,
-        params['shared_gate_proj'],
-        params['shared_up_proj'],
-        params['shared_down_proj'],
-    )
-    # Shared expert gate: sigmoid(x @ shared_expert_gate) * shared_output
-    shared_gate = jax.nn.sigmoid(x_flat @ params['shared_expert_gate_weight'])
-    shared_out = shared_gate * shared_out
+    with jax.named_scope('moe_shared_expert'):
+        shared_out = shared_expert_forward(
+            x_flat,
+            params['shared_gate_proj'],
+            params['shared_up_proj'],
+            params['shared_down_proj'],
+        )
+        shared_gate = jax.nn.sigmoid(x_flat @ params['shared_expert_gate_weight'])
+        shared_out = shared_gate * shared_out
 
     output = routed_out + shared_out
     return output.reshape(B, T, D).astype(x.dtype)

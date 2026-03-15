@@ -198,8 +198,8 @@ def forward(
     """
     B, T = tokens.shape
 
-    # Token embedding (no positional embedding — RoPE handles position)
-    x = params['embed'][tokens]  # (B, T, D)
+    with jax.named_scope('embedding'):
+        x = params['embed'][tokens]  # (B, T, D)
 
     # Precompute RoPE frequencies
     rope_freqs = precompute_rope_freqs(
@@ -279,9 +279,9 @@ def forward(
         x, _ = jax.lax.scan(_group_step, x, scan_inputs)
         new_cache = None
 
-    # Final norm + lm_head
-    x = rms_norm(x, params['final_norm'], config.rms_norm_eps)
-    logits = x @ params['lm_head']  # (B, T, vocab_size)
+    with jax.named_scope('output_head'):
+        x = rms_norm(x, params['final_norm'], config.rms_norm_eps)
+        logits = x @ params['lm_head']  # (B, T, vocab_size)
 
     return logits, new_cache
 

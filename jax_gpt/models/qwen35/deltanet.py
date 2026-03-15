@@ -126,7 +126,8 @@ def deltanet_recurrent_step(
     groups = config_n_v_heads // config_n_qk_heads
 
     # Project QKV and gate/decay
-    mixed_qkv = x @ params['in_proj_qkv']  # (B, 1, key_dim*2 + value_dim)
+    with jax.named_scope('qkv_proj'):
+        mixed_qkv = x @ params['in_proj_qkv']  # (B, 1, key_dim*2 + value_dim)
     z = x @ params['in_proj_z']             # (B, 1, value_dim)
     b = x @ params['in_proj_b']             # (B, 1, n_v_heads)
     a = x @ params['in_proj_a']             # (B, 1, n_v_heads)

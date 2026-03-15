@@ -53,8 +53,8 @@ def gqa_attention(
     B, T, D = x.shape
     groups = n_q_heads // n_kv_heads
 
-    # Project Q (with gate), K, V
-    q_gate = (x @ params['q_proj']).reshape(B, T, n_q_heads, head_dim * 2)
+    with jax.named_scope('qkv_proj'):
+        q_gate = (x @ params['q_proj']).reshape(B, T, n_q_heads, head_dim * 2)
     q = q_gate[..., :head_dim]      # (B, T, n_q_heads, head_dim)
     gate = q_gate[..., head_dim:]    # (B, T, n_q_heads, head_dim)
     gate = gate.reshape(B, T, -1)   # (B, T, n_q_heads * head_dim)
@@ -99,23 +99,23 @@ def gqa_attention(
         k_full = jnp.repeat(k_full, groups, axis=1)
         v_full = jnp.repeat(v_full, groups, axis=1)
 
-    # Scaled dot-product attention
-    scale = head_dim ** -0.5
-    attn = jnp.matmul(q, jnp.swapaxes(k_full, -2, -1)) * scale
+    with jax.named_scope('sdpa'):
+        scale = head_dim ** -0.5
+        attn = jnp.matmul(q, jnp.swapaxes(k_full, -2, -1)) * scale
 
-    # Causal mask
-    if cache_pos is not None:
-        q_positions = cache_pos + jnp.arange(T)
-        k_positions = jnp.arange(attn.shape[-1])
-        mask = q_positions[:, None] >= k_positions[None, :]
-    else:
-        mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+        # Causal mask
+        if cache_pos is not None:
+            q_positions = cache_pos + jnp.arange(T)
+            k_positions = jnp.arange(attn.shape[-1])
+            mask = q_positions[:, None] >= k_positions[None, :]
+        else:
+            mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
 
-    attn = jnp.where(mask, attn, jnp.finfo(attn.dtype).min)
-    attn = jax.nn.softmax(attn, axis=-1)
+        attn = jnp.where(mask, attn, jnp.finfo(attn.dtype).min)
+        attn = jax.nn.softmax(attn, axis=-1)
 
-    # Attend
-    out = jnp.matmul(attn, v_full)  # (B, n_q_heads, T, head_dim)
+        # Attend
+        out = jnp.matmul(attn, v_full)  # (B, n_q_heads, T, head_dim)
 
     # Transpose back
     out = jnp.transpose(out, (0, 2, 1, 3)).reshape(B, T, n_q_heads * head_dim)

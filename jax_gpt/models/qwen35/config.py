@@ -74,15 +74,15 @@ class Qwen35Config:
 
     @classmethod
     def mid(cls) -> Qwen35Config:
-        """Mid-size config for 4x TPU v5p (~32B params, ~64GB bf16).
+        """Mid-size config for 4x TPU v5p (~8B params, ~16GB bf16).
 
-        Same d_model and head geometry as full model, but fewer layers (32)
-        and fewer experts (64 instead of 512). Designed to exercise the
-        full sharding strategy on 4 TPU chips.
+        Same d_model and head geometry as full model, but 16 layers (4 groups)
+        and 16 experts. Fits in host RAM during init and exercises the full
+        sharding strategy on 4 TPU chips.
         """
         return cls(
             d_model=4096,
-            n_layers=32,
+            n_layers=16,
             max_position_embeddings=8192,
             # GQA — same as full
             gqa_n_q_heads=32,
@@ -93,7 +93,30 @@ class Qwen35Config:
             delta_n_v_heads=64,
             delta_qk_head_dim=128,
             delta_v_head_dim=128,
-            # MoE — 64 experts (fits on 4 devices: 16 per device)
+            # MoE — 16 experts (4 per device with TP=4)
+            n_routed_experts=16,
+            n_experts_per_token=4,
+            moe_intermediate_size=1024,
+            shared_expert_intermediate_size=1024,
+        )
+
+    @classmethod
+    def mid_large(cls) -> Qwen35Config:
+        """Larger mid config (~32B params). Needs ~64GB host RAM for init.
+
+        Use if your TPU VM has sufficient host memory (200GB+).
+        """
+        return cls(
+            d_model=4096,
+            n_layers=32,
+            max_position_embeddings=8192,
+            gqa_n_q_heads=32,
+            gqa_n_kv_heads=2,
+            gqa_head_dim=256,
+            delta_n_qk_heads=16,
+            delta_n_v_heads=64,
+            delta_qk_head_dim=128,
+            delta_v_head_dim=128,
             n_routed_experts=64,
             n_experts_per_token=4,
             moe_intermediate_size=1024,
