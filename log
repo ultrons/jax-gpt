@@ -43,7 +43,7 @@ tests/gpt2/test_inference_benchmark.py:78: in _make_model
     cls._pytree_meta_construct(node, *args, **kwargs)
 ../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:423: in _pytree_meta_construct
     self.__init__(*args, **kwargs)
-jax_gpt/models/gpt2/model.py:188: in __init__
+jax_gpt/models/gpt2/model.py:202: in __init__
     self.wte = nnx.Embed(
 ../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:420: in __call__
     return _graph_node_meta_call(cls, *args, **kwargs)
@@ -132,7 +132,7 @@ tests/gpt2/test_inference_benchmark.py:78: in _make_model
     cls._pytree_meta_construct(node, *args, **kwargs)
 ../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:423: in _pytree_meta_construct
     self.__init__(*args, **kwargs)
-jax_gpt/models/gpt2/model.py:188: in __init__
+jax_gpt/models/gpt2/model.py:202: in __init__
     self.wte = nnx.Embed(
 ../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:420: in __call__
     return _graph_node_meta_call(cls, *args, **kwargs)
