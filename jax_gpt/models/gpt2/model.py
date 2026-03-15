@@ -23,18 +23,34 @@ def _sharding_constraint(x, spec, mesh):
     return activation_sharding_constraint(x, spec, mesh)
 
 
+def _check_eager_sharding():
+    """Detect if current Flax eagerly applies sharding (requires mesh)."""
+    try:
+        init = nnx.with_partitioning(nnx.initializers.zeros, sharding=('_test',))
+        _var = nnx.Param(init(jax.random.key(42), (2,)))
+        return False  # older Flax: metadata only, no mesh needed
+    except (ValueError, TypeError):
+        return True  # newer Flax: mesh required for with_partitioning
+
+_MESH_REQUIRED = _check_eager_sharding()
+
+
 def _partitioned(initializer, sharding, mesh=None):
-    """Wrap initializer with nnx.with_partitioning, passing mesh for newer Flax.
+    """Wrap initializer with nnx.with_partitioning, handling Flax version diffs.
 
     Newer Flax (post-FLIP 4844) eagerly applies sharding at variable creation
-    time, which requires a mesh. Older Flax just stores sharding as metadata.
-    Passing mesh=None works on older Flax; passing an explicit mesh works on
-    both old and new.
+    time, requiring a mesh. Older Flax just stores sharding as metadata.
+
+    When no mesh is available and Flax requires one, returns the bare initializer.
+    shard_train_state has a path-based fallback for this case.
     """
-    kwargs = {'sharding': sharding}
     if mesh is not None:
-        kwargs['mesh'] = mesh
-    return nnx.with_partitioning(initializer, **kwargs)
+        return nnx.with_partitioning(initializer, sharding=sharding, mesh=mesh)
+    if _MESH_REQUIRED:
+        # Newer Flax: can't annotate without mesh. Return bare initializer.
+        return initializer
+    # Older Flax: annotation stored as metadata, no mesh needed.
+    return nnx.with_partitioning(initializer, sharding=sharding)
 
 # Step 1.2: LayerNorm Module
 # TODO: Implement the LayerNorm nnx.Module.
@@ -223,7 +239,7 @@ class GPT(nnx.Module):
             rngs=rngs,
         )
         # Weight tying
-        #self.lm_head.kernel.value = self.wte.embedding.value.T
+        #self.lm_head.kernel.value = self.wte.embedding[...].T
         self._init_weights(rngs=rngs)
 
     def __call__(self, x: jax.Array, *, deterministic: bool, cache: KVCache | None = None, return_activations: bool = False, mesh=None):
@@ -251,11 +267,6 @@ class GPT(nnx.Module):
         # mesh is captured as a closure variable (Python object, not JAX array)
         _mesh = mesh
 
-        # nnx.scan flax 0.8.5 API: nnx.scan(f, in_axes=..., carry_argnum=0, scan_output=...)
-        # carry_argnum=0 → first arg is carry (no nnx.Carry sentinel needed)
-        # in_axes tuple length = number of non-carry args
-        # scan_output=False → function returns only carry (no stacked output)
-
         # deterministic and _mesh are Python values captured via closure —
         # they must NOT be passed as scan args (would become traced JAX arrays).
 
@@ -266,14 +277,14 @@ class GPT(nnx.Module):
                     x_out, c_out, a_out = blocks_(x_c, deterministic=deterministic, cache=c_in, return_activations=True, mesh=_mesh)
                     return x_out, (c_out.key, c_out.value, a_out)
                 x, (k_out, v_out, a_stacked) = nnx.scan(
-                    _scan_act, in_axes=(None, 0, 0, 0), carry_argnum=0
+                    _scan_act, in_axes=(nnx.Carry, 0, 0, 0), out_axes=(nnx.Carry, 0)
                 )(x, c_k, c_v, self.h)
             else:
                 def _scan_act_no_cache(x_c, blocks_):
                     x_out, _, a_out = blocks_(x_c, deterministic=deterministic, cache=None, return_activations=True, mesh=_mesh)
                     return x_out, a_out
                 x, a_stacked = nnx.scan(
-                    _scan_act_no_cache, in_axes=(None, 0), carry_argnum=0
+                    _scan_act_no_cache, in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0)
                 )(x, self.h)
                 k_out, v_out = None, None
             for k_act, v_act in a_stacked.items():
@@ -286,14 +297,14 @@ class GPT(nnx.Module):
                     x_out, c_out = blocks_(x_c, deterministic=deterministic, cache=c_in, mesh=_mesh)
                     return x_out, (c_out.key, c_out.value)
                 x, (k_out, v_out) = nnx.scan(
-                    _scan, in_axes=(None, 0, 0, 0), carry_argnum=0
+                    _scan, in_axes=(nnx.Carry, 0, 0, 0), out_axes=(nnx.Carry, 0)
                 )(x, c_k, c_v, self.h)
             else:
                 def _scan_no_cache(x_c, blocks_):
                     x_out, _ = blocks_(x_c, deterministic=deterministic, cache=None, mesh=_mesh)
                     return x_out
                 x = nnx.scan(
-                    _scan_no_cache, in_axes=(None, 0), carry_argnum=0, scan_output=False
+                    _scan_no_cache, in_axes=(nnx.Carry, 0), out_axes=nnx.Carry
                 )(x, self.h)
                 k_out, v_out = None, None
         
@@ -306,7 +317,7 @@ class GPT(nnx.Module):
         if return_activations:
             all_activations["final_layernorm"] = x
 
-        logits = x @ self.wte.embedding.value.T
+        logits = x @ self.wte.embedding[...].T
         if return_activations:
             all_activations["final_logits"] = logits
 
@@ -316,55 +327,55 @@ class GPT(nnx.Module):
 
     def _init_weights(self, *, rngs: nnx.Rngs):
         initializer_fn = jax.nn.initializers.normal(stddev=0.02)
-        self.wte.embedding.value = initializer_fn(
+        self.wte.embedding[...] = initializer_fn(
             rngs(),
-            self.wte.embedding.value.shape,
-            self.wte.embedding.value.dtype,
+            self.wte.embedding.shape,
+            self.wte.embedding.dtype,
         )
-        self.wpe.embedding.value = initializer_fn(
+        self.wpe.embedding[...] = initializer_fn(
             rngs(),
-            self.wpe.embedding.value.shape,
-            self.wpe.embedding.value.dtype,
+            self.wpe.embedding.shape,
+            self.wpe.embedding.dtype,
         )
-        for path, module in self.iter_modules():
+        for path, module in nnx.iter_modules(self):
             if isinstance(module, nnx.Linear):
-                module.kernel.value = initializer_fn(
+                module.kernel[...] = initializer_fn(
                     rngs(),
-                    module.kernel.value.shape,
-                    module.kernel.value.dtype,
+                    module.kernel.shape,
+                    module.kernel.dtype,
                 )
-                if module.bias.value is not None:
-                    module.bias.value = jax.nn.initializers.zeros(
+                if module.bias is not None:
+                    module.bias[...] = jax.nn.initializers.zeros(
                         rngs(),
-                        module.bias.value.shape,
-                        module.bias.value.dtype
+                        module.bias.shape,
+                        module.bias.dtype
                     )
             elif isinstance(module, LayerNorm): # Custom LayerNorm wrapper
-                module.layer_norm.scale.value = jax.nn.initializers.ones(
+                module.layer_norm.scale[...] = jax.nn.initializers.ones(
                     rngs(),
-                    module.layer_norm.scale.value.shape,
-                    module.layer_norm.scale.value.dtype,
+                    module.layer_norm.scale.shape,
+                    module.layer_norm.scale.dtype,
                 )
-                if module.layer_norm.bias is not None and module.layer_norm.bias.value is not None:
-                    module.layer_norm.bias.value = jax.nn.initializers.zeros(
+                if module.layer_norm.bias is not None:
+                    module.layer_norm.bias[...] = jax.nn.initializers.zeros(
                         rngs(),
-                        module.layer_norm.bias.value.shape,
-                        module.layer_norm.bias.value.dtype
+                        module.layer_norm.bias.shape,
+                        module.layer_norm.bias.dtype
                     )
         scaled_initializer = jax.nn.initializers.normal(
             stddev = 0.02 / math.sqrt(2 * self.config.n_layers)
         )
         attn_proj_kernel = self.h.attn.c_proj.kernel
-        attn_proj_kernel.value = scaled_initializer(
+        attn_proj_kernel[...] = scaled_initializer(
             rngs(),
-            attn_proj_kernel.value.shape,
-            attn_proj_kernel.value.dtype,
+            attn_proj_kernel.shape,
+            attn_proj_kernel.dtype,
         )
         mlp_proj_kernel = self.h.mlp.c_proj.kernel
-        mlp_proj_kernel.value = scaled_initializer(
+        mlp_proj_kernel[...] = scaled_initializer(
             rngs(),
-            mlp_proj_kernel.value.shape,
-            mlp_proj_kernel.value.dtype,
+            mlp_proj_kernel.shape,
+            mlp_proj_kernel.dtype,
         )
 
     def generate(self, idx: jax.Array, new_tokens: int, temperature: float = 1.0, top_k: int | None = None, *, rngs: nnx.Rngs):
@@ -428,28 +439,24 @@ class GPT(nnx.Module):
         assert jnp.array_equal(wte_hf, lm_head_hf), "Mismatch between wte and lm_head weights"
 
         # Embeddings
-        model.wte.embedding.value = jnp.asarray(wte_hf)
-        model.wpe.embedding.value = jnp.asarray(sd_hf['transformer.wpe.weight'])
+        model.wte.embedding[...] = jnp.asarray(wte_hf)
+        model.wpe.embedding[...] = jnp.asarray(sd_hf['transformer.wpe.weight'])
 
-        model.h.ln_1.layer_norm.scale.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_1.weight']) for i in range(config.n_layers)])
-        model.h.ln_1.layer_norm.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_1.bias']) for i in range(config.n_layers)])
-        model.h.attn.c_attn.kernel.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_attn.weight']) for i in range(config.n_layers)])
-        model.h.attn.c_attn.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_attn.bias']) for i in range(config.n_layers)])
-        model.h.attn.c_proj.kernel.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_proj.weight']) for i in range(config.n_layers)])
-        model.h.attn.c_proj.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_proj.bias']) for i in range(config.n_layers)])
-        model.h.ln_2.layer_norm.scale.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_2.weight']) for i in range(config.n_layers)])
-        model.h.ln_2.layer_norm.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_2.bias']) for i in range(config.n_layers)])
-        model.h.mlp.c_fc.kernel.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_fc.weight']) for i in range(config.n_layers)])
-        model.h.mlp.c_fc.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_fc.bias']) for i in range(config.n_layers)])
-        model.h.mlp.c_proj.kernel.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_proj.weight']) for i in range(config.n_layers)])
-        model.h.mlp.c_proj.bias.value = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_proj.bias']) for i in range(config.n_layers)])
+        model.h.ln_1.layer_norm.scale[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_1.weight']) for i in range(config.n_layers)])
+        model.h.ln_1.layer_norm.bias[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_1.bias']) for i in range(config.n_layers)])
+        model.h.attn.c_attn.kernel[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_attn.weight']) for i in range(config.n_layers)])
+        model.h.attn.c_attn.bias[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_attn.bias']) for i in range(config.n_layers)])
+        model.h.attn.c_proj.kernel[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_proj.weight']) for i in range(config.n_layers)])
+        model.h.attn.c_proj.bias[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.attn.c_proj.bias']) for i in range(config.n_layers)])
+        model.h.ln_2.layer_norm.scale[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_2.weight']) for i in range(config.n_layers)])
+        model.h.ln_2.layer_norm.bias[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.ln_2.bias']) for i in range(config.n_layers)])
+        model.h.mlp.c_fc.kernel[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_fc.weight']) for i in range(config.n_layers)])
+        model.h.mlp.c_fc.bias[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_fc.bias']) for i in range(config.n_layers)])
+        model.h.mlp.c_proj.kernel[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_proj.weight']) for i in range(config.n_layers)])
+        model.h.mlp.c_proj.bias[...] = jnp.stack([jnp.asarray(sd_hf[f'transformer.h.{i}.mlp.c_proj.bias']) for i in range(config.n_layers)])
 
-        model.ln_f.layer_norm.scale.value = jnp.asarray(sd_hf['transformer.ln_f.weight'])
-        model.ln_f.layer_norm.bias.value = jnp.asarray(sd_hf['transformer.ln_f.bias'])
-
-        # The lm_head weights are tied to the wte weights in the reference implementation.
-        # We load the lm_head weights into our wte embedding matrix.
-        #model.wte.embedding.value = jnp.asarray(sd_hf['lm_head.weight'])
+        model.ln_f.layer_norm.scale[...] = jnp.asarray(sd_hf['transformer.ln_f.weight'])
+        model.ln_f.layer_norm.bias[...] = jnp.asarray(sd_hf['transformer.ln_f.bias'])
 
         # The lm_head weights are tied to the wte weights in the reference implementation
         # We handle this in the __init__ and __call__ methods

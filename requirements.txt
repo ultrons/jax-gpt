@@ -1,5 +1,5 @@
-jax
-flax
+jax>=0.9.1
+flax>=0.12.5
 tiktoken
 torch
 transformers
