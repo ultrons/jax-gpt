@@ -1,183 +1,53 @@
-============================= test session starts ==============================
-platform linux -- Python 3.12.13, pytest-9.0.2, pluggy-1.6.0 -- /home/sivaibhav_google_com/.perf/bin/python
-cachedir: .pytest_cache
-rootdir: /home/sivaibhav_google_com/jax-gpt
-plugins: jaxtyping-0.3.9, anyio-4.12.1
-collecting ... collected 2 items
+======================================================================
+QWEN3.5 INFERENCE BENCHMARK
+======================================================================
+  Config:         mini (8L, 1024D, 4E top-2)
+  Sharding:       Config B
+  Devices:        4x tpu
+  Batch size:     1
+  Prompt len:     512
+  Decode steps:   128
+  Max seq len:    704
+  Dtype:          bfloat16
+  Runs:           5
+  Profile:        False
 
-tests/gpt2/test_inference_benchmark.py::test_prefill_benchmark FAILED
-tests/gpt2/test_inference_benchmark.py::test_decode_benchmark FAILED
+Initializing model...
+  Params:         603,662,688 (2.41 GB fp32)
+  Init time:      18445 ms
+  Converted to bfloat16
 
-=================================== FAILURES ===================================
-____________________________ test_prefill_benchmark ____________________________
+Sharding params across 4 devices...
+  Shard time:     1432 ms
 
-    def test_prefill_benchmark():
-        """
-        Benchmark prefill (prompt processing) latency.
-    
-        What to look for in the TPU trace:
-        - A single dense block of compute (matmuls, layer norms, attention)
-        - No gaps between operations (no host roundtrips)
-        - The HLO should show the full model as one fused program
-        """
-        cfg = GPTConfig(
-            d_model=768, d_head=64, d_ff=3072,
-            n_head=12, n_kv_head=12, n_layers=12,
-            d_context=1024, vocab_size=50257,
-        )
-        batch_size = 4
-        seq_len = 512
-    
->       model = _make_model(cfg)
-                ^^^^^^^^^^^^^^^^
+──────────────────────────────────────────────────────────────────────
+PREFILL BENCHMARK
+──────────────────────────────────────────────────────────────────────
+  Compiling prefill...
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 309, in <module>
+    main()
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 288, in main
+    run_prefill_benchmark(
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 119, in run_prefill_benchmark
+    logits, _ = prefill(params, tokens, cache)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 114, in prefill
+    return forward(p, t, cfg, cache=c, is_decode=False, cache_sharding=cache_sharding)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 247, in forward
+    x, (new_dMs, new_dConvs, new_gKs, new_gVs) = jax.lax.scan(
+                                                 ^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 225, in _group_step
+    x_carry, new_dM, new_dC, new_gk, new_gv = group_forward(
+                                              ^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/block.py", line 150, in group_forward
+    x, (new_Ms, new_convs) = jax.lax.scan( 
+                             ^^^^^^^^^^^^^ 
+TypeError: scan body function carry input and carry output must have equal types, but they differ:
 
-tests/gpt2/test_inference_benchmark.py:168: 
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-tests/gpt2/test_inference_benchmark.py:78: in _make_model
-    return GPT(cfg, rngs=nnx.Rngs(0))
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:420: in __call__
-    return _graph_node_meta_call(cls, *args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:431: in _graph_node_meta_call
-    cls._pytree_meta_construct(node, *args, **kwargs)
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:423: in _pytree_meta_construct
-    self.__init__(*args, **kwargs)
-jax_gpt/models/gpt2/model.py:202: in __init__
-    self.wte = nnx.Embed(
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:420: in __call__
-    return _graph_node_meta_call(cls, *args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:431: in _graph_node_meta_call
-    cls._pytree_meta_construct(node, *args, **kwargs)
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:423: in _pytree_meta_construct
-    self.__init__(*args, **kwargs)
-../.perf/lib/python3.12/site-packages/flax/nnx/nn/linear.py:1283: in __init__
-    self.embedding = nnx.Param(
-../.perf/lib/python3.12/site-packages/flax/nnx/variablelib.py:1148: in __call__
-    return cls._variable_meta_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../.perf/lib/python3.12/site-packages/flax/nnx/variablelib.py:1151: in _variable_meta_call
-    variable = super().__call__(*args, **kwargs)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../.perf/lib/python3.12/site-packages/flax/nnx/variablelib.py:1338: in __init__
-    value = core_spmd.shard_value(
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+The input carry carry has type bfloat16[1,512,1024] but the corresponding output carry component has type float32[1,512,1024], so the dtypes do not match.
 
-value = Array([[ 1.0040143 , -0.9063372 , -0.7481722 , ..., -1.1280233 ,
-         1.1328597 ,  1.7058012 ],
-       [ 0.7573111...8],
-       [ 0.94369555, -2.109763  , -1.2888681 , ...,  0.7174901 ,
-        -1.0452837 , -0.24223006]], dtype=float32)
-sharding = ('vocab', 'embed'), sharding_rules = None, mesh = None
-
-    def shard_value(
-      value, sharding, sharding_rules, mesh: jax.sharding.AbstractMesh | jax.sharding.Mesh | None
-    ):
-      if not sharding:
-        return value
-    
-      if mesh is None:
-        mesh = meta.get_global_mesh()
-    
-      if mesh is None:
->       raise ValueError(
-          'An auto mesh context or metadata is required if creating a variable'
-          f' with annotation {sharding=}. '
-          'For more guidance, see https://flax.readthedocs.io/en/latest/flip/4844-var-eager-sharding.html.')
-E       ValueError: An auto mesh context or metadata is required if creating a variable with annotation sharding=('vocab', 'embed'). For more guidance, see https://flax.readthedocs.io/en/latest/flip/4844-var-eager-sharding.html.
-
-../.perf/lib/python3.12/site-packages/flax/core/spmd.py:56: ValueError
------------------------------- Captured log call -------------------------------
-WARNING  jax._src.xla_bridge:xla_bridge.py:887 A Google TPU may be present on this machine, but either a TPU-enabled jaxlib or libtpu is not installed. Falling back to cpu.
-____________________________ test_decode_benchmark _____________________________
-
-    def test_decode_benchmark():
-        """
-        Benchmark autoregressive decode latency.
-    
-        Measures per-step decode time with proper warm-up and async dispatch.
-        Each step generates one token using greedy argmax.
-    
-        Key timing pattern:
-        - Warm up JIT (first call compiles)
-        - For each timed run:
-          1. Prefill → get fresh KV cache and first token
-          2. block_until_ready() — ensure prefill is done (sync boundary)
-          3. Dispatch all N decode steps WITHOUT blocking between them
-             (JAX async dispatch — host enqueues, device executes)
-          4. block_until_ready() on final output only (sync boundary)
-        """
-        cfg = GPTConfig(
-            d_model=768, d_head=64, d_ff=3072,
-            n_head=12, n_kv_head=12, n_layers=12,
-            d_context=1024, vocab_size=50257,
-        )
-        batch_size = 4
-        prompt_len = 128
-        n_decode_steps = 64
-    
->       model = _make_model(cfg)
-                ^^^^^^^^^^^^^^^^
-
-tests/gpt2/test_inference_benchmark.py:254: 
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-tests/gpt2/test_inference_benchmark.py:78: in _make_model
-    return GPT(cfg, rngs=nnx.Rngs(0))
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:420: in __call__
-    return _graph_node_meta_call(cls, *args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:431: in _graph_node_meta_call
-    cls._pytree_meta_construct(node, *args, **kwargs)
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:423: in _pytree_meta_construct
-    self.__init__(*args, **kwargs)
-jax_gpt/models/gpt2/model.py:202: in __init__
-    self.wte = nnx.Embed(
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:420: in __call__
-    return _graph_node_meta_call(cls, *args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:431: in _graph_node_meta_call
-    cls._pytree_meta_construct(node, *args, **kwargs)
-../.perf/lib/python3.12/site-packages/flax/nnx/pytreelib.py:423: in _pytree_meta_construct
-    self.__init__(*args, **kwargs)
-../.perf/lib/python3.12/site-packages/flax/nnx/nn/linear.py:1283: in __init__
-    self.embedding = nnx.Param(
-../.perf/lib/python3.12/site-packages/flax/nnx/variablelib.py:1148: in __call__
-    return cls._variable_meta_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../.perf/lib/python3.12/site-packages/flax/nnx/variablelib.py:1151: in _variable_meta_call
-    variable = super().__call__(*args, **kwargs)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../.perf/lib/python3.12/site-packages/flax/nnx/variablelib.py:1338: in __init__
-    value = core_spmd.shard_value(
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-
-value = Array([[ 1.0040143 , -0.9063372 , -0.7481722 , ..., -1.1280233 ,
-         1.1328597 ,  1.7058012 ],
-       [ 0.7573111...8],
-       [ 0.94369555, -2.109763  , -1.2888681 , ...,  0.7174901 ,
-        -1.0452837 , -0.24223006]], dtype=float32)
-sharding = ('vocab', 'embed'), sharding_rules = None, mesh = None
-
-    def shard_value(
-      value, sharding, sharding_rules, mesh: jax.sharding.AbstractMesh | jax.sharding.Mesh | None
-    ):
-      if not sharding:
-        return value
-    
-      if mesh is None:
-        mesh = meta.get_global_mesh()
-    
-      if mesh is None:
->       raise ValueError(
-          'An auto mesh context or metadata is required if creating a variable'
-          f' with annotation {sharding=}. '
-          'For more guidance, see https://flax.readthedocs.io/en/latest/flip/4844-var-eager-sharding.html.')
-E       ValueError: An auto mesh context or metadata is required if creating a variable with annotation sharding=('vocab', 'embed'). For more guidance, see https://flax.readthedocs.io/en/latest/flip/4844-var-eager-sharding.html.
-
-../.perf/lib/python3.12/site-packages/flax/core/spmd.py:56: ValueError
-=========================== short test summary info ============================
-FAILED tests/gpt2/test_inference_benchmark.py::test_prefill_benchmark - Value...
-FAILED tests/gpt2/test_inference_benchmark.py::test_decode_benchmark - ValueE...
-============================== 2 failed in 4.96s ===============================
+Revise the function so that all output types match the corresponding input types.
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+──────────────────────────────────────────────────────────────────────
