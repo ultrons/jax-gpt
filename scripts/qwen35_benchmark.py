@@ -84,6 +84,7 @@ def get_config(name: str) -> Qwen35Config:
     configs = {
         'mini': Qwen35Config.mini,
         'mid': Qwen35Config.mid,
+        'mid_large': Qwen35Config.mid_large,
         'full': Qwen35Config.full,
     }
     if name not in configs:
@@ -205,7 +206,7 @@ def run_decode_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen3.5 inference benchmark")
-    parser.add_argument('--config', default='mini', choices=['mini', 'mid', 'full'])
+    parser.add_argument('--config', default='mini', choices=['mini', 'mid', 'mid_large', 'full'])
     parser.add_argument('--sharding', default='none', choices=['none', 'A', 'B'])
     parser.add_argument('--devices', type=int, default=None)
     parser.add_argument('--batch-size', type=int, default=1)
