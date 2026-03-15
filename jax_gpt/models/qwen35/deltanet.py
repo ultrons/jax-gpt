@@ -169,20 +169,20 @@ def deltanet_recurrent_step(
     v = v[:, 0]  # (B, n_v_heads, v_head_dim)
     beta = beta[:, 0]  # (B, n_v_heads)
 
-    # Recurrent step
+    # Recurrent step (compute in float32, cast state back to input dtype for scan)
+    input_dtype = x.dtype
     # state: (B, n_v_heads, qk_head_dim, v_head_dim)
-    g_factor = jnp.exp(g)[..., None, None]  # (B, n_v_heads, 1, 1)
-    new_state = state * g_factor
+    state_f32 = state.astype(jnp.float32)
+    g_factor = jnp.exp(g.astype(jnp.float32))[..., None, None]
+    new_state = state_f32 * g_factor
 
-    # Retrieve from memory: contract over key_dim
-    kv_mem = jnp.einsum('bhkv,bhk->bhv', new_state, k)  # (B, n_v_heads, v_head_dim)
-    delta = (v - kv_mem) * beta[..., None]  # (B, n_v_heads, v_head_dim)
+    kv_mem = jnp.einsum('bhkv,bhk->bhv', new_state, k.astype(jnp.float32))
+    delta = (v.astype(jnp.float32) - kv_mem) * beta.astype(jnp.float32)[..., None]
 
-    # Rank-1 update
-    new_state = new_state + jnp.einsum('bhk,bhv->bhkv', k, delta)
+    new_state = new_state + jnp.einsum('bhk,bhv->bhkv', k.astype(jnp.float32), delta)
+    new_state = new_state.astype(input_dtype)
 
-    # Query the state
-    output = jnp.einsum('bhkv,bhk->bhv', new_state, q)  # (B, n_v_heads, v_head_dim)
+    output = jnp.einsum('bhkv,bhk->bhv', new_state.astype(jnp.float32), q.astype(jnp.float32))
 
     # Gated RMSNorm (applied per-head, weight is per v_head_dim)
     output = output.reshape(B * config_n_v_heads, config_v_head_dim)
@@ -192,7 +192,7 @@ def deltanet_recurrent_step(
     output = output.reshape(B, value_dim)
     output = (output @ params['out_proj'])[:, None, :]  # (B, 1, D)
 
-    return output, new_state, new_conv_state
+    return output.astype(x.dtype), new_state, new_conv_state
 
 
 def deltanet_prefill(
@@ -274,18 +274,21 @@ def deltanet_prefill(
         dtype=q.dtype,
     )
 
+    carry_dtype = q.dtype  # preserve dtype for scan carry
+
     def _step(state, inputs):
         q_t, k_t, v_t, beta_t, g_t = inputs
-        # state: (B, H, dk, dv)
-        g_factor = jnp.exp(g_t)[..., None, None]  # (B, H, 1, 1)
-        state = state * g_factor
+        # Compute in float32 for numerical stability, cast back for scan carry
+        state_f32 = state.astype(jnp.float32)
+        g_factor = jnp.exp(g_t.astype(jnp.float32))[..., None, None]
+        state_f32 = state_f32 * g_factor
 
-        kv_mem = jnp.einsum('bhkv,bhk->bhv', state, k_t)
-        delta = (v_t - kv_mem) * beta_t[..., None]
-        state = state + jnp.einsum('bhk,bhv->bhkv', k_t, delta)
+        kv_mem = jnp.einsum('bhkv,bhk->bhv', state_f32, k_t.astype(jnp.float32))
+        delta = (v_t.astype(jnp.float32) - kv_mem) * beta_t.astype(jnp.float32)[..., None]
+        state_f32 = state_f32 + jnp.einsum('bhk,bhv->bhkv', k_t.astype(jnp.float32), delta)
 
-        o_t = jnp.einsum('bhkv,bhk->bhv', state, q_t)
-        return state, o_t
+        o_t = jnp.einsum('bhkv,bhk->bhv', state_f32, q_t.astype(jnp.float32))
+        return state_f32.astype(carry_dtype), o_t.astype(carry_dtype)
 
     # Prepare scan inputs: transpose T to leading axis
     scan_inputs = (
@@ -309,7 +312,7 @@ def deltanet_prefill(
     core_attn_out = core_attn_out.reshape(B, T, value_dim)
     output = core_attn_out @ params['out_proj']  # (B, T, D)
 
-    return output, final_state, final_conv_state
+    return output.astype(x.dtype), final_state, final_conv_state
 
 
 def _gated_rms_norm(
@@ -326,8 +329,10 @@ def _gated_rms_norm(
         weight: (D,) — learnable scale (per v_head_dim, broadcast across heads).
         eps: numerical stability.
     """
+    orig_dtype = x.dtype
     x_f32 = x.astype(jnp.float32)
     variance = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
     x_normed = x_f32 * jax.lax.rsqrt(variance + eps)
     x_normed = (1.0 + weight.astype(jnp.float32)) * x_normed
-    return x_normed * jax.nn.silu(gate.astype(jnp.float32))
+    result = x_normed * jax.nn.silu(gate.astype(jnp.float32))
+    return result.astype(orig_dtype)

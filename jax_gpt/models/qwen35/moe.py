@@ -128,7 +128,7 @@ def expert_forward(
 
     # Scatter-add back to token positions
     output = jnp.zeros((M, D), dtype=x.dtype)
-    output = output.at[sorted_token_ids].add(weighted_out)
+    output = output.at[sorted_token_ids].add(weighted_out.astype(x.dtype))
 
     return output
 
@@ -205,4 +205,4 @@ def moe_layer(
     shared_out = shared_gate * shared_out
 
     output = routed_out + shared_out
-    return output.reshape(B, T, D)
+    return output.reshape(B, T, D).astype(x.dtype)

@@ -86,8 +86,8 @@ def gqa_attention(
     # KV cache update
     if cache_pos is not None:
         k_update_idx = (0, 0, cache_pos, 0)
-        cache_k = jax.lax.dynamic_update_slice(cache_k, k, k_update_idx)
-        cache_v = jax.lax.dynamic_update_slice(cache_v, v, k_update_idx)
+        cache_k = jax.lax.dynamic_update_slice(cache_k, k.astype(cache_k.dtype), k_update_idx)
+        cache_v = jax.lax.dynamic_update_slice(cache_v, v.astype(cache_v.dtype), k_update_idx)
         k_full = cache_k
         v_full = cache_v
     else:
@@ -121,9 +121,9 @@ def gqa_attention(
     out = jnp.transpose(out, (0, 2, 1, 3)).reshape(B, T, n_q_heads * head_dim)
 
     # Output gate (sigmoid)
-    out = out * jax.nn.sigmoid(gate)
+    out = out * jax.nn.sigmoid(gate).astype(out.dtype)
 
     # Output projection
     out = out @ params['o_proj']
 
-    return out, cache_k, cache_v
+    return out.astype(x.dtype), cache_k, cache_v
