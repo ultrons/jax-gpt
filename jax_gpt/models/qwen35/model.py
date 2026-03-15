@@ -21,11 +21,11 @@ from jax_gpt.models.qwen35.primitives import precompute_rope_freqs, rms_norm
 # Parameter initialization
 # ---------------------------------------------------------------------------
 
-def _init_linear(key: jax.Array, in_dim: int, out_dim: int, scale: float = 0.02) -> jax.Array:
-    return jax.random.normal(key, (in_dim, out_dim)) * scale
+def _init_linear(key: jax.Array, in_dim: int, out_dim: int, scale: float = 0.02, dtype: jnp.dtype = jnp.float32) -> jax.Array:
+    return jax.random.normal(key, (in_dim, out_dim), dtype=dtype) * scale
 
 
-def _init_deltanet_attn_params(key: jax.Array, config: Qwen35Config) -> dict:
+def _init_deltanet_attn_params(key: jax.Array, config: Qwen35Config, dtype: jnp.dtype = jnp.float32) -> dict:
     """Initialize one DeltaNet attention sub-layer's params."""
     keys = jax.random.split(key, 10)
     D = config.d_model
@@ -34,19 +34,19 @@ def _init_deltanet_attn_params(key: jax.Array, config: Qwen35Config) -> dict:
     conv_dim = key_dim * 2 + value_dim
 
     return {
-        'in_proj_qkv': _init_linear(keys[0], D, conv_dim),
-        'in_proj_z': _init_linear(keys[1], D, value_dim),
-        'in_proj_b': _init_linear(keys[2], D, config.delta_n_v_heads),
-        'in_proj_a': _init_linear(keys[3], D, config.delta_n_v_heads),
-        'conv_weight': jax.random.normal(keys[4], (conv_dim, config.delta_conv_kernel)) * 0.02,
+        'in_proj_qkv': _init_linear(keys[0], D, conv_dim, dtype=dtype),
+        'in_proj_z': _init_linear(keys[1], D, value_dim, dtype=dtype),
+        'in_proj_b': _init_linear(keys[2], D, config.delta_n_v_heads, dtype=dtype),
+        'in_proj_a': _init_linear(keys[3], D, config.delta_n_v_heads, dtype=dtype),
+        'conv_weight': (jax.random.normal(keys[4], (conv_dim, config.delta_conv_kernel), dtype=dtype) * 0.02),
         'A_log': jnp.log(jax.random.uniform(keys[5], (config.delta_n_v_heads,), minval=0.1, maxval=16.0)),
-        'dt_bias': jnp.ones(config.delta_n_v_heads),
-        'norm_weight': jnp.zeros(config.delta_v_head_dim),
-        'out_proj': _init_linear(keys[6], value_dim, D),
+        'dt_bias': jnp.ones(config.delta_n_v_heads, dtype=dtype),
+        'norm_weight': jnp.zeros(config.delta_v_head_dim, dtype=dtype),
+        'out_proj': _init_linear(keys[6], value_dim, D, dtype=dtype),
     }
 
 
-def _init_gqa_attn_params(key: jax.Array, config: Qwen35Config) -> dict:
+def _init_gqa_attn_params(key: jax.Array, config: Qwen35Config, dtype: jnp.dtype = jnp.float32) -> dict:
     """Initialize one GQA attention sub-layer's params."""
     keys = jax.random.split(key, 5)
     D = config.d_model
@@ -54,16 +54,16 @@ def _init_gqa_attn_params(key: jax.Array, config: Qwen35Config) -> dict:
     kv_dim = config.gqa_n_kv_heads * config.gqa_head_dim
 
     return {
-        'q_proj': _init_linear(keys[0], D, q_dim * 2),  # query + output gate
-        'k_proj': _init_linear(keys[1], D, kv_dim),
-        'v_proj': _init_linear(keys[2], D, kv_dim),
-        'o_proj': _init_linear(keys[3], q_dim, D),
-        'q_norm': jnp.zeros(config.gqa_head_dim),  # RMSNorm weight (init 0, used as 1+w)
-        'k_norm': jnp.zeros(config.gqa_head_dim),
+        'q_proj': _init_linear(keys[0], D, q_dim * 2, dtype=dtype),
+        'k_proj': _init_linear(keys[1], D, kv_dim, dtype=dtype),
+        'v_proj': _init_linear(keys[2], D, kv_dim, dtype=dtype),
+        'o_proj': _init_linear(keys[3], q_dim, D, dtype=dtype),
+        'q_norm': jnp.zeros(config.gqa_head_dim, dtype=dtype),
+        'k_norm': jnp.zeros(config.gqa_head_dim, dtype=dtype),
     }
 
 
-def _init_moe_params(key: jax.Array, config: Qwen35Config) -> dict:
+def _init_moe_params(key: jax.Array, config: Qwen35Config, dtype: jnp.dtype = jnp.float32) -> dict:
     """Initialize one MoE layer's params."""
     keys = jax.random.split(key, 8)
     D = config.d_model
@@ -72,36 +72,36 @@ def _init_moe_params(key: jax.Array, config: Qwen35Config) -> dict:
     SI = config.shared_expert_intermediate_size
 
     return {
-        'gate_weight': _init_linear(keys[0], D, E),
-        'gate_proj': jax.random.normal(keys[1], (E, D, I)) * 0.02,
-        'up_proj': jax.random.normal(keys[2], (E, D, I)) * 0.02,
-        'down_proj': jax.random.normal(keys[3], (E, I, D)) * 0.02,
-        'shared_gate_proj': _init_linear(keys[4], D, SI),
-        'shared_up_proj': _init_linear(keys[5], D, SI),
-        'shared_down_proj': _init_linear(keys[6], SI, D),
-        'shared_expert_gate_weight': _init_linear(keys[7], D, 1),
+        'gate_weight': _init_linear(keys[0], D, E, dtype=dtype),
+        'gate_proj': jax.random.normal(keys[1], (E, D, I), dtype=dtype) * 0.02,
+        'up_proj': jax.random.normal(keys[2], (E, D, I), dtype=dtype) * 0.02,
+        'down_proj': jax.random.normal(keys[3], (E, I, D), dtype=dtype) * 0.02,
+        'shared_gate_proj': _init_linear(keys[4], D, SI, dtype=dtype),
+        'shared_up_proj': _init_linear(keys[5], D, SI, dtype=dtype),
+        'shared_down_proj': _init_linear(keys[6], SI, D, dtype=dtype),
+        'shared_expert_gate_weight': _init_linear(keys[7], D, 1, dtype=dtype),
     }
 
 
-def _init_delta_layer_params(key: jax.Array, config: Qwen35Config) -> dict:
+def _init_delta_layer_params(key: jax.Array, config: Qwen35Config, dtype: jnp.dtype = jnp.float32) -> dict:
     """Initialize one DeltaNet layer (attn_norm + attn + moe_norm + moe)."""
     k1, k2 = jax.random.split(key)
     return {
-        'attn_norm': jnp.zeros(config.d_model),
-        'attn': _init_deltanet_attn_params(k1, config),
-        'moe_norm': jnp.zeros(config.d_model),
-        'moe': _init_moe_params(k2, config),
+        'attn_norm': jnp.zeros(config.d_model, dtype=dtype),
+        'attn': _init_deltanet_attn_params(k1, config, dtype),
+        'moe_norm': jnp.zeros(config.d_model, dtype=dtype),
+        'moe': _init_moe_params(k2, config, dtype),
     }
 
 
-def _init_gqa_layer_params(key: jax.Array, config: Qwen35Config) -> dict:
+def _init_gqa_layer_params(key: jax.Array, config: Qwen35Config, dtype: jnp.dtype = jnp.float32) -> dict:
     """Initialize one GQA layer (attn_norm + attn + moe_norm + moe)."""
     k1, k2 = jax.random.split(key)
     return {
-        'attn_norm': jnp.zeros(config.d_model),
-        'attn': _init_gqa_attn_params(k1, config),
-        'moe_norm': jnp.zeros(config.d_model),
-        'moe': _init_moe_params(k2, config),
+        'attn_norm': jnp.zeros(config.d_model, dtype=dtype),
+        'attn': _init_gqa_attn_params(k1, config, dtype),
+        'moe_norm': jnp.zeros(config.d_model, dtype=dtype),
+        'moe': _init_moe_params(k2, config, dtype),
     }
 
 
@@ -111,8 +111,13 @@ def _stack_tree(trees: list[dict]) -> dict:
     return jax.tree.map(lambda *arrs: jnp.stack(arrs, axis=0), *trees)
 
 
-def init_params(config: Qwen35Config, key: jax.Array) -> dict:
+def init_params(config: Qwen35Config, key: jax.Array, dtype: jnp.dtype = jnp.float32) -> dict:
     """Initialize all model parameters as a nested dict pytree.
+
+    Args:
+        config: model config.
+        key: PRNG key.
+        dtype: parameter dtype (use jnp.bfloat16 for large models to save memory).
 
     Structure:
         embed: (vocab_size, d_model)
@@ -126,7 +131,7 @@ def init_params(config: Qwen35Config, key: jax.Array) -> dict:
     key_idx = 0
 
     # Embedding
-    embed = jax.random.normal(keys[key_idx], (config.vocab_size, config.d_model)) * 0.02
+    embed = jax.random.normal(keys[key_idx], (config.vocab_size, config.d_model), dtype=dtype) * 0.02
     key_idx += 1
 
     # Groups
@@ -136,11 +141,11 @@ def init_params(config: Qwen35Config, key: jax.Array) -> dict:
         delta_keys = jax.random.split(keys[key_idx], 3)
         key_idx += 1
         delta_layers = _stack_tree([
-            _init_delta_layer_params(delta_keys[i], config) for i in range(3)
+            _init_delta_layer_params(delta_keys[i], config, dtype) for i in range(3)
         ])
 
         # 1 GQA layer
-        gqa_layer = _init_gqa_layer_params(keys[key_idx], config)
+        gqa_layer = _init_gqa_layer_params(keys[key_idx], config, dtype)
         key_idx += 1
 
         group_params_list.append({
@@ -151,8 +156,8 @@ def init_params(config: Qwen35Config, key: jax.Array) -> dict:
     groups = _stack_tree(group_params_list)
 
     # Final norm + lm_head
-    final_norm = jnp.zeros(config.d_model)
-    lm_head = jax.random.normal(keys[key_idx], (config.d_model, config.vocab_size)) * 0.02
+    final_norm = jnp.zeros(config.d_model, dtype=dtype)
+    lm_head = jax.random.normal(keys[key_idx], (config.d_model, config.vocab_size), dtype=dtype) * 0.02
 
     return {
         'embed': embed,

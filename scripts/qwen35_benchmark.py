@@ -243,18 +243,15 @@ def main():
     print(f"  Profile:        {args.profile}")
 
     # Initialize model
-    print(f"\nInitializing model...")
+    param_dtype = jnp.bfloat16 if args.dtype == 'bfloat16' else jnp.float32
+    print(f"\nInitializing model ({args.dtype})...")
     t0 = time.perf_counter()
-    params = init_params(cfg, jax.random.key(0))
+    params = init_params(cfg, jax.random.key(0), dtype=param_dtype)
     n_params = count_params(params)
+    bytes_per_param = 2 if args.dtype == 'bfloat16' else 4
     init_ms = (time.perf_counter() - t0) * 1000
-    print(f"  Params:         {n_params:,} ({n_params * 4 / 1e9:.2f} GB fp32)")
+    print(f"  Params:         {n_params:,} ({n_params * bytes_per_param / 1e9:.2f} GB {args.dtype})")
     print(f"  Init time:      {init_ms:.0f} ms")
-
-    # Convert dtype
-    if args.dtype == 'bfloat16':
-        params = jax.tree.map(lambda x: x.astype(jnp.bfloat16), params)
-        print(f"  Converted to bfloat16")
 
     # Setup mesh and sharding
     mesh = None
