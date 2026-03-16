@@ -244,7 +244,7 @@ def run_prefill_benchmark(
     @jax.jit
     def prefill(p, t, c):
         return forward(p, t, cfg, cache=c, is_decode=False,
-                       cache_sharding=cache_sharding, n_devices=n_devices)
+                       cache_sharding=cache_sharding, n_devices=n_devices, mesh=mesh)
 
     # Warm-up
     print("  Compiling prefill...")
@@ -284,7 +284,7 @@ def run_decode_benchmark(
         # Prefill
         logits, cache_after = forward(
             p, prompt, cfg, cache=initial_cache, is_decode=False,
-            cache_sharding=cache_sharding, n_devices=n_devices,
+            cache_sharding=cache_sharding, n_devices=n_devices, mesh=mesh,
         )
         first_token = jnp.argmax(logits[:, -1, :], axis=-1)
 
@@ -293,7 +293,7 @@ def run_decode_benchmark(
             token, c, key = carry
             step_logits, new_c = forward(
                 p, token[:, None], cfg, cache=c, is_decode=True,
-                cache_sharding=cache_sharding, n_devices=n_devices,
+                cache_sharding=cache_sharding, n_devices=n_devices, mesh=mesh,
             )
             key, subkey = jax.random.split(key)
             next_token = jnp.argmax(step_logits[:, 0, :], axis=-1)

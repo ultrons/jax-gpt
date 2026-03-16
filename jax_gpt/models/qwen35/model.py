@@ -213,6 +213,7 @@ def forward(
     cache_sharding: dict | None = None,
     n_devices: int = 1,
     axis_name: str = 'tp',
+    mesh=None,
 ) -> tuple[jax.Array, HybridCache | None]:
     """Full model forward pass.
 
@@ -267,7 +268,7 @@ def forward(
             g_delta_M, g_delta_conv,
             g_gqa_k, g_gqa_v,
             cache_pos, config, rope_freqs, is_decode,
-            n_devices=n_devices, axis_name=axis_name,
+            n_devices=n_devices, mesh=mesh, axis_name=axis_name,
         )
 
         # Apply sharding constraints on cache outputs to prevent XLA
