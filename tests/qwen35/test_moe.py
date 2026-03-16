@@ -6,7 +6,7 @@ import pytest
 
 from jax_gpt.models.qwen35.config import Qwen35Config
 from jax_gpt.models.qwen35.moe import (
-    expert_forward,
+    expert_forward_single,
     moe_layer,
     moe_routing,
     shared_expert_forward,
@@ -43,12 +43,10 @@ def test_routing_shapes():
     x = jax.random.normal(key, (M, D))
     gate_w = jax.random.normal(jax.random.key(1), (D, cfg.n_routed_experts)) * 0.02
 
-    indices, weights, sorted_ids, group_sizes = moe_routing(x, gate_w, k)
+    indices, weights = moe_routing(x, gate_w, k)
 
     assert indices.shape == (M, k)
     assert weights.shape == (M, k)
-    assert sorted_ids.shape == (M * k,)
-    assert group_sizes.shape == (cfg.n_routed_experts,)
 
 
 def test_routing_weights_sum_to_one():
@@ -57,19 +55,9 @@ def test_routing_weights_sum_to_one():
     x = jax.random.normal(jax.random.key(2), (M, D))
     gate_w = jax.random.normal(jax.random.key(3), (D, E)) * 0.1
 
-    _, weights, _, _ = moe_routing(x, gate_w, k)
+    _, weights = moe_routing(x, gate_w, k)
     sums = jnp.sum(weights, axis=-1)
     assert jnp.allclose(sums, 1.0, atol=1e-5)
-
-
-def test_routing_group_sizes_sum():
-    """Group sizes should sum to M * k."""
-    M, D, E, k = 16, 64, 4, 2
-    x = jax.random.normal(jax.random.key(4), (M, D))
-    gate_w = jax.random.normal(jax.random.key(5), (D, E)) * 0.1
-
-    _, _, _, group_sizes = moe_routing(x, gate_w, k)
-    assert int(jnp.sum(group_sizes)) == M * k
 
 
 def test_shared_expert_shape():
