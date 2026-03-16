@@ -1,8 +1,8 @@
-PROFILE_DIR=/tmp/qwen35_profiles python scripts/qwen35_benchmark.py     --config full     --sharding B     --devices 4     --batch-size 1     --prompt-len 128     --decode-steps 32    --dtype fp8 --profile --roofline --chunk-size 32 --n-layers 8
+~/jax-gpt$ PROFILE_DIR=/tmp/qwen35_profiles python scripts/qwen35_benchmark.py     --config full     --sharding B     --devices 4     --batch-size 1     --prompt-len 128     --decode-steps 32    --dtype fp8 --profile --chunk-size 32 --n-layers 4
 ======================================================================
 QWEN3.5 INFERENCE BENCHMARK
 ======================================================================
-  Config:         full (8L, 4096D, 512E top-10)
+  Config:         full (4L, 4096D, 512E top-10)
   Sharding:       Config B
   Devices:        4x tpu
   Batch size:     1
@@ -15,41 +15,51 @@ QWEN3.5 INFERENCE BENCHMARK
   Profile:        True
 
 Initializing model (fp8)...
-  Params:         54,609,189,376 (109.22 GB bfloat16)
-  Init time:      178562 ms
-  Quantizing weights to FP8...
-  FP8 weights:    53,591,670,784 / 54,634,848,000 (98%)
-  Est. memory:    55.68 GB (weights fp8 + cache/activations bf16)
-  Quant time:     86910 ms
+  Params:         28,334,668,932 (fp8 weights + bf16 norms/cache)
+  FP8 weights:    27,304,411,136 / 28,334,668,932 (96%)
+  Est. memory:    29.36 GB
+  Init time:      89897 ms
 
 Sharding params across 4 devices...
-  Shard time:     4244 ms
-  [roofline] prefill failed: 'dict' object has no attribute 'shape'
-  [roofline] decode failed: 'dict' object has no attribute 'shape'
-E0316 18:16:54.188960  607566 watchdog.cc:436] RAW: Watchdog: TpuSyncFlagReadCallbackWatchdog (pthread id: 7f9827928640, tid: 609592) expired; Thread id 609592 last called Alive() 64s ago (18:15:50); timeout is 60s
+  Shard time:     9255 ms
 
-E0316 18:16:54.189013  607566 watchdog.cc:333] RAW: Stack trace of thread 609592:
-E0316 18:16:54.189038  607566 watchdog.cc:349] RAW: Thread 609592 not found.
-Kernel stack unavailable.
-F0316 18:16:54.189064  607566 watchdog.cc:442] Watchdog: TpuSyncFlagReadCallbackWatchdog (pthread id: 7f9827928640, tid: 609592) expired; Thread id 609592 last called Alive() 64s ago (18:15:50); timeout is 60s
-*** Check failure stack trace: ***
-    @     0x7fa223729d24  absl::log_internal::LogMessage::SendToLog()
-    @     0x7fa223729cd8  absl::log_internal::LogMessage::Flush()
-    @     0x7fa2239d2d7c  WatchDog::TimedOutInternal()
-    @     0x7fa2235869de  WatchDog::CheckTimeout()
-    @     0x7fa223586562  WatchDog::CheckAlive()
-    @     0x7fa223582a77  (anonymous namespace)::ThreadLivenessWatcher()
-    @     0x7fa2d7c94ac3  (unknown)
-https://symbolize.stripped_domain/r/?trace=7fa223729d23,7fa223729cd7,7fa2239d2d7b,7fa2235869dd,7fa223586561,7fa223582a76,7fa2d7c94ac2&map= 
-https://symbolize.stripped_domain/r/?trace=7fa2d7c969fc,7fa2d7c4251f&map= 
-*** SIGABRT received by PID 607480 (TID 607566) on cpu 108, si_code=-6, from PID 607480; ***
-E0316 18:16:54.261063  607566 coredump_hook.cc:310] RAW: Remote crash data gathering hook invoked.
-E0316 18:16:54.261072  607566 coredump_hook.cc:349] RAW: Skipping coredump since rlimit was 0 at process start.
-E0316 18:16:54.261081  607566 client.cc:261] RAW: Coroner client retries enabled, will retry for up to 30 sec.
-E0316 18:16:54.261086  607566 coredump_hook.cc:405] RAW: Sending fingerprint to remote end.
-E0316 18:16:54.261100  607566 coredump_hook.cc:415] RAW: Cannot send fingerprint to Coroner: [NOT_FOUND] stat failed on crash reporting socket /var/google/services/logmanagerd/remote_coredump.socket (Is the listener running?): No such file or directory
-E0316 18:16:54.261106  607566 coredump_hook.cc:467] RAW: Dumping core locally.
+──────────────────────────────────────────────────────────────────────
+PREFILL BENCHMARK
+──────────────────────────────────────────────────────────────────────
+  Compiling prefill...
+Traceback (most recent call last):
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 488, in <module>
+    main()
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 467, in main
+    run_prefill_benchmark(
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 251, in run_prefill_benchmark
+    logits, _ = prefill(params, tokens, cache)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 246, in prefill
+    return forward(p, t, cfg, cache=c, is_decode=False, cache_sharding=cache_sharding)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 285, in forward
+    x, (new_dMs, new_dConvs, new_gKs, new_gVs) = jax.lax.scan(
+                                                 ^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 263, in _group_step
+    x_carry, new_dM, new_dC, new_gk, new_gv = group_forward(
+                                              ^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/block.py", line 118, in group_forward
+    x, (new_Ms, new_convs) = jax.lax.scan(
+                             ^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/block.py", line 111, in _delta_step
+    x_carry, new_M, new_conv = deltanet_layer_forward(
+                               ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/block.py", line 53, in deltanet_layer_forward
+    moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/moe.py", line 192, in moe_layer
+    expert_indices, expert_weights, sorted_token_ids, group_sizes = moe_routing(
+                                                                    ^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/moe.py", line 33, in moe_routing
+    n_experts = gate_weight.shape[1]
+                ^^^^^^^^^^^^^^^^^
+AttributeError: 'dict' object has no attribute 'shape'
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 
-^Z
-
-[1]+  Stopped                 PROFILE_DIR=/tmp/qwen35_profiles python scripts/qwen35_benchmark.py --config full --sharding B --devices 4 --batch-size 1 --prompt-len 128 --decode-steps 32 --dtype fp8 --profile --roofline --chunk-size 32 --n-layers 8
