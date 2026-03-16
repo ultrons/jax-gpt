@@ -352,6 +352,8 @@ def main():
                         help='float32/bfloat16: uniform dtype. fp8: weights in fp8, activations/cache in bf16.')
     parser.add_argument('--chunk-size', type=int, default=None,
                         help='DeltaNet prefill chunk size (default: from config)')
+    parser.add_argument('--n-layers', type=int, default=None,
+                        help='Override number of layers (must be divisible by 4)')
     parser.add_argument('--roofline', action='store_true',
                         help='Print roofline analysis (FLOPs, HBM, arithmetic intensity). '
                              'Tracing can be slow for large models — use --chunk-size 32 for faster analysis.')
@@ -361,10 +363,17 @@ def main():
         args.max_seq_len = args.prompt_len + args.decode_steps + 64
 
     # Config
+    from dataclasses import replace
     cfg = get_config(args.config)
+    overrides = {}
     if args.chunk_size is not None:
-        from dataclasses import replace
-        cfg = replace(cfg, delta_chunk_size=args.chunk_size)
+        overrides['delta_chunk_size'] = args.chunk_size
+    if args.n_layers is not None:
+        assert args.n_layers % cfg.full_attention_interval == 0, \
+            f"--n-layers must be divisible by {cfg.full_attention_interval}"
+        overrides['n_layers'] = args.n_layers
+    if overrides:
+        cfg = replace(cfg, **overrides)
     axis_rules = get_axis_rules(args.sharding)
 
     print("=" * 70)
