@@ -47,8 +47,8 @@ def _causal_conv1d_update(
     """
     # Shift state left and append new input (preserve conv_state dtype)
     new_state = jnp.concatenate([conv_state[..., 1:], x.astype(conv_state.dtype)], axis=-1)
-    # Depthwise conv: sum(state * weight) per channel
-    out = jnp.sum(new_state * conv_weight[None, :, :], axis=-1, keepdims=True)
+    # Depthwise conv: sum(state * weight) per channel — match dtypes
+    out = jnp.sum(new_state * conv_weight.astype(new_state.dtype)[None, :, :], axis=-1, keepdims=True)
     out = jax.nn.silu(out)
     return out, new_state
 
@@ -70,7 +70,8 @@ def _causal_conv1d_prefill(
         output: (B, conv_dim, T) after causal depthwise conv + silu.
         final_conv_state: (B, conv_dim, kernel_size) for subsequent decode.
     """
-    # Pad left for causal conv
+    # Pad left for causal conv — ensure matching dtypes
+    x = x.astype(conv_weight.dtype)
     x_padded = jnp.pad(x, ((0, 0), (0, 0), (kernel_size - 1, 0)))
     # Depthwise conv via lax.conv_general_dilated
     # weight: (conv_dim, kernel_size) -> (conv_dim, 1, kernel_size) for group conv
