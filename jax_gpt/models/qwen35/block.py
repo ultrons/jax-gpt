@@ -113,14 +113,12 @@ def group_forward(
         )
         return x_carry, (new_M, new_conv)
 
-    with jax.named_scope('deltanet_layers'):
-        delta_layer_params = group_params['delta_layers']
-        x, (new_Ms, new_convs) = jax.lax.scan(
-            _delta_step, x, (delta_layer_params, delta_Ms, delta_convs),
-        )
+    delta_layer_params = group_params['delta_layers']
+    x, (new_Ms, new_convs) = jax.lax.scan(
+        _delta_step, x, (delta_layer_params, delta_Ms, delta_convs),
+    )
 
-    with jax.named_scope('gqa_layer'):
-        x, new_gqa_k, new_gqa_v = gqa_layer_forward(
+    x, new_gqa_k, new_gqa_v = gqa_layer_forward(
             x, group_params['gqa_layer'],
             gqa_k, gqa_v, cache_pos,
             config, rope_freqs,

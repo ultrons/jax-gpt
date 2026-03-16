@@ -30,7 +30,11 @@ def moe_routing(
         sorted_indices: (M*k,) token indices sorted by expert assignment.
         group_sizes: (n_experts,) number of tokens assigned to each expert.
     """
-    n_experts = gate_weight.shape[1]
+    # Extract n_experts from shape (handle fp8 dict or plain array)
+    if isinstance(gate_weight, dict) and 'w' in gate_weight:
+        n_experts = gate_weight['w'].shape[0]  # fp8 layout is (out=E, in=D)
+    else:
+        n_experts = gate_weight.shape[1]       # regular layout is (D, E)
 
     # Router: softmax over ALL experts, then top-k, then renormalize
     # (matches HF Qwen3.5 router)
