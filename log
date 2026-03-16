@@ -1,53 +1,55 @@
+NFERENCE BENCHMARK
 ======================================================================
-QWEN3.5 INFERENCE BENCHMARK
-======================================================================
-  Config:         mini (8L, 1024D, 4E top-2)
+  Config:         mid (16L, 4096D, 16E top-4)
   Sharding:       Config B
   Devices:        4x tpu
   Batch size:     1
   Prompt len:     512
   Decode steps:   128
   Max seq len:    704
+  Chunk size:     256
   Dtype:          bfloat16
   Runs:           5
-  Profile:        False
+  Profile:        True
 
-Initializing model...
-  Params:         603,662,688 (2.41 GB fp32)
-  Init time:      18445 ms
-  Converted to bfloat16
+Initializing model (bfloat16)...
+  Params:         7,293,641,728 (14.59 GB bfloat16)
+  Init time:      40009 ms
 
 Sharding params across 4 devices...
-  Shard time:     1432 ms
+  Shard time:     2753 ms
 
 ──────────────────────────────────────────────────────────────────────
 PREFILL BENCHMARK
 ──────────────────────────────────────────────────────────────────────
   Compiling prefill...
-  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 309, in <module>
+  Compilation: 12534 ms
+  Profiling to: /tmp/qwen35_profiles/prefill
+
+  PREFILL RESULTS
+  Avg latency:         75.83 ms
+  Throughput:          6,752 tokens/sec
+  Tokens:              1 × 512 = 512
+
+──────────────────────────────────────────────────────────────────────
+DECODE BENCHMARK
+──────────────────────────────────────────────────────────────────────
+  Compiling decode (lax.scan)...
+Traceback (most recent call last):
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 439, in <module>
     main()
-  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 288, in main
-    run_prefill_benchmark(
-  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 119, in run_prefill_benchmark
-    logits, _ = prefill(params, tokens, cache)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 114, in prefill
-    return forward(p, t, cfg, cache=c, is_decode=False, cache_sharding=cache_sharding)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 247, in forward
-    x, (new_dMs, new_dConvs, new_gKs, new_gVs) = jax.lax.scan(
-                                                 ^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 225, in _group_step
-    x_carry, new_dM, new_dC, new_gk, new_gv = group_forward(
-                                              ^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/block.py", line 150, in group_forward
-    x, (new_Ms, new_convs) = jax.lax.scan( 
-                             ^^^^^^^^^^^^^ 
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 428, in main
+    run_decode_benchmark(
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 300, in run_decode_benchmark
+    generated = generate_scan(params, prompt_tokens, cache, rng)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 289, in generate_scan
+    _, generated = jax.lax.scan(
+                   ^^^^^^^^^^^^^
 TypeError: scan body function carry input and carry output must have equal types, but they differ:
 
-The input carry carry has type bfloat16[1,512,1024] but the corresponding output carry component has type float32[1,512,1024], so the dtypes do not match.
+The input carry component carry[1].delta_M has type float32[4,3,1,64,128,128] but the corresponding output carry component has type bfloat16[4,3,1,64,128,128], so the dtypes do not match.
 
 Revise the function so that all output types match the corresponding input types.
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
-──────────────────────────────────────────────────────────────────────
