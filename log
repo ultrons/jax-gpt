@@ -1,4 +1,5 @@
-NFERENCE BENCHMARK
+======================================================================
+QWEN3.5 INFERENCE BENCHMARK
 ======================================================================
   Config:         mid (16L, 4096D, 16E top-4)
   Sharding:       Config B
@@ -14,21 +15,44 @@ NFERENCE BENCHMARK
 
 Initializing model (bfloat16)...
   Params:         7,293,641,728 (14.59 GB bfloat16)
-  Init time:      40009 ms
+  Init time:      39859 ms
 
 Sharding params across 4 devices...
-  Shard time:     2753 ms
+  Shard time:     2749 ms
+
+==============================================================================
+ROOFLINE ANALYSIS (B=1)
+==============================================================================
+
+  Overall                             FLOPs        HBM         AI      Bound
+  ------------------------------------------------------------------------
+  Prefill (full model)           1.32 TFLOP    6.30 GB    209.3x    COMPUTE
+                                  roofline:      2.87ms (compute=2.87, mem=2.25)
+  Decode (full model)            2.56 GFLOP    2.57 GB      1.0x     MEMORY
+                                  roofline:      0.92ms (compute=0.01, mem=0.92)
+
+  Per module (1 layer)                FLOPs        HBM         AI      Bound
+  ------------------------------------------------------------------------
+  DeltaNet attn (T=512)        132.42 GFLOP    3.50 GB     37.9x     MEMORY
+  DeltaNet attn (T=1)           242.2 MFLOP   248.8 MB      1.0x     MEMORY
+  GQA attn (T=512)             115.96 GFLOP   391.1 MB    296.5x    COMPUTE
+  MoE (T=512)                   12.96 GFLOP    49.4 MB    262.1x    COMPUTE
+  MoE (T=1)                      25.3 MFLOP    25.4 MB      1.0x     MEMORY
+
+  TPU v5p reference: 459 TFLOPS bf16, 2.8 TB/s HBM, ridge=164 FLOPs/byte
+==============================================================================
+
 
 ──────────────────────────────────────────────────────────────────────
 PREFILL BENCHMARK
 ──────────────────────────────────────────────────────────────────────
   Compiling prefill...
-  Compilation: 12534 ms
+  Compilation: 12236 ms
   Profiling to: /tmp/qwen35_profiles/prefill
 
   PREFILL RESULTS
-  Avg latency:         75.83 ms
-  Throughput:          6,752 tokens/sec
+  Avg latency:         75.82 ms
+  Throughput:          6,753 tokens/sec
   Tokens:              1 × 512 = 512
 
 ──────────────────────────────────────────────────────────────────────
@@ -53,3 +77,4 @@ The input carry component carry[1].delta_M has type float32[4,3,1,64,128,128] bu
 Revise the function so that all output types match the corresponding input types.
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+
