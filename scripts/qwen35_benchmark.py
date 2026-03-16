@@ -236,14 +236,15 @@ def get_axis_rules(name: str) -> dict | None:
 
 def run_prefill_benchmark(
     params, cfg, cache, tokens, cache_sharding,
-    n_runs: int, profile: bool, mesh,
+    n_runs: int, profile: bool, mesh, n_devices: int = 1,
 ):
     """Benchmark prefill latency."""
     B, T = tokens.shape
 
     @jax.jit
     def prefill(p, t, c):
-        return forward(p, t, cfg, cache=c, is_decode=False, cache_sharding=cache_sharding)
+        return forward(p, t, cfg, cache=c, is_decode=False,
+                       cache_sharding=cache_sharding, n_devices=n_devices)
 
     # Warm-up
     print("  Compiling prefill...")
@@ -273,7 +274,7 @@ def run_prefill_benchmark(
 
 def run_decode_benchmark(
     params, cfg, cache, prompt_tokens, n_decode_steps, cache_sharding,
-    n_runs: int, profile: bool, mesh,
+    n_runs: int, profile: bool, mesh, n_devices: int = 1,
 ):
     """Benchmark decode latency using lax.scan (single HLO)."""
     B = prompt_tokens.shape[0]
@@ -283,7 +284,7 @@ def run_decode_benchmark(
         # Prefill
         logits, cache_after = forward(
             p, prompt, cfg, cache=initial_cache, is_decode=False,
-            cache_sharding=cache_sharding,
+            cache_sharding=cache_sharding, n_devices=n_devices,
         )
         first_token = jnp.argmax(logits[:, -1, :], axis=-1)
 
@@ -292,7 +293,7 @@ def run_decode_benchmark(
             token, c, key = carry
             step_logits, new_c = forward(
                 p, token[:, None], cfg, cache=c, is_decode=True,
-                cache_sharding=cache_sharding,
+                cache_sharding=cache_sharding, n_devices=n_devices,
             )
             key, subkey = jax.random.split(key)
             next_token = jnp.argmax(step_logits[:, 0, :], axis=-1)
@@ -459,6 +460,8 @@ def main():
     # Run benchmarks
     ctx = mesh if mesh is not None else contextlib.nullcontext()
 
+    n_ep_devices = (args.devices or jax.device_count()) if axis_rules is not None else 1
+
     with ctx:
         if not args.skip_prefill:
             print(f"\n{'─'*70}")
@@ -466,7 +469,7 @@ def main():
             print(f"{'─'*70}")
             run_prefill_benchmark(
                 params, cfg, cache, tokens, cache_sharding,
-                args.n_runs, args.profile, mesh,
+                args.n_runs, args.profile, mesh, n_devices=n_ep_devices,
             )
 
         if not args.skip_decode:
@@ -476,7 +479,7 @@ def main():
             prompt = jnp.ones((args.batch_size, args.prompt_len), dtype=jnp.int32)
             run_decode_benchmark(
                 params, cfg, cache, prompt, args.decode_steps, cache_sharding,
-                args.n_runs, args.profile, mesh,
+                args.n_runs, args.profile, mesh, n_devices=n_ep_devices,
             )
 
     print(f"\n{'='*70}")

@@ -23,6 +23,8 @@ def deltanet_layer_forward(
     delta_conv: jax.Array,
     config: Qwen35Config,
     is_decode: bool,
+    n_devices: int = 1,
+    axis_name: str = 'tp',
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Single DeltaNet layer: pre-norm -> attention -> residual -> pre-norm -> MoE -> residual."""
 
@@ -50,7 +52,8 @@ def deltanet_layer_forward(
 
     with jax.named_scope('deltanet_moe'):
         normed = rms_norm(x, params['moe_norm'], config.rms_norm_eps)
-        moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token)
+        moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token,
+                            n_devices=n_devices, axis_name=axis_name)
 
     x = x + moe_out
     return x, new_M, new_conv
@@ -64,6 +67,8 @@ def gqa_layer_forward(
     cache_pos: jax.Array | None,
     config: Qwen35Config,
     rope_freqs: jax.Array,
+    n_devices: int = 1,
+    axis_name: str = 'tp',
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Single GQA layer: pre-norm -> attention -> residual -> pre-norm -> MoE -> residual."""
 
@@ -80,7 +85,8 @@ def gqa_layer_forward(
 
     with jax.named_scope('gqa_moe'):
         normed = rms_norm(x, params['moe_norm'], config.rms_norm_eps)
-        moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token)
+        moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token,
+                            n_devices=n_devices, axis_name=axis_name)
 
     x = x + moe_out
     # Ensure cache dtypes match input for scan carry compatibility
@@ -101,6 +107,8 @@ def group_forward(
     config: Qwen35Config,
     rope_freqs: jax.Array,
     is_decode: bool,
+    n_devices: int = 1,
+    axis_name: str = 'tp',
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Forward pass through one 4-layer group (3 DeltaNet + 1 GQA)."""
 
@@ -110,6 +118,7 @@ def group_forward(
         layer_params, M_i, conv_i = layer_inputs
         x_carry, new_M, new_conv = deltanet_layer_forward(
             x_carry, layer_params, M_i, conv_i, config, is_decode,
+            n_devices=n_devices, axis_name=axis_name,
         )
         return x_carry, (new_M, new_conv)
 
@@ -122,6 +131,7 @@ def group_forward(
             x, group_params['gqa_layer'],
             gqa_k, gqa_v, cache_pos,
             config, rope_freqs,
+            n_devices=n_devices, axis_name=axis_name,
         )
 
     return x, new_Ms, new_convs, new_gqa_k, new_gqa_v
