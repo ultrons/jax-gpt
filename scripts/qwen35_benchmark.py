@@ -85,20 +85,29 @@ def run_roofline_analysis(params, cfg, cache, prompt_len, batch_size):
 
     B = batch_size
     T = prompt_len
+    param_dtype = params['embed'].dtype
     param_shapes = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), params)
     cache_shapes = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), cache)
+
+    def _try_roofline(name, fn, *args):
+        try:
+            _, r = roofline(fn)(*args)
+            return r
+        except Exception as e:
+            print(f"  [roofline] {name} failed: {e}")
+            return None
 
     # Overall prefill
     tok_pre = jax.ShapeDtypeStruct((B, T), jnp.int32)
     def fwd_pre(p, t, c):
         return forward(p, t, cfg, cache=c, is_decode=False)
-    _, pre_r = roofline(fwd_pre)(param_shapes, tok_pre, cache_shapes)
+    pre_r = _try_roofline('prefill', fwd_pre, param_shapes, tok_pre, cache_shapes)
 
     # Overall decode
     tok_dec = jax.ShapeDtypeStruct((B, 1), jnp.int32)
     def fwd_dec(p, t, c):
         return forward(p, t, cfg, cache=c, is_decode=True)
-    _, dec_r = roofline(fwd_dec)(param_shapes, tok_dec, cache_shapes)
+    dec_r = _try_roofline('decode', fwd_dec, param_shapes, tok_dec, cache_shapes)
 
     # Per-module shapes
     delta_params = jax.tree.map(lambda x: x[0, 0], params['groups']['delta_layers'])
@@ -107,14 +116,14 @@ def run_roofline_analysis(params, cfg, cache, prompt_len, batch_size):
     gqa_params = jax.tree.map(lambda x: x[0], params['groups']['gqa_layer'])
     gqa_attn_s = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), gqa_params['attn'])
 
-    x_T = jax.ShapeDtypeStruct((B, T, cfg.d_model), params['embed'].dtype)
-    x_1 = jax.ShapeDtypeStruct((B, 1, cfg.d_model), params['embed'].dtype)
+    x_T = jax.ShapeDtypeStruct((B, T, cfg.d_model), param_dtype)
+    x_1 = jax.ShapeDtypeStruct((B, 1, cfg.d_model), param_dtype)
 
     key_dim = cfg.delta_n_qk_heads * cfg.delta_qk_head_dim
     value_dim = cfg.delta_n_v_heads * cfg.delta_v_head_dim
     conv_dim = key_dim * 2 + value_dim
-    state_s = jax.ShapeDtypeStruct((B, cfg.delta_n_v_heads, cfg.delta_qk_head_dim, cfg.delta_v_head_dim), jnp.float32)
-    conv_s = jax.ShapeDtypeStruct((B, conv_dim, cfg.delta_conv_kernel), jnp.float32)
+    state_s = jax.ShapeDtypeStruct((B, cfg.delta_n_v_heads, cfg.delta_qk_head_dim, cfg.delta_v_head_dim), param_dtype)
+    conv_s = jax.ShapeDtypeStruct((B, conv_dim, cfg.delta_conv_kernel), param_dtype)
 
     rope = precompute_rope_freqs(cfg.gqa_rope_dim, cfg.max_position_embeddings, cfg.gqa_rope_theta)
 
@@ -125,30 +134,30 @@ def run_roofline_analysis(params, cfg, cache, prompt_len, batch_size):
         return deltanet_prefill(x, p, cfg.delta_n_qk_heads, cfg.delta_n_v_heads,
                                 cfg.delta_qk_head_dim, cfg.delta_v_head_dim,
                                 cfg.delta_conv_kernel, chunk_size=cfg.delta_chunk_size)
-    _, r = roofline(dn_pre)(delta_attn_s, x_T)
-    modules.append((f'DeltaNet attn (T={T})', r))
+    r = _try_roofline('DeltaNet prefill', dn_pre, delta_attn_s, x_T)
+    if r: modules.append((f'DeltaNet attn (T={T})', r))
 
     # DeltaNet decode
     def dn_dec(p, x, s, c):
         return deltanet_recurrent_step(x, p, s, c, cfg.delta_n_qk_heads, cfg.delta_n_v_heads,
                                         cfg.delta_qk_head_dim, cfg.delta_v_head_dim)
-    _, r = roofline(dn_dec)(delta_attn_s, x_1, state_s, conv_s)
-    modules.append(('DeltaNet attn (T=1)', r))
+    r = _try_roofline('DeltaNet decode', dn_dec, delta_attn_s, x_1, state_s, conv_s)
+    if r: modules.append(('DeltaNet attn (T=1)', r))
 
     # GQA prefill
     def gqa_pre(p, x):
         return gqa_attention(x, p, cfg.gqa_n_q_heads, cfg.gqa_n_kv_heads, cfg.gqa_head_dim,
                              rope, cfg.gqa_rope_dim)
-    _, r = roofline(gqa_pre)(gqa_attn_s, x_T)
-    modules.append((f'GQA attn (T={T})', r))
+    r = _try_roofline('GQA prefill', gqa_pre, gqa_attn_s, x_T)
+    if r: modules.append((f'GQA attn (T={T})', r))
 
     # MoE
     def moe_fwd(p, x):
         return moe_layer(x, p, cfg.n_experts_per_token)
-    _, r = roofline(moe_fwd)(delta_moe_s, x_T)
-    modules.append((f'MoE (T={T})', r))
-    _, r = roofline(moe_fwd)(delta_moe_s, x_1)
-    modules.append(('MoE (T=1)', r))
+    r = _try_roofline('MoE prefill', moe_fwd, delta_moe_s, x_T)
+    if r: modules.append((f'MoE (T={T})', r))
+    r = _try_roofline('MoE decode', moe_fwd, delta_moe_s, x_1)
+    if r: modules.append(('MoE (T=1)', r))
 
     # TPU v5p: 459 TFLOPS bf16, 2.8 TB/s HBM bandwidth
     tpu_flops = 459e12
@@ -160,23 +169,26 @@ def run_roofline_analysis(params, cfg, cache, prompt_len, batch_size):
     print(f"\n  {'Overall':<28s} {'FLOPs':>12s} {'HBM':>10s} {'AI':>10s} {'Bound':>10s}")
     print(f"  {'-'*72}")
     for name, r in [('Prefill (full model)', pre_r), ('Decode (full model)', dec_r)]:
+        if r is None:
+            print(f"  {name:<28s} {'(failed)':>12s}")
+            continue
         ai = r.flops / max(r.hbm_bytes, 1)
         ridge = tpu_flops / tpu_bw  # ~164 FLOPs/byte for v5p
         bound = 'COMPUTE' if ai > ridge else 'MEMORY'
-        # Theoretical time
         t_compute = r.flops / tpu_flops * 1000  # ms
         t_memory = r.hbm_bytes / tpu_bw * 1000  # ms
         t_roof = max(t_compute, t_memory)
         print(f"  {name:<28s} {_fmt_flops(r.flops):>12s} {_fmt_bytes(r.hbm_bytes):>10s} {ai:>8.1f}x {bound:>10s}")
         print(f"  {'':28s} {'roofline:':>12s} {t_roof:>9.2f}ms (compute={t_compute:.2f}, mem={t_memory:.2f})")
 
-    print(f"\n  {'Per module (1 layer)':<28s} {'FLOPs':>12s} {'HBM':>10s} {'AI':>10s} {'Bound':>10s}")
-    print(f"  {'-'*72}")
-    for name, r in modules:
-        ai = r.flops / max(r.hbm_bytes, 1)
-        ridge = tpu_flops / tpu_bw
-        bound = 'COMPUTE' if ai > ridge else 'MEMORY'
-        print(f"  {name:<28s} {_fmt_flops(r.flops):>12s} {_fmt_bytes(r.hbm_bytes):>10s} {ai:>8.1f}x {bound:>10s}")
+    if modules:
+        print(f"\n  {'Per module (1 layer)':<28s} {'FLOPs':>12s} {'HBM':>10s} {'AI':>10s} {'Bound':>10s}")
+        print(f"  {'-'*72}")
+        for name, r in modules:
+            ai = r.flops / max(r.hbm_bytes, 1)
+            ridge = tpu_flops / tpu_bw
+            bound = 'COMPUTE' if ai > ridge else 'MEMORY'
+            print(f"  {name:<28s} {_fmt_flops(r.flops):>12s} {_fmt_bytes(r.hbm_bytes):>10s} {ai:>8.1f}x {bound:>10s}")
 
     print(f"\n  TPU v5p reference: {tpu_flops/1e12:.0f} TFLOPS bf16, {tpu_bw/1e12:.1f} TB/s HBM, ridge={tpu_flops/tpu_bw:.0f} FLOPs/byte")
     print(f"{'='*78}\n")
