@@ -348,11 +348,10 @@ def main():
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--skip-prefill', action='store_true')
     parser.add_argument('--skip-decode', action='store_true')
-    parser.add_argument('--dtype', default='float32', choices=['float32', 'bfloat16'])
+    parser.add_argument('--dtype', default='float32', choices=['float32', 'bfloat16', 'fp8'],
+                        help='float32/bfloat16: uniform dtype. fp8: weights in fp8, activations/cache in bf16.')
     parser.add_argument('--chunk-size', type=int, default=None,
                         help='DeltaNet prefill chunk size (default: from config)')
-    parser.add_argument('--fp8', action='store_true',
-                        help='Quantize weights to FP8 after init (reduces memory ~2x)')
     parser.add_argument('--roofline', action='store_true',
                         help='Print roofline analysis (FLOPs, HBM, arithmetic intensity). '
                              'Tracing can be slow for large models — use --chunk-size 32 for faster analysis.')
@@ -386,28 +385,31 @@ def main():
     print(f"  Profile:        {args.profile}")
 
     # Initialize model
-    param_dtype = jnp.bfloat16 if args.dtype == 'bfloat16' else jnp.float32
+    # fp8: init in bf16 then quantize weights to fp8 (activations/cache stay bf16)
+    use_fp8 = args.dtype == 'fp8'
+    init_dtype = jnp.bfloat16 if args.dtype in ('bfloat16', 'fp8') else jnp.float32
+    cache_dtype = init_dtype  # activations and cache always match init dtype
+
     print(f"\nInitializing model ({args.dtype})...")
     t0 = time.perf_counter()
-    params = init_params(cfg, jax.random.key(0), dtype=param_dtype)
+    params = init_params(cfg, jax.random.key(0), dtype=init_dtype)
     n_params = count_params(params)
-    bytes_per_param = 2 if args.dtype == 'bfloat16' else 4
+    bytes_per_param = 2 if init_dtype == jnp.bfloat16 else 4
     init_ms = (time.perf_counter() - t0) * 1000
-    print(f"  Params:         {n_params:,} ({n_params * bytes_per_param / 1e9:.2f} GB {args.dtype})")
+    print(f"  Params:         {n_params:,} ({n_params * bytes_per_param / 1e9:.2f} GB "
+          f"{'bfloat16' if init_dtype == jnp.bfloat16 else 'float32'})")
     print(f"  Init time:      {init_ms:.0f} ms")
 
-    # FP8 quantization
-    if args.fp8:
+    if use_fp8:
         from jax_gpt.models.qwen35.quantize import quantize_params_fp8, count_fp8_params
-        print(f"\nQuantizing to FP8...")
+        print(f"  Quantizing weights to FP8...")
         t0 = time.perf_counter()
         params = quantize_params_fp8(params)
         quant_ms = (time.perf_counter() - t0) * 1000
         total, fp8_count = count_fp8_params(params)
-        # Estimate memory: fp8 params use 1 byte, non-fp8 use bytes_per_param
         fp8_bytes = fp8_count * 1 + (total - fp8_count) * bytes_per_param
-        print(f"  FP8 params:     {fp8_count:,} / {total:,} ({100*fp8_count/max(total,1):.0f}%)")
-        print(f"  Est. memory:    {fp8_bytes / 1e9:.2f} GB")
+        print(f"  FP8 weights:    {fp8_count:,} / {total:,} ({100*fp8_count/max(total,1):.0f}%)")
+        print(f"  Est. memory:    {fp8_bytes / 1e9:.2f} GB (weights fp8 + cache/activations bf16)")
         print(f"  Quant time:     {quant_ms:.0f} ms")
 
     # Setup mesh and sharding
@@ -425,8 +427,7 @@ def main():
 
     # Inputs
     tokens = jnp.ones((args.batch_size, args.prompt_len), dtype=jnp.int32)
-    cache = init_cache(cfg, args.batch_size, args.max_seq_len,
-                       dtype=jnp.bfloat16 if args.dtype == 'bfloat16' else jnp.float32)
+    cache = init_cache(cfg, args.batch_size, args.max_seq_len, dtype=cache_dtype)
 
     if mesh is not None:
         cache = shard_cache(cache, mesh, cfg, axis_rules)
