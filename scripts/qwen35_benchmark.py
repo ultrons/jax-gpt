@@ -376,6 +376,10 @@ def main():
         overrides['n_layers'] = args.n_layers
     if args.n_experts is not None:
         overrides['n_routed_experts'] = args.n_experts
+        # Clamp top-k to not exceed number of experts
+        current_top_k = overrides.get('n_experts_per_token', cfg.n_experts_per_token)
+        if current_top_k > args.n_experts:
+            overrides['n_experts_per_token'] = min(current_top_k, args.n_experts)
     if overrides:
         cfg = replace(cfg, **overrides)
     axis_rules = get_axis_rules(args.sharding)
@@ -398,7 +402,6 @@ def main():
     print(f"  Profile:        {args.profile}")
 
     # Initialize model
-    # fp8: init in bf16 then quantize weights to fp8 (activations/cache stay bf16)
     use_fp8 = args.dtype == 'fp8'
     init_dtype = jnp.bfloat16 if args.dtype in ('bfloat16', 'fp8') else jnp.float32
     cache_dtype = init_dtype  # activations and cache always match init dtype
@@ -407,26 +410,22 @@ def main():
     print(f"\nInitializing model ({args.dtype})...")
     t0 = time.perf_counter()
     with jax.default_device(jax.devices('cpu')[0]):
-        params = init_params(cfg, jax.random.key(0), dtype=init_dtype)
+        params = init_params(cfg, jax.random.key(0), dtype=init_dtype, fp8=use_fp8)
     n_params = count_params(params)
-    bytes_per_param = 2 if init_dtype == jnp.bfloat16 else 4
     init_ms = (time.perf_counter() - t0) * 1000
-    print(f"  Params:         {n_params:,} ({n_params * bytes_per_param / 1e9:.2f} GB "
-          f"{'bfloat16' if init_dtype == jnp.bfloat16 else 'float32'})")
-    print(f"  Init time:      {init_ms:.0f} ms")
 
     if use_fp8:
-        from jax_gpt.models.qwen35.quantize import quantize_params_fp8, count_fp8_params
-        print(f"  Quantizing weights to FP8...")
-        t0 = time.perf_counter()
-        with jax.default_device(jax.devices('cpu')[0]):
-            params = quantize_params_fp8(params)
-        quant_ms = (time.perf_counter() - t0) * 1000
+        from jax_gpt.models.qwen35.quantize import count_fp8_params
         total, fp8_count = count_fp8_params(params)
-        fp8_bytes = fp8_count * 1 + (total - fp8_count) * bytes_per_param
+        non_fp8 = total - fp8_count
+        est_gb = (fp8_count * 1 + non_fp8 * 2) / 1e9  # fp8=1byte, rest=bf16=2bytes
+        print(f"  Params:         {n_params:,} (fp8 weights + bf16 norms/cache)")
         print(f"  FP8 weights:    {fp8_count:,} / {total:,} ({100*fp8_count/max(total,1):.0f}%)")
-        print(f"  Est. memory:    {fp8_bytes / 1e9:.2f} GB (weights fp8 + cache/activations bf16)")
-        print(f"  Quant time:     {quant_ms:.0f} ms")
+        print(f"  Est. memory:    {est_gb:.2f} GB")
+    else:
+        bytes_per = 2 if init_dtype == jnp.bfloat16 else 4
+        print(f"  Params:         {n_params:,} ({n_params * bytes_per / 1e9:.2f} GB {args.dtype})")
+    print(f"  Init time:      {init_ms:.0f} ms")
 
     # Setup mesh and sharding
     mesh = None
@@ -451,7 +450,11 @@ def main():
 
     # Roofline analysis (before benchmarks — no actual computation needed)
     if args.roofline:
-        run_roofline_analysis(params, cfg, cache, args.prompt_len, args.batch_size)
+        if use_fp8:
+            print("\n  [roofline] Skipped — not supported with fp8 params. "
+                  "Run with --dtype bfloat16 for roofline analysis.")
+        else:
+            run_roofline_analysis(params, cfg, cache, args.prompt_len, args.batch_size)
 
     # Run benchmarks
     ctx = mesh if mesh is not None else contextlib.nullcontext()
