@@ -60,6 +60,7 @@ def _make_hf_mini_model():
         delta_qk_head_dim=64,
         delta_v_head_dim=64,
         delta_conv_kernel=4,
+        delta_chunk_size=8,
         n_routed_experts=2,
         n_experts_per_token=1,
         moe_intermediate_size=128,
