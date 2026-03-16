@@ -13,6 +13,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
 from jax_gpt.models.qwen35.primitives import apply_rotary_emb, rms_norm
 
 
@@ -54,13 +55,13 @@ def gqa_attention(
     groups = n_q_heads // n_kv_heads
 
     with jax.named_scope('qkv_proj'):
-        q_gate = (x @ params['q_proj']).reshape(B, T, n_q_heads, head_dim * 2)
+        q_gate = matmul_maybe_fp8(x, params['q_proj']).reshape(B, T, n_q_heads, head_dim * 2)
     q = q_gate[..., :head_dim]      # (B, T, n_q_heads, head_dim)
     gate = q_gate[..., head_dim:]    # (B, T, n_q_heads, head_dim)
     gate = gate.reshape(B, T, -1)   # (B, T, n_q_heads * head_dim)
 
-    k = (x @ params['k_proj']).reshape(B, T, n_kv_heads, head_dim)
-    v = (x @ params['v_proj']).reshape(B, T, n_kv_heads, head_dim)
+    k = matmul_maybe_fp8(x, params['k_proj']).reshape(B, T, n_kv_heads, head_dim)
+    v = matmul_maybe_fp8(x, params['v_proj']).reshape(B, T, n_kv_heads, head_dim)
 
     # QK normalization (per-head RMSNorm)
     if 'q_norm' in params:
@@ -124,6 +125,6 @@ def gqa_attention(
     out = out * jax.nn.sigmoid(gate).astype(out.dtype)
 
     # Output projection
-    out = out @ params['o_proj']
+    out = matmul_maybe_fp8(out, params['o_proj'])
 
     return out.astype(x.dtype), cache_k, cache_v

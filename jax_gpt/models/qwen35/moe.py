@@ -9,6 +9,8 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
+
 
 def moe_routing(
     x: jax.Array,
@@ -32,7 +34,7 @@ def moe_routing(
 
     # Router: softmax over ALL experts, then top-k, then renormalize
     # (matches HF Qwen3.5 router)
-    logits = x @ gate_weight  # (M, n_experts)
+    logits = matmul_maybe_fp8(x, gate_weight)  # (M, n_experts)
     probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
     top_k_values, top_k_indices = jax.lax.top_k(probs, n_experts_per_token)
     # Renormalize selected expert weights
@@ -89,27 +91,32 @@ def expert_forward(
         (M, D) weighted sum of expert outputs.
     """
     M, D = x.shape
-    n_experts = gate_proj.shape[0]
     k = expert_indices.shape[1]
+
+    # Extract raw arrays from fp8 dicts if quantized
+    # For ragged_dot, dequantize expert weights back to activation dtype
+    # (native fp8 ragged_dot can be added later)
+    def _get_expert_weight(w):
+        if isinstance(w, dict) and 'w' in w:
+            # Dequantize: w is (E, out, in), scale_inv is (E, out, 1)
+            # Transpose back to (E, in, out) for ragged_dot
+            w_f = (w['w'].astype(jnp.float32) * w['scale_inv'])
+            return jnp.transpose(w_f, (*range(w_f.ndim - 2), w_f.ndim - 1, w_f.ndim - 2)).astype(x.dtype)
+        return w
+
+    gate_w = _get_expert_weight(gate_proj)
+    up_w = _get_expert_weight(up_proj)
+    down_w = _get_expert_weight(down_proj)
+    n_experts = gate_w.shape[0]
 
     # Gather tokens in expert-sorted order
     x_sorted = x[sorted_token_ids]  # (M*k, D)
 
     # SwiGLU expert computation via ragged_dot:
-    # Step 1: gate activations = silu(x_sorted @ gate_proj[expert])
-    gate_out = jax.lax.ragged_dot(x_sorted, gate_proj, group_sizes)  # (M*k, intermediate)
-    gate_out = jax.nn.silu(gate_out)
-
-    # Step 2: up activations = x_sorted @ up_proj[expert]
-    up_out = jax.lax.ragged_dot(x_sorted, up_proj, group_sizes)  # (M*k, intermediate)
-
-    # Step 3: combined = gate * up
-    hidden = gate_out * up_out  # (M*k, intermediate)
-
-    # Step 4: output = hidden @ down_proj[expert]
-    # down_proj shape is (n_experts, intermediate, D) — need to transpose for ragged_dot
-    # ragged_dot expects (g, k_dim, n_dim), and lhs is (M*k, intermediate)
-    expert_out = jax.lax.ragged_dot(hidden, down_proj, group_sizes)  # (M*k, D)
+    gate_out = jax.nn.silu(jax.lax.ragged_dot(x_sorted, gate_w, group_sizes))
+    up_out = jax.lax.ragged_dot(x_sorted, up_w, group_sizes)
+    hidden = gate_out * up_out
+    expert_out = jax.lax.ragged_dot(hidden, down_w, group_sizes)  # (M*k, D)
 
     # Scatter back: accumulate weighted expert outputs per token
     # Build the inverse mapping: for each sorted position, which token and which expert slot
@@ -150,9 +157,9 @@ def shared_expert_forward(
     Returns:
         (M, D)
     """
-    gate = jax.nn.silu(x @ gate_proj)
-    up = x @ up_proj
-    return (gate * up) @ down_proj
+    gate = jax.nn.silu(matmul_maybe_fp8(x, gate_proj))
+    up = matmul_maybe_fp8(x, up_proj)
+    return matmul_maybe_fp8(gate * up, down_proj)
 
 
 def moe_layer(
@@ -200,7 +207,7 @@ def moe_layer(
             params['shared_up_proj'],
             params['shared_down_proj'],
         )
-        shared_gate = jax.nn.sigmoid(x_flat @ params['shared_expert_gate_weight'])
+        shared_gate = jax.nn.sigmoid(matmul_maybe_fp8(x_flat, params['shared_expert_gate_weight']))
         shared_out = shared_gate * shared_out
 
     output = routed_out + shared_out
