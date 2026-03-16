@@ -354,6 +354,8 @@ def main():
                         help='DeltaNet prefill chunk size (default: from config)')
     parser.add_argument('--n-layers', type=int, default=None,
                         help='Override number of layers (must be divisible by 4)')
+    parser.add_argument('--n-experts', type=int, default=None,
+                        help='Override number of routed experts')
     parser.add_argument('--roofline', action='store_true',
                         help='Print roofline analysis (FLOPs, HBM, arithmetic intensity). '
                              'Tracing can be slow for large models — use --chunk-size 32 for faster analysis.')
@@ -372,6 +374,8 @@ def main():
         assert args.n_layers % cfg.full_attention_interval == 0, \
             f"--n-layers must be divisible by {cfg.full_attention_interval}"
         overrides['n_layers'] = args.n_layers
+    if args.n_experts is not None:
+        overrides['n_routed_experts'] = args.n_experts
     if overrides:
         cfg = replace(cfg, **overrides)
     axis_rules = get_axis_rules(args.sharding)
@@ -399,9 +403,11 @@ def main():
     init_dtype = jnp.bfloat16 if args.dtype in ('bfloat16', 'fp8') else jnp.float32
     cache_dtype = init_dtype  # activations and cache always match init dtype
 
+    # Init on CPU to avoid single-device OOM — sharding distributes to TPU later
     print(f"\nInitializing model ({args.dtype})...")
     t0 = time.perf_counter()
-    params = init_params(cfg, jax.random.key(0), dtype=init_dtype)
+    with jax.default_device(jax.devices('cpu')[0]):
+        params = init_params(cfg, jax.random.key(0), dtype=init_dtype)
     n_params = count_params(params)
     bytes_per_param = 2 if init_dtype == jnp.bfloat16 else 4
     init_ms = (time.perf_counter() - t0) * 1000
@@ -413,7 +419,8 @@ def main():
         from jax_gpt.models.qwen35.quantize import quantize_params_fp8, count_fp8_params
         print(f"  Quantizing weights to FP8...")
         t0 = time.perf_counter()
-        params = quantize_params_fp8(params)
+        with jax.default_device(jax.devices('cpu')[0]):
+            params = quantize_params_fp8(params)
         quant_ms = (time.perf_counter() - t0) * 1000
         total, fp8_count = count_fp8_params(params)
         fp8_bytes = fp8_count * 1 + (total - fp8_count) * bytes_per_param
@@ -436,7 +443,8 @@ def main():
 
     # Inputs
     tokens = jnp.ones((args.batch_size, args.prompt_len), dtype=jnp.int32)
-    cache = init_cache(cfg, args.batch_size, args.max_seq_len, dtype=cache_dtype)
+    with jax.default_device(jax.devices('cpu')[0]):
+        cache = init_cache(cfg, args.batch_size, args.max_seq_len, dtype=cache_dtype)
 
     if mesh is not None:
         cache = shard_cache(cache, mesh, cfg, axis_rules)
