@@ -1,80 +1,71 @@
+:~/jax-gpt$ PROFILE_DIR=/tmp/qwen35_profiles python scripts/qwen35_benchmark.py     --config full     --sharding B     --devices 4     --batch-size 1     --prompt-len 128     --decode-steps 32    --dtype fp8 --profile --roofline --chunk-size 32 --n-layers 16
 ======================================================================
 QWEN3.5 INFERENCE BENCHMARK
 ======================================================================
-  Config:         mid (16L, 4096D, 16E top-4)
+  Config:         full (16L, 4096D, 512E top-10)
   Sharding:       Config B
   Devices:        4x tpu
   Batch size:     1
-  Prompt len:     512
-  Decode steps:   128
-  Max seq len:    704
-  Chunk size:     256
-  Dtype:          bfloat16
+  Prompt len:     128
+  Decode steps:   32
+  Max seq len:    224
+  Chunk size:     32
+  Dtype:          fp8
   Runs:           5
   Profile:        True
 
-Initializing model (bfloat16)...
-  Params:         7,293,641,728 (14.59 GB bfloat16)
-  Init time:      39859 ms
-
-Sharding params across 4 devices...
-  Shard time:     2749 ms
-
-==============================================================================
-ROOFLINE ANALYSIS (B=1)
-==============================================================================
-
-  Overall                             FLOPs        HBM         AI      Bound
-  ------------------------------------------------------------------------
-  Prefill (full model)           1.32 TFLOP    6.30 GB    209.3x    COMPUTE
-                                  roofline:      2.87ms (compute=2.87, mem=2.25)
-  Decode (full model)            2.56 GFLOP    2.57 GB      1.0x     MEMORY
-                                  roofline:      0.92ms (compute=0.01, mem=0.92)
-
-  Per module (1 layer)                FLOPs        HBM         AI      Bound
-  ------------------------------------------------------------------------
-  DeltaNet attn (T=512)        132.42 GFLOP    3.50 GB     37.9x     MEMORY
-  DeltaNet attn (T=1)           242.2 MFLOP   248.8 MB      1.0x     MEMORY
-  GQA attn (T=512)             115.96 GFLOP   391.1 MB    296.5x    COMPUTE
-  MoE (T=512)                   12.96 GFLOP    49.4 MB    262.1x    COMPUTE
-  MoE (T=1)                      25.3 MFLOP    25.4 MB      1.0x     MEMORY
-
-  TPU v5p reference: 459 TFLOPS bf16, 2.8 TB/s HBM, ridge=164 FLOPs/byte
-==============================================================================
-
-
-──────────────────────────────────────────────────────────────────────
-PREFILL BENCHMARK
-──────────────────────────────────────────────────────────────────────
-  Compiling prefill...
-  Compilation: 12236 ms
-  Profiling to: /tmp/qwen35_profiles/prefill
-
-  PREFILL RESULTS
-  Avg latency:         75.82 ms
-  Throughput:          6,753 tokens/sec
-  Tokens:              1 × 512 = 512
-
-──────────────────────────────────────────────────────────────────────
-DECODE BENCHMARK
-──────────────────────────────────────────────────────────────────────
-  Compiling decode (lax.scan)...
+Initializing model (fp8)...
 Traceback (most recent call last):
-  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 439, in <module>
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 477, in <module>
     main()
-  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 428, in main
-    run_decode_benchmark(
-  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 300, in run_decode_benchmark
-    generated = generate_scan(params, prompt_tokens, cache, rng)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 289, in generate_scan
-    _, generated = jax.lax.scan(
+  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 404, in main
+    params = init_params(cfg, jax.random.key(0), dtype=init_dtype)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 144, in init_params
+    delta_layers = _stack_tree([
                    ^^^^^^^^^^^^^
-TypeError: scan body function carry input and carry output must have equal types, but they differ:
-
-The input carry component carry[1].delta_M has type float32[4,3,1,64,128,128] but the corresponding output carry component has type bfloat16[4,3,1,64,128,128], so the dtypes do not match.
-
-Revise the function so that all output types match the corresponding input types.
---------------------
-For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
-
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 112, in _stack_tree
+    return jax.tree.map(lambda *arrs: jnp.stack(arrs, axis=0), *trees)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/tree.py", line 156, in map
+    return tree_util.tree_map(f, tree, *rest, is_leaf=is_leaf)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/tree_util.py", line 373, in tree_map
+    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/tree_util.py", line 373, in <genexpr>
+    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+                             ^^^^^^
+  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 112, in <lambda>
+    return jax.tree.map(lambda *arrs: jnp.stack(arrs, axis=0), *trees)
+                                      ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/numpy/lax_numpy.py", line 4464, in stack
+    new_arrays.append(expand_dims(a, axis))
+                      ^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/numpy/lax_numpy.py", line 2409, in expand_dims
+    return lax.expand_dims(a, axis)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/lax/lax.py", line 3554, in expand_dims
+    return broadcast_in_dim(array, result_shape, broadcast_dims)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/lax/lax.py", line 2700, in broadcast_in_dim
+    return broadcast_in_dim_p.bind(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/core.py", line 636, in bind
+    return self._true_bind(*args, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/core.py", line 652, in _true_bind
+    return self.bind_with_trace(prev_trace, args, params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/core.py", line 664, in bind_with_trace
+    return trace.process_primitive(self, args, params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/core.py", line 1208, in process_primitive
+    return primitive.impl(*args, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/dispatch.py", line 91, in apply_primitive
+    outs = fun(*args)
+           ^^^^^^^^^^
+ValueError: RESOURCE_EXHAUSTED: E0100: RuntimeBufferAllocationFailure:
+Error allocating device buffer: Attempting to allocate 4.00G. That was not possible. There are 3.48G free.; (0x0x0_HBM0)
+See https://openxla.org/xla/errors/error_0100 for more details.
