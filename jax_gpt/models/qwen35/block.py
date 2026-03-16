@@ -40,6 +40,7 @@ def deltanet_layer_forward(
                 config.delta_n_qk_heads, config.delta_n_v_heads,
                 config.delta_qk_head_dim, config.delta_v_head_dim,
                 config.delta_conv_kernel,
+                chunk_size=config.delta_chunk_size,
             )
 
     x = x + attn_out

@@ -69,15 +69,18 @@ def init_cache(
         max_len = config.max_position_embeddings
     n_groups = config.n_groups
     n_delta_per_group = config.full_attention_interval - 1  # 3
+    key_dim = config.delta_n_qk_heads * config.delta_qk_head_dim
+    value_dim = config.delta_n_v_heads * config.delta_v_head_dim
+    conv_dim = key_dim * 2 + value_dim
 
     delta_M = jnp.zeros(
         (n_groups, n_delta_per_group, batch_size,
-         config.delta_n_qk_heads, config.delta_qk_head_dim, config.delta_v_head_dim),
+         config.delta_n_v_heads, config.delta_qk_head_dim, config.delta_v_head_dim),
         dtype=dtype,
     )
     delta_conv = jnp.zeros(
         (n_groups, n_delta_per_group, batch_size,
-         config.d_model, config.delta_conv_kernel),
+         conv_dim, config.delta_conv_kernel),
         dtype=dtype,
     )
     gqa_k = jnp.zeros(

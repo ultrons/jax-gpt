@@ -204,7 +204,7 @@ def deltanet_prefill(
     config_qk_head_dim: int,
     config_v_head_dim: int,
     config_conv_kernel: int,
-    chunk_size: int = 64,
+    chunk_size: int = 256,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Chunk-parallel DeltaNet prefill.
 
@@ -261,48 +261,140 @@ def deltanet_prefill(
         q = jnp.repeat(q, groups, axis=2)
         k = jnp.repeat(k, groups, axis=2)
 
-    # Transpose to (B, heads, T, dim)
-    q = jnp.transpose(q, (0, 2, 1, 3))  # (B, n_v_heads, T, qk_head_dim)
-    k = jnp.transpose(k, (0, 2, 1, 3))
-    v = jnp.transpose(v, (0, 2, 1, 3))  # (B, n_v_heads, T, v_head_dim)
-    beta = jnp.transpose(beta, (0, 2, 1))  # (B, n_v_heads, T)
-    g = jnp.transpose(g, (0, 2, 1))        # (B, n_v_heads, T)
+    # Transpose to (B, H, T, dim) — all chunked computation uses this layout
+    q = jnp.transpose(q, (0, 2, 1, 3)).astype(jnp.float32)  # (B, H, T, dk)
+    k = jnp.transpose(k, (0, 2, 1, 3)).astype(jnp.float32)
+    v = jnp.transpose(v, (0, 2, 1, 3)).astype(jnp.float32)  # (B, H, T, dv)
+    beta = jnp.transpose(beta, (0, 2, 1)).astype(jnp.float32)  # (B, H, T)
+    g = jnp.transpose(g, (0, 2, 1)).astype(jnp.float32)        # (B, H, T)
 
-    # Run recurrent computation via lax.scan for correctness
-    # (chunk-parallel optimization can be added later as a Pallas kernel)
-    initial_state = jnp.zeros(
-        (B, config_n_v_heads, config_qk_head_dim, config_v_head_dim),
-        dtype=q.dtype,
-    )
+    H = config_n_v_heads
+    dk = config_qk_head_dim
+    dv = config_v_head_dim
 
-    carry_dtype = q.dtype  # preserve dtype for scan carry
+    # Pad sequence to multiple of chunk_size
+    C = chunk_size
+    pad_size = (C - T % C) % C
+    if pad_size > 0:
+        q = jnp.pad(q, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        k = jnp.pad(k, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        v = jnp.pad(v, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_size)))
+        g = jnp.pad(g, ((0, 0), (0, 0), (0, pad_size)))
+    T_padded = T + pad_size
+    n_chunks = T_padded // C
 
-    def _step(state, inputs):
-        q_t, k_t, v_t, beta_t, g_t = inputs
-        # Compute in float32 for numerical stability, cast back for scan carry
-        state_f32 = state.astype(jnp.float32)
-        g_factor = jnp.exp(g_t.astype(jnp.float32))[..., None, None]
-        state_f32 = state_f32 * g_factor
+    # Precompute gated values
+    v_beta = v * beta[..., None]             # (B, H, T_padded, dv)
+    k_beta = k * beta[..., None]             # (B, H, T_padded, dk)
 
-        kv_mem = jnp.einsum('bhkv,bhk->bhv', state_f32, k_t.astype(jnp.float32))
-        delta = (v_t.astype(jnp.float32) - kv_mem) * beta_t.astype(jnp.float32)[..., None]
-        state_f32 = state_f32 + jnp.einsum('bhk,bhv->bhkv', k_t.astype(jnp.float32), delta)
+    # Reshape to chunks: (B, H, n_chunks, C, dim)
+    q_c = q.reshape(B, H, n_chunks, C, dk)
+    k_c = k.reshape(B, H, n_chunks, C, dk)
+    v_c = v.reshape(B, H, n_chunks, C, dv)
+    k_beta_c = k_beta.reshape(B, H, n_chunks, C, dk)
+    v_beta_c = v_beta.reshape(B, H, n_chunks, C, dv)
+    g_c = g.reshape(B, H, n_chunks, C)
 
-        o_t = jnp.einsum('bhkv,bhk->bhv', state_f32, q_t.astype(jnp.float32))
-        return state_f32.astype(carry_dtype), o_t.astype(carry_dtype)
+    # === Intra-chunk WY-like decomposition ===
+    # Cumulative decay within each chunk
+    g_cumsum = jnp.cumsum(g_c, axis=-1)  # (B, H, n_chunks, C)
 
-    # Prepare scan inputs: transpose T to leading axis
+    # Decay mask: exp(g_cumsum[i] - g_cumsum[j]) for i >= j (lower triangular)
+    decay_mask = jnp.exp(
+        jnp.tril(g_cumsum[..., :, None] - g_cumsum[..., None, :])
+    ) * jnp.tril(jnp.ones((C, C)))  # (B, H, n_chunks, C, C)
+
+    # Build the WY transfer matrix A
+    # A = -(k_beta @ k^T * decay_mask), lower-triangular, then accumulate indirect effects
+    upper_mask = jnp.triu(jnp.ones((C, C), dtype=jnp.bool_))
+    A = -(jnp.einsum('bhcid,bhcjd->bhcij', k_beta_c, k_c) * decay_mask)
+    A = jnp.where(upper_mask, 0.0, A)
+
+    # WY accumulation (Python loop — unrolled at trace time).
+    # A[i, :i] += A[i, :i] @ A[:i, :i]
+    # This accumulates indirect effects: token j updates token k which updates token i.
+    for i in range(1, C):
+        row = A[..., i, :i]        # (B, H, n_chunks, i)
+        sub = A[..., :i, :i]       # (B, H, n_chunks, i, i)
+        correction = jnp.einsum('...m,...mj->...j', row, sub)
+        A = A.at[..., i, :i].set(row + correction)
+
+    # Add identity: A = A + I
+    A = A + jnp.eye(C)
+
+    # Effective values within chunk (incorporating delta rule updates)
+    v_eff = jnp.einsum('bhcij,bhcjd->bhcid', A, v_beta_c)  # (B, H, n_chunks, C, dv)
+
+    # Effective keys with cumulative decay
+    k_cumdecay = jnp.einsum(
+        'bhcij,bhcjd->bhcid', A,
+        k_beta_c * jnp.exp(g_cumsum)[..., None],
+    )  # (B, H, n_chunks, C, dk)
+
+    # === Inter-chunk state propagation via lax.scan ===
+    initial_state = jnp.zeros((B, H, dk, dv), dtype=jnp.float32)
+    carry_dtype = x.dtype
+
+    # Upper triangular mask for intra-chunk causal attention
+    upper_mask_1 = jnp.triu(jnp.ones((C, C), dtype=jnp.bool_), k=1)
+
+    def _chunk_step(state, chunk_inputs):
+        q_i, k_i, v_i, k_cumdecay_i, g_i, decay_mask_i = chunk_inputs
+        # q_i, k_i: (B, H, C, dk), v_i: (B, H, C, dv)
+        # g_i: (B, H, C) cumulative, decay_mask_i: (B, H, C, C)
+
+        # Intra-chunk attention (parallel): q @ k^T * decay_mask, causal
+        intra_attn = jnp.einsum('bhid,bhjd->bhij', q_i, k_i) * decay_mask_i
+        intra_attn = jnp.where(upper_mask_1, 0.0, intra_attn)
+
+        # Cross-chunk: correct effective values for state already in memory
+        v_prime = jnp.einsum('bhid,bhdv->bhiv', k_cumdecay_i, state)  # (B, H, C, dv)
+        v_new = v_i - v_prime
+
+        # Cross-chunk: query the state with per-position decay
+        attn_inter = jnp.einsum(
+            'bhid,bhdv->bhiv',
+            q_i * jnp.exp(g_i)[..., None],  # (B, H, C, dk)
+            state,
+        )  # (B, H, C, dv)
+
+        # Output = intra-chunk + cross-chunk
+        out_i = attn_inter + jnp.einsum('bhij,bhjv->bhiv', intra_attn, v_new)
+
+        # Update state for next chunk
+        # Decay state to end of this chunk, then add this chunk's contribution
+        g_end = g_i[..., -1]  # (B, H) — cumulative g at end of chunk
+        new_state = (
+            state * jnp.exp(g_end)[..., None, None]
+            + jnp.einsum(
+                'bhid,bhiv->bhdv',
+                k_i * jnp.exp(g_end[..., None] - g_i)[..., None],  # (B, H, C, dk)
+                v_new,
+            )
+        )
+
+        return new_state, out_i.astype(carry_dtype)
+
+    # Prepare scan inputs: move n_chunks to leading axis
     scan_inputs = (
-        jnp.transpose(q, (2, 0, 1, 3)),     # (T, B, H, dk)
-        jnp.transpose(k, (2, 0, 1, 3)),     # (T, B, H, dk)
-        jnp.transpose(v, (2, 0, 1, 3)),     # (T, B, H, dv)
-        jnp.transpose(beta, (2, 0, 1)),     # (T, B, H)
-        jnp.transpose(g, (2, 0, 1)),        # (T, B, H)
+        jnp.transpose(q_c, (2, 0, 1, 3, 4)),           # (n_chunks, B, H, C, dk)
+        jnp.transpose(k_c, (2, 0, 1, 3, 4)),
+        jnp.transpose(v_eff, (2, 0, 1, 3, 4)),          # effective values
+        jnp.transpose(k_cumdecay, (2, 0, 1, 3, 4)),
+        jnp.transpose(g_cumsum, (2, 0, 1, 3)),          # (n_chunks, B, H, C)
+        jnp.transpose(decay_mask, (2, 0, 1, 3, 4)),     # (n_chunks, B, H, C, C)
     )
 
-    final_state, outputs = jax.lax.scan(_step, initial_state, scan_inputs)
-    # outputs: (T, B, H, dv) -> (B, T, H, dv)
-    core_attn_out = jnp.transpose(outputs, (1, 0, 2, 3))
+    final_state, chunk_outputs = jax.lax.scan(
+        _chunk_step, initial_state, scan_inputs,
+    )
+    # chunk_outputs: (n_chunks, B, H, C, dv) -> (B, H, n_chunks*C, dv)
+    core_attn_out = jnp.transpose(chunk_outputs, (1, 2, 0, 3, 4))
+    core_attn_out = core_attn_out.reshape(B, H, T_padded, dv)
+    # Trim padding and transpose to (B, T, H, dv)
+    core_attn_out = core_attn_out[:, :, :T, :]
+    core_attn_out = jnp.transpose(core_attn_out, (0, 2, 1, 3))  # (B, T, H, dv)
 
     # Gated RMSNorm (applied per-head, weight is per v_head_dim)
     # core_attn_out: (B, T, n_v_heads, v_head_dim) -> (B*T*n_v_heads, v_head_dim)

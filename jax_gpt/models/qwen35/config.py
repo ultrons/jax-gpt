@@ -37,6 +37,7 @@ class Qwen35Config:
     delta_qk_head_dim: int = 128
     delta_v_head_dim: int = 128
     delta_conv_kernel: int = 4                 # causal conv1d width
+    delta_chunk_size: int = 256                # chunk size for prefill
 
     # MoE params
     n_routed_experts: int = 512
@@ -65,6 +66,7 @@ class Qwen35Config:
             delta_n_v_heads=8,
             delta_qk_head_dim=128,
             delta_v_head_dim=128,
+            delta_chunk_size=4,  # small for fast compilation in tests
             # MoE
             n_routed_experts=4,
             n_experts_per_token=2,
