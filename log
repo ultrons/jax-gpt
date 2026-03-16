@@ -1,8 +1,8 @@
-:~/jax-gpt$ PROFILE_DIR=/tmp/qwen35_profiles python scripts/qwen35_benchmark.py     --config full     --sharding B     --devices 4     --batch-size 1     --prompt-len 128     --decode-steps 32    --dtype fp8 --profile --roofline --chunk-size 32 --n-layers 16
+PROFILE_DIR=/tmp/qwen35_profiles python scripts/qwen35_benchmark.py     --config full     --sharding B     --devices 4     --batch-size 1     --prompt-len 128     --decode-steps 32    --dtype fp8 --profile --roofline --chunk-size 32 --n-layers 8
 ======================================================================
 QWEN3.5 INFERENCE BENCHMARK
 ======================================================================
-  Config:         full (16L, 4096D, 512E top-10)
+  Config:         full (8L, 4096D, 512E top-10)
   Sharding:       Config B
   Devices:        4x tpu
   Batch size:     1
@@ -15,57 +15,41 @@ QWEN3.5 INFERENCE BENCHMARK
   Profile:        True
 
 Initializing model (fp8)...
-Traceback (most recent call last):
-  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 477, in <module>
-    main()
-  File "/home/sivaibhav_google_com/jax-gpt/scripts/qwen35_benchmark.py", line 404, in main
-    params = init_params(cfg, jax.random.key(0), dtype=init_dtype)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 144, in init_params
-    delta_layers = _stack_tree([
-                   ^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 112, in _stack_tree
-    return jax.tree.map(lambda *arrs: jnp.stack(arrs, axis=0), *trees)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/tree.py", line 156, in map
-    return tree_util.tree_map(f, tree, *rest, is_leaf=is_leaf)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/tree_util.py", line 373, in tree_map
-    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/tree_util.py", line 373, in <genexpr>
-    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
-                             ^^^^^^
-  File "/home/sivaibhav_google_com/jax-gpt/jax_gpt/models/qwen35/model.py", line 112, in <lambda>
-    return jax.tree.map(lambda *arrs: jnp.stack(arrs, axis=0), *trees)
-                                      ^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/numpy/lax_numpy.py", line 4464, in stack
-    new_arrays.append(expand_dims(a, axis))
-                      ^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/numpy/lax_numpy.py", line 2409, in expand_dims
-    return lax.expand_dims(a, axis)
-           ^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/lax/lax.py", line 3554, in expand_dims
-    return broadcast_in_dim(array, result_shape, broadcast_dims)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/lax/lax.py", line 2700, in broadcast_in_dim
-    return broadcast_in_dim_p.bind(
-           ^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/core.py", line 636, in bind
-    return self._true_bind(*args, **params)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/core.py", line 652, in _true_bind
-    return self.bind_with_trace(prev_trace, args, params)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/core.py", line 664, in bind_with_trace
-    return trace.process_primitive(self, args, params)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/core.py", line 1208, in process_primitive
-    return primitive.impl(*args, **params)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/sivaibhav_google_com/.perf/lib/python3.12/site-packages/jax/_src/dispatch.py", line 91, in apply_primitive
-    outs = fun(*args)
-           ^^^^^^^^^^
-ValueError: RESOURCE_EXHAUSTED: E0100: RuntimeBufferAllocationFailure:
-Error allocating device buffer: Attempting to allocate 4.00G. That was not possible. There are 3.48G free.; (0x0x0_HBM0)
-See https://openxla.org/xla/errors/error_0100 for more details.
+  Params:         54,609,189,376 (109.22 GB bfloat16)
+  Init time:      178562 ms
+  Quantizing weights to FP8...
+  FP8 weights:    53,591,670,784 / 54,634,848,000 (98%)
+  Est. memory:    55.68 GB (weights fp8 + cache/activations bf16)
+  Quant time:     86910 ms
+
+Sharding params across 4 devices...
+  Shard time:     4244 ms
+  [roofline] prefill failed: 'dict' object has no attribute 'shape'
+  [roofline] decode failed: 'dict' object has no attribute 'shape'
+E0316 18:16:54.188960  607566 watchdog.cc:436] RAW: Watchdog: TpuSyncFlagReadCallbackWatchdog (pthread id: 7f9827928640, tid: 609592) expired; Thread id 609592 last called Alive() 64s ago (18:15:50); timeout is 60s
+
+E0316 18:16:54.189013  607566 watchdog.cc:333] RAW: Stack trace of thread 609592:
+E0316 18:16:54.189038  607566 watchdog.cc:349] RAW: Thread 609592 not found.
+Kernel stack unavailable.
+F0316 18:16:54.189064  607566 watchdog.cc:442] Watchdog: TpuSyncFlagReadCallbackWatchdog (pthread id: 7f9827928640, tid: 609592) expired; Thread id 609592 last called Alive() 64s ago (18:15:50); timeout is 60s
+*** Check failure stack trace: ***
+    @     0x7fa223729d24  absl::log_internal::LogMessage::SendToLog()
+    @     0x7fa223729cd8  absl::log_internal::LogMessage::Flush()
+    @     0x7fa2239d2d7c  WatchDog::TimedOutInternal()
+    @     0x7fa2235869de  WatchDog::CheckTimeout()
+    @     0x7fa223586562  WatchDog::CheckAlive()
+    @     0x7fa223582a77  (anonymous namespace)::ThreadLivenessWatcher()
+    @     0x7fa2d7c94ac3  (unknown)
+https://symbolize.stripped_domain/r/?trace=7fa223729d23,7fa223729cd7,7fa2239d2d7b,7fa2235869dd,7fa223586561,7fa223582a76,7fa2d7c94ac2&map= 
+https://symbolize.stripped_domain/r/?trace=7fa2d7c969fc,7fa2d7c4251f&map= 
+*** SIGABRT received by PID 607480 (TID 607566) on cpu 108, si_code=-6, from PID 607480; ***
+E0316 18:16:54.261063  607566 coredump_hook.cc:310] RAW: Remote crash data gathering hook invoked.
+E0316 18:16:54.261072  607566 coredump_hook.cc:349] RAW: Skipping coredump since rlimit was 0 at process start.
+E0316 18:16:54.261081  607566 client.cc:261] RAW: Coroner client retries enabled, will retry for up to 30 sec.
+E0316 18:16:54.261086  607566 coredump_hook.cc:405] RAW: Sending fingerprint to remote end.
+E0316 18:16:54.261100  607566 coredump_hook.cc:415] RAW: Cannot send fingerprint to Coroner: [NOT_FOUND] stat failed on crash reporting socket /var/google/services/logmanagerd/remote_coredump.socket (Is the listener running?): No such file or directory
+E0316 18:16:54.261106  607566 coredump_hook.cc:467] RAW: Dumping core locally.
+
+^Z
+
+[1]+  Stopped                 PROFILE_DIR=/tmp/qwen35_profiles python scripts/qwen35_benchmark.py --config full --sharding B --devices 4 --batch-size 1 --prompt-len 128 --decode-steps 32 --dtype fp8 --profile --roofline --chunk-size 32 --n-layers 8
