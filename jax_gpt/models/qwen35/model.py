@@ -11,6 +11,7 @@ import jax.numpy as jnp
 
 from jax.sharding import PartitionSpec as P
 
+from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
 from jax_gpt.models.qwen35.block import group_forward
 from jax_gpt.models.qwen35.cache import HybridCache, init_cache
 from jax_gpt.models.qwen35.config import Qwen35Config
@@ -281,7 +282,7 @@ def forward(
 
     with jax.named_scope('output_head'):
         x = rms_norm(x, params['final_norm'], config.rms_norm_eps)
-        logits = x @ params['lm_head']  # (B, T, vocab_size)
+        logits = matmul_maybe_fp8(x, params['lm_head'])  # (B, T, vocab_size)
 
     return logits, new_cache
 

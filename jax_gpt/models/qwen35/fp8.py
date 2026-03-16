@@ -120,6 +120,36 @@ def fp8_linear(
         return x @ w
 
 
+def matmul_maybe_fp8(x: jax.Array, w) -> jax.Array:
+    """Universal matmul that handles both regular arrays and fp8 quantized dicts.
+
+    Our weight convention is (in, out) for x @ w.
+    FP8 quantized weights are stored as {'w': (in, out) fp8, 'scale_inv': scale}.
+    We transpose to (out, in) for fp8_matmul which does x @ w^T.
+
+    Args:
+        x: (..., in_features) input.
+        w: either a plain array (in, out) or a dict {'w': fp8, 'scale_inv': f32}.
+
+    Returns:
+        (..., out_features)
+    """
+    if isinstance(w, dict) and 'w' in w:
+        w_fp8 = w['w']
+        scale_inv = w['scale_inv']
+        if w_fp8.ndim == 2:
+            # w_fp8 already in (out, in) layout from quantize
+            return fp8_matmul(x, w_fp8, scale_inv)
+        else:
+            # 3D+ expert weights (E, out, in): dequant + transpose back
+            # for ragged_dot which expects (E, in, out)
+            w_dequant = (w_fp8.astype(jnp.float32) * scale_inv)
+            if w_dequant.ndim == 3:
+                w_dequant = jnp.transpose(w_dequant, (0, 2, 1))  # (E, in, out)
+            return (x @ w_dequant.astype(x.dtype))
+    return x @ w
+
+
 def fp8_ragged_dot(
     x: jax.Array,
     w_fp8: jax.Array,

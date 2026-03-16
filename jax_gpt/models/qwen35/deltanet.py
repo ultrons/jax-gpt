@@ -20,6 +20,8 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
+
 
 def _l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
     """L2 normalize along the last axis."""
@@ -127,10 +129,10 @@ def deltanet_recurrent_step(
 
     # Project QKV and gate/decay
     with jax.named_scope('qkv_proj'):
-        mixed_qkv = x @ params['in_proj_qkv']  # (B, 1, key_dim*2 + value_dim)
-    z = x @ params['in_proj_z']             # (B, 1, value_dim)
-    b = x @ params['in_proj_b']             # (B, 1, n_v_heads)
-    a = x @ params['in_proj_a']             # (B, 1, n_v_heads)
+        mixed_qkv = matmul_maybe_fp8(x, params['in_proj_qkv'])  # (B, 1, key_dim*2 + value_dim)
+    z = matmul_maybe_fp8(x, params['in_proj_z'])             # (B, 1, value_dim)
+    b = matmul_maybe_fp8(x, params['in_proj_b'])             # (B, 1, n_v_heads)
+    a = matmul_maybe_fp8(x, params['in_proj_a'])             # (B, 1, n_v_heads)
 
     # Causal conv1d update (channels-first)
     mixed_qkv_cf = jnp.transpose(mixed_qkv, (0, 2, 1))  # (B, conv_dim, 1)
@@ -191,7 +193,7 @@ def deltanet_recurrent_step(
     z_reshaped = z_reshaped.reshape(B * config_n_v_heads, config_v_head_dim)
     output = _gated_rms_norm(output, z_reshaped, params['norm_weight'], eps=1e-6)
     output = output.reshape(B, value_dim)
-    output = (output @ params['out_proj'])[:, None, :]  # (B, 1, D)
+    output = (matmul_maybe_fp8(output, params['out_proj']))[:, None, :]  # (B, 1, D)
 
     return output.astype(x.dtype), new_state, new_conv_state
 
@@ -229,10 +231,10 @@ def deltanet_prefill(
     groups = config_n_v_heads // config_n_qk_heads
 
     # Project
-    mixed_qkv = x @ params['in_proj_qkv']  # (B, T, conv_dim)
-    z = x @ params['in_proj_z']             # (B, T, value_dim)
-    b = x @ params['in_proj_b']             # (B, T, n_v_heads)
-    a = x @ params['in_proj_a']             # (B, T, n_v_heads)
+    mixed_qkv = matmul_maybe_fp8(x, params['in_proj_qkv'])  # (B, T, conv_dim)
+    z = matmul_maybe_fp8(x, params['in_proj_z'])             # (B, T, value_dim)
+    b = matmul_maybe_fp8(x, params['in_proj_b'])             # (B, T, n_v_heads)
+    a = matmul_maybe_fp8(x, params['in_proj_a'])             # (B, T, n_v_heads)
 
     # Causal conv1d (full sequence)
     mixed_qkv_cf = jnp.transpose(mixed_qkv, (0, 2, 1))  # (B, conv_dim, T)
@@ -403,7 +405,7 @@ def deltanet_prefill(
     z_flat = z_flat.reshape(B * T * config_n_v_heads, config_v_head_dim)
     core_attn_out = _gated_rms_norm(core_attn_out, z_flat, params['norm_weight'], eps=1e-6)
     core_attn_out = core_attn_out.reshape(B, T, value_dim)
-    output = core_attn_out @ params['out_proj']  # (B, T, D)
+    output = matmul_maybe_fp8(core_attn_out, params['out_proj'])  # (B, T, D)
 
     return output.astype(x.dtype), final_state, final_conv_state
 
