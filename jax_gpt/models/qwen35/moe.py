@@ -1,14 +1,17 @@
 """Mixture of Experts layer with expert parallelism.
 
 Single-device: uses ragged_dot over all experts directly.
-Multi-device (EP): all-to-all dispatch → local ragged_dot → all-to-all collect.
-No all-gather of expert weights — each device only touches its local shard.
+Multi-device (EP): shard_map + psum following MaxText/Megablox pattern.
+Each device handles its local expert shard — no all-gather of weights.
 """
 
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
 
@@ -16,15 +19,14 @@ from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
 def _get_n_experts(gate_weight) -> int:
     """Extract n_experts from gate_weight (handles fp8 dict or plain array)."""
     if isinstance(gate_weight, dict) and 'w' in gate_weight:
-        return gate_weight['w'].shape[0]  # fp8: (E, D)
-    return gate_weight.shape[1]  # regular: (D, E)
+        return gate_weight['w'].shape[0]
+    return gate_weight.shape[1]
 
 
 def _get_expert_weight(w, dtype=None):
     """Extract raw array from fp8 dict if quantized, for ragged_dot."""
     if isinstance(w, dict) and 'w' in w:
         w_f = (w['w'].astype(jnp.float32) * w['scale_inv'])
-        # Transpose back: (..., out, in) -> (..., in, out) for ragged_dot
         axes = list(range(w_f.ndim))
         axes[-2], axes[-1] = axes[-1], axes[-2]
         w_f = jnp.transpose(w_f, axes)
@@ -59,14 +61,7 @@ def _sort_and_group(
     expert_weights: jax.Array,
     n_experts: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Sort tokens by expert assignment for ragged_dot.
-
-    Returns:
-        x_sorted: (M*k, D) tokens in expert-sorted order.
-        group_sizes: (n_experts,) tokens per expert.
-        sorted_weights: (M*k,) routing weights in sorted order.
-        sorted_token_ids: (M*k,) original token indices in sorted order.
-    """
+    """Sort tokens by expert assignment for ragged_dot."""
     M = x.shape[0]
     k = expert_indices.shape[1]
 
@@ -124,64 +119,102 @@ def expert_forward_ep(
     expert_indices: jax.Array,
     expert_weights: jax.Array,
     gate_proj, up_proj, down_proj,
-    n_devices: int,
+    mesh,
     axis_name: str = 'tp',
 ) -> jax.Array:
-    """Expert-parallel computation via capacity-padded dense dispatch.
+    """Expert-parallel MoE using shard_map.
 
-    Instead of all-gathering expert weights (O(E*D*I) per device),
-    this reshapes the problem so XLA's SPMD partitioner handles the
-    token-to-expert dispatch via the sharded einsum pattern:
+    Following the MaxText/Megablox pattern from Robert Dyro's presentation:
+    - shard_map gives each device explicit control via axis_index
+    - Each device slices group_sizes to its local experts
+    - Local ragged_dot on local expert weights (no all-gather)
+    - psum to reduce across EP devices
 
-    1. Build a dispatch mask: (M*k, E_total) one-hot
-    2. Reshape to (M*k, n_devices, E_local) so the E dimension is sharded
-    3. XLA inserts all-to-all for the dispatch/combine automatically
-    4. Local expert computation on each device's E_local experts
-
-    Expert weights stay local — no all-gather.
+    Args:
+        x: (M, D) tokens.
+        expert_indices: (M, k) global expert indices.
+        expert_weights: (M, k) routing weights.
+        gate_proj, up_proj, down_proj: expert weights sharded along expert dim.
+        mesh: device mesh.
+        axis_name: mesh axis for EP.
     """
-    from jax.sharding import PartitionSpec as P
+    from jax.experimental.shard_map import shard_map
 
     gate_w = _get_expert_weight(gate_proj, x.dtype)
     up_w = _get_expert_weight(up_proj, x.dtype)
     down_w = _get_expert_weight(down_proj, x.dtype)
     E_local = gate_w.shape[0]
-    E_total = E_local * n_devices
     M, D = x.shape
     k = expert_indices.shape[1]
-    I = gate_w.shape[2]  # intermediate dim
+    n_devices = mesh.shape[axis_name]
+    E_total = E_local * n_devices
 
-    # Remap to local expert indices for local computation
-    local_expert_ids = expert_indices % E_local  # (M, k)
+    # Compute group_sizes for ALL experts (on each device, same result)
+    flat_expert_ids = expert_indices.reshape(-1)  # (M*k,)
+    group_sizes_all = jnp.zeros(E_total, dtype=jnp.int32)
+    group_sizes_all = group_sizes_all.at[flat_expert_ids].add(1)
 
-    # Sort tokens by local expert id and compute per-device
-    # Each device independently sorts its tokens by local_expert_id
-    # and runs ragged_dot on its local expert shard.
-    #
-    # The key: expert weights are (E_local, D, I) per device.
-    # We sort by local_expert_id (0..E_local-1) so ragged_dot
-    # maps each group to the correct local expert.
-    #
-    # But we also need to filter: only tokens whose global expert
-    # is owned by THIS device should be processed here.
-    # With SPMD, all devices run the same code on the same data.
-    # The sharding of expert weights ensures each device only has
-    # E_local experts. We use the single-device path but with
-    # local expert indices — XLA's SPMD handles the rest.
+    # Sort tokens by global expert id
+    flat_token_ids = jnp.repeat(jnp.arange(M), k)
+    flat_weights = expert_weights.reshape(-1)
+    sort_order = jnp.argsort(flat_expert_ids)
+    sorted_token_ids = flat_token_ids[sort_order]
+    sorted_weights = flat_weights[sort_order]
+    x_sorted = x[sorted_token_ids]  # (M*k, D) sorted by global expert
 
-    # Use the single-device path with remapped local indices
-    # and constrain expert weights to stay local (not all-gathered)
-    x_sorted, group_sizes, sorted_weights, sorted_token_ids = _sort_and_group(
-        x, local_expert_ids, expert_weights, E_local,
-    )
+    # The shard_map expert function: each device processes its local shard
+    # Precompute cumulative offsets for each device's expert range
+    # group_offsets[i] = sum of group_sizes for experts 0..i-1
+    group_offsets = jnp.concatenate([jnp.array([0]), jnp.cumsum(group_sizes_all)])
 
-    # Constrain expert weights to their sharded partition
-    gate_w = jax.lax.with_sharding_constraint(gate_w, P('tp', None, None))
-    up_w = jax.lax.with_sharding_constraint(up_w, P('tp', None, None))
-    down_w = jax.lax.with_sharding_constraint(down_w, P('tp', None, None))
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P(), P(), P(), P(), P(axis_name, None, None),
+                       P(axis_name, None, None), P(axis_name, None, None), P()),
+             out_specs=P(),
+             check_rep=False)
+    def _expert_fn(x_sorted, sorted_weights, group_sizes_all, group_offsets,
+                   local_gate, local_up, local_down, sorted_token_ids):
+        # Which device am I?
+        my_idx = jax.lax.axis_index(axis_name)
 
-    expert_out = _expert_swiglu(x_sorted, group_sizes, gate_w, up_w, down_w)
-    return _scatter_back(expert_out, sorted_weights, sorted_token_ids, M, D, x.dtype)
+        # E_local from the actual local weight shape (after shard_map splits)
+        e_local = local_gate.shape[0]
+
+        # My local group sizes
+        group_sizes_local = jax.lax.dynamic_slice(
+            group_sizes_all, (my_idx * e_local,), (e_local,))
+
+        # Start offset in the sorted array for my experts
+        start_offset = group_offsets[my_idx * e_local]
+
+        # Slice my tokens from the sorted array (use M*k as max, mask later)
+        x_local = jax.lax.dynamic_slice(x_sorted, (start_offset, 0), (M * k, D))
+        weights_local = jax.lax.dynamic_slice(sorted_weights, (start_offset,), (M * k,))
+        token_ids_local = jax.lax.dynamic_slice(sorted_token_ids, (start_offset,), (M * k,))
+
+        # How many tokens are actually mine
+        n_local_tokens = jnp.sum(group_sizes_local)
+
+        # Compute SwiGLU on local experts
+        local_out = _expert_swiglu(x_local, group_sizes_local,
+                                   local_gate, local_up, local_down)
+
+        # Mask out padding tokens (beyond my actual count)
+        mask = jnp.arange(M * k) < n_local_tokens
+        local_out = jnp.where(mask[:, None], local_out, 0.0)
+        weights_local = jnp.where(mask, weights_local, 0.0)
+
+        # Scatter weighted outputs back to token positions
+        weighted = local_out * weights_local[:, None]
+        output = jnp.zeros((M, D), dtype=x_sorted.dtype)
+        output = output.at[token_ids_local].add(weighted.astype(output.dtype))
+
+        # psum across all EP devices to combine expert contributions
+        output = jax.lax.psum(output, axis_name)
+        return output
+
+    return _expert_fn(x_sorted, sorted_weights, group_sizes_all, group_offsets,
+                      gate_w, up_w, down_w, sorted_token_ids)
 
 
 def shared_expert_forward(
@@ -200,19 +233,13 @@ def moe_layer(
     n_experts_per_token: int,
     n_devices: int = 1,
     axis_name: str = 'tp',
+    mesh=None,
 ) -> jax.Array:
     """Full MoE layer: route + routed experts + shared expert.
 
-    When n_devices > 1, uses expert parallelism with all-to-all dispatch.
+    When n_devices > 1 and mesh is provided, uses shard_map EP.
     Expert weights are never all-gathered — each device only computes on
     its local expert shard.
-
-    Args:
-        x: (B, T, D) input.
-        params: dict with expert and shared expert weights.
-        n_experts_per_token: top-k.
-        n_devices: number of EP devices (1 = single device, no collectives).
-        axis_name: mesh axis name for all-to-all collectives.
     """
     B, T, D = x.shape
     M = B * T
@@ -224,11 +251,11 @@ def moe_layer(
         )
 
     with jax.named_scope('moe_experts'):
-        if n_devices > 1:
+        if n_devices > 1 and mesh is not None:
             routed_out = expert_forward_ep(
                 x_flat, expert_indices, expert_weights,
                 params['gate_proj'], params['up_proj'], params['down_proj'],
-                n_devices=n_devices, axis_name=axis_name,
+                mesh=mesh, axis_name=axis_name,
             )
         else:
             routed_out = expert_forward_single(
