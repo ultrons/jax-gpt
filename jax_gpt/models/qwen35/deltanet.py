@@ -43,8 +43,8 @@ def _causal_conv1d_update(
         output: (B, conv_dim, 1) after depthwise conv + silu.
         new_conv_state: updated sliding window.
     """
-    # Shift state left and append new input
-    new_state = jnp.concatenate([conv_state[..., 1:], x], axis=-1)
+    # Shift state left and append new input (preserve conv_state dtype)
+    new_state = jnp.concatenate([conv_state[..., 1:], x.astype(conv_state.dtype)], axis=-1)
     # Depthwise conv: sum(state * weight) per channel
     out = jnp.sum(new_state * conv_weight[None, :, :], axis=-1, keepdims=True)
     out = jax.nn.silu(out)
@@ -170,8 +170,8 @@ def deltanet_recurrent_step(
     v = v[:, 0]  # (B, n_v_heads, v_head_dim)
     beta = beta[:, 0]  # (B, n_v_heads)
 
-    # Recurrent step (compute in float32, cast state back to input dtype for scan)
-    input_dtype = x.dtype
+    # Recurrent step (compute in float32, cast state back to STATE dtype for scan carry)
+    state_dtype = state.dtype  # preserve cache dtype (may differ from activation dtype)
     # state: (B, n_v_heads, qk_head_dim, v_head_dim)
     state_f32 = state.astype(jnp.float32)
     g_factor = jnp.exp(g.astype(jnp.float32))[..., None, None]
@@ -181,7 +181,7 @@ def deltanet_recurrent_step(
     delta = (v.astype(jnp.float32) - kv_mem) * beta.astype(jnp.float32)[..., None]
 
     new_state = new_state + jnp.einsum('bhk,bhv->bhkv', k.astype(jnp.float32), delta)
-    new_state = new_state.astype(input_dtype)
+    new_state = new_state.astype(state_dtype)
 
     output = jnp.einsum('bhkv,bhk->bhv', new_state.astype(jnp.float32), q.astype(jnp.float32))
 
@@ -333,7 +333,7 @@ def deltanet_prefill(
     )  # (B, H, n_chunks, C, dk)
 
     # === Inter-chunk state propagation via lax.scan ===
-    initial_state = jnp.zeros((B, H, dk, dv), dtype=jnp.float32)
+    initial_state = jnp.zeros((B, H, dk, dv), dtype=x.dtype)
     carry_dtype = x.dtype
 
     # Upper triangular mask for intra-chunk causal attention
@@ -374,7 +374,7 @@ def deltanet_prefill(
             )
         )
 
-        return new_state, out_i.astype(carry_dtype)
+        return new_state.astype(carry_dtype), out_i.astype(carry_dtype)
 
     # Prepare scan inputs: move n_chunks to leading axis
     scan_inputs = (

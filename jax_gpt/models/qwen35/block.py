@@ -42,6 +42,9 @@ def deltanet_layer_forward(
                 config.delta_conv_kernel,
                 chunk_size=config.delta_chunk_size,
             )
+        # Ensure state dtypes match input cache for scan carry compatibility
+        new_M = new_M.astype(delta_M.dtype)
+        new_conv = new_conv.astype(delta_conv.dtype)
 
     x = x + attn_out
 
@@ -80,6 +83,10 @@ def gqa_layer_forward(
         moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token)
 
     x = x + moe_out
+    # Ensure cache dtypes match input for scan carry compatibility
+    if new_k is not None:
+        new_k = new_k.astype(gqa_k.dtype)
+        new_v = new_v.astype(gqa_v.dtype)
     return x, new_k, new_v
 
 
