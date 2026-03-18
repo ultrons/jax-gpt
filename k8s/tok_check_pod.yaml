@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tok-check
+  namespace: default
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    topology.kubernetes.io/zone: europe-west4-b
+  containers:
+    - name: tok-check
+      image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v2
+      command: ["sh", "-c"]
+      args:
+        - |
+          echo "=== /mnt/model/ ==="
+          ls /mnt/model/
+
+          echo ""
+          echo "=== /mnt/model/qwen3.5-397b/ ==="
+          ls /mnt/model/qwen3.5-397b/ 2>/dev/null || echo "directory not found"
+
+          echo ""
+          echo "=== tokenizer_config.json ==="
+          cat /mnt/model/qwen3.5-397b/tokenizer_config.json 2>/dev/null || echo "not found"
+
+          echo ""
+          echo "=== tiktoken check ==="
+          python -c "import tiktoken; print('tiktoken', tiktoken.__version__)"
+          python -c "
+          from transformers.utils import is_tiktoken_available, is_sentencepiece_available
+          print('is_tiktoken_available:', is_tiktoken_available())
+          print('is_sentencepiece_available:', is_sentencepiece_available())
+          "
+
+          echo ""
+          echo "=== tokenizer load test ==="
+          python -c "
+          from transformers import AutoTokenizer
+          tok = AutoTokenizer.from_pretrained('/mnt/model/qwen3.5-397b')
+          print('tokenizer loaded ok:', type(tok).__name__)
+          ids = tok('hello world', return_tensors='np').input_ids
+          print('encode test:', ids.shape)
+          "
+      volumeMounts:
+        - name: model
+          mountPath: /mnt/model
+          readOnly: true
+  volumes:
+    - name: model
+      persistentVolumeClaim:
+        claimName: oss-model-dev-pvc
+        readOnly: true

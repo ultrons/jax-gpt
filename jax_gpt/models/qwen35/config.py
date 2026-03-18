@@ -51,24 +51,28 @@ class Qwen35Config:
 
     @classmethod
     def mini(cls) -> Qwen35Config:
-        """Scaled-down config for Mac development (8 layers, ~small footprint)."""
+        """Scaled-down config for development/smoke-testing.
+
+        n_routed_experts=32 so it shards evenly across TP=32 (mlperf-v5p).
+        For single-device Mac runs use tp=1 or tp=4.
+        """
         return cls(
             d_model=1024,
             n_layers=8,
             max_position_embeddings=2048,
-            # GQA
-            gqa_n_q_heads=8,
-            gqa_n_kv_heads=1,
+            # GQA — same head counts as full config so TP=32 sharding works
+            gqa_n_q_heads=32,
+            gqa_n_kv_heads=2,
             gqa_head_dim=128,
             gqa_rope_theta=10_000_000.0,
-            # DeltaNet
-            delta_n_qk_heads=4,
-            delta_n_v_heads=8,
+            # DeltaNet — same head counts as full config
+            delta_n_qk_heads=16,
+            delta_n_v_heads=64,
             delta_qk_head_dim=128,
             delta_v_head_dim=128,
             delta_chunk_size=4,  # small for fast compilation in tests
-            # MoE
-            n_routed_experts=4,
+            # MoE — 32 experts divides evenly across TP=4/8/16/32
+            n_routed_experts=32,
             n_experts_per_token=2,
             moe_intermediate_size=512,
             shared_expert_intermediate_size=512,

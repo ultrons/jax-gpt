@@ -1,0 +1,45 @@
+# Docker image for Qwen3.5-397B evaluation on TPU v5p.
+#
+# Build:
+#   docker build -f k8s/Dockerfile.tpu -t gcr.io/YOUR_PROJECT/jax-gpt-tpu:latest .
+#
+# Push:
+#   docker push gcr.io/YOUR_PROJECT/jax-gpt-tpu:latest
+
+FROM python:3.11-slim
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy project
+COPY . /app
+
+# Install JAX with TPU support (libtpu is pulled automatically for v5p)
+RUN pip install --upgrade pip && \
+    pip install \
+        "jax[tpu]>=0.4.30" \
+        -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# Install project deps
+RUN pip install \
+    flax>=0.9.0 \
+    transformers>=4.45.0 \
+    safetensors>=0.4.0 \
+    tiktoken \
+    datasets \
+    lm_eval
+
+# Install CPU-only torch separately (needs its own index URL)
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install project in editable mode
+RUN pip install -e /app
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python"]

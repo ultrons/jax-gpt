@@ -1,0 +1,79 @@
+---
+# Test that oss-model-dev disk is accessible from mlperf-v5p (cloud-tpu-multipod-dev).
+# Runs on a CPU node — no TPU resource needed.
+#
+# Apply:   kubectl apply -f k8s/disk_test_pod.yaml
+# Logs:    kubectl logs disk-test
+# Cleanup: kubectl delete pod disk-test && kubectl delete pvc oss-model-dev-pvc-test && kubectl delete pv oss-model-dev-pv-test
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: oss-model-dev-pv-test
+spec:
+  capacity:
+    storage: 1000Gi
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: pd.csi.storage.gke.io
+    volumeHandle: projects/tpu-vm-gke-testing/zones/europe-west4-b/disks/oss-model-dev
+    readOnly: true
+    fsType: ext4
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values:
+                - europe-west4-b
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oss-model-dev-pvc-test
+  namespace: default
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 1000Gi
+  volumeName: oss-model-dev-pv-test
+  storageClassName: ""
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: disk-test
+  namespace: default
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: gke-mlperf-v5p-cpu-np-b188bf3f-2qd0
+  volumes:
+    - name: model-weights
+      persistentVolumeClaim:
+        claimName: oss-model-dev-pvc-test
+        readOnly: true
+  containers:
+    - name: test
+      image: busybox:latest
+      command: ["sh", "-c"]
+      args:
+        - |
+          echo "=== Disk mount test ==="
+          echo "--- Top-level contents of /mnt/model ---"
+          ls -la /mnt/model/
+          echo ""
+          echo "--- Looking for model weight files ---"
+          find /mnt/model -name "*.safetensors" | head -10
+          find /mnt/model -name "*.json" | head -10
+          echo "=== DONE ==="
+      volumeMounts:
+        - name: model-weights
+          mountPath: /mnt/model
+          readOnly: true
