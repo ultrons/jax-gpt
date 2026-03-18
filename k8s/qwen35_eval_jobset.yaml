@@ -1,0 +1,149 @@
+# JobSet for Qwen3.5-397B HumanEval on mlperf-v5p (cloud-tpu-multipod-dev).
+#
+# Topology:  2×4×4 v5p = 32 chips = 8 hosts × 4 chips (ct5p-hightpu-4t)
+# Sharding:  TP=32 (all chips), DP=1
+# Memory:    32 chips × 96 GB = 3,072 GB >> 794 GB model (fits with ~2.3× headroom)
+#
+# JobSet creates one child Job with 8 indexed pods (one per TPU host).
+# All pods restart together if any fails — required for JAX collective ops.
+# Kueue (multislice-queue) handles admission on mlperf-v5p.
+#
+# Prerequisites:
+#   1. JobSet CRD installed on mlperf-v5p (already present).
+#
+#   2. Model weights disk in cloud-tpu-multipod-dev:
+#        Created from snapshot of oss-model-dev (tpu-vm-gke-testing).
+#        See README.md → "Disk handoff workflow"
+#
+#   3. Docker image built and pushed (see k8s/Dockerfile.tpu).
+#
+# Deploy:
+#   kubectl apply -f k8s/qwen35_eval_jobset.yaml
+#
+# Monitor:
+#   kubectl get jobset qwen35-humaneval
+#   kubectl logs -l jobset.sigs.k8s.io/jobset-name=qwen35-humaneval --prefix=true -f
+
+---
+# PersistentVolume referencing the existing 'oss-model-dev' disk (read-only).
+#
+# IMPORTANT: Detach the disk from this VM before deploying:
+#   See README.md → "Disk handoff workflow"
+#
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: oss-model-dev-pv
+spec:
+  capacity:
+    storage: 1000Gi
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain   # don't delete the disk on PVC release
+  csi:
+    driver: pd.csi.storage.gke.io
+    volumeHandle: projects/cloud-tpu-multipod-dev/zones/europe-west4-b/disks/oss-model-dev-mlperf
+    readOnly: true
+    fsType: ext4
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values:
+                - europe-west4-b
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oss-model-dev-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 1000Gi
+  volumeName: oss-model-dev-pv   # bind directly to the PV above
+  storageClassName: ""            # static binding — no dynamic provisioner
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-humaneval
+  namespace: default
+  labels:
+    # Required for Kueue admission on mlperf-v5p
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    # Pin all pods to the same node pool (required for TPU topology)
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  # If any pod fails the whole JobSet restarts — required for JAX collectives.
+  failurePolicy:
+    maxRestarts: 2
+
+  replicatedJobs:
+    - name: slice
+      # replicas=1: one TPU slice (4×4×4 = 8 hosts)
+      replicas: 1
+      template:
+        spec:
+          # 8 indexed pods, one per TPU host in the 2×4×4 slice (4 chips each)
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          # No backoff — let JobSet handle restarts at the JobSet level
+          backoffLimit: 0
+
+          template:
+            metadata:
+              labels:
+                app: qwen35-humaneval
+            spec:
+              restartPolicy: Never
+
+              # ---- Volumes -----------------------------------------------
+              volumes:
+                - name: model-weights
+                  persistentVolumeClaim:
+                    claimName: oss-model-dev-pvc
+                    readOnly: true
+
+              # ---- Node selector (TPU v5p pool) ---------------------------
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+                cloud.google.com/gke-tpu-topology: 2x4x4
+
+              # ---- Containers ---------------------------------------------
+              containers:
+                - name: eval
+                  # EDIT: replace with your image
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v6
+                  imagePullPolicy: Always
+
+                  command: ["python", "scripts/eval_humaneval.py"]
+                  args:
+                    - "--model-dir=/mnt/model/qwen3.5-397b"
+                    - "--output-dir=/tmp/output"
+                    - "--n-problems=164"
+                    - "--tp=32"
+                    - "--dp=1"
+
+                  env:
+                    # GKE TPU admission webhook injects TPU_WORKER_ID and
+                    # TPU_WORKER_HOSTNAMES automatically — JAX auto-detects from these.
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+
+                  resources:
+                    limits:
+                      google.com/tpu: "4"   # 4 v5p chips per host (ct5p-hightpu-4t)
+
+                  volumeMounts:
+                    - name: model-weights
+                      mountPath: /mnt/model
+                      readOnly: true

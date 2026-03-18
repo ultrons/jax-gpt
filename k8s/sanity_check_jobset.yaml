@@ -1,0 +1,74 @@
+---
+# Sanity-check JobSet: runs eval pipeline with random weights (no disk needed).
+# Use this to verify JAX distributed init, TPU allocation, and forward pass
+# before committing to the full model run.
+#
+# Config: mini (4-layer model), 2 problems, tp=32, dp=1
+# No PV/PVC needed — weights are randomly initialized in-process.
+#
+# Deploy:
+#   kubectl apply -f k8s/sanity_check_jobset.yaml
+#
+# Monitor:
+#   kubectl get jobset qwen35-sanity
+#   kubectl logs -l jobset.sigs.k8s.io/jobset-name=qwen35-sanity --prefix=true -f
+#
+# Cleanup:
+#   kubectl delete jobset qwen35-sanity
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-sanity
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+
+          template:
+            metadata:
+              labels:
+                app: qwen35-sanity
+            spec:
+              restartPolicy: Never
+
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+                cloud.google.com/gke-tpu-topology: 2x4x4
+
+              containers:
+                - name: eval
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v2
+                  imagePullPolicy: Always
+
+                  command: ["python", "scripts/eval_humaneval.py"]
+                  args:
+                    - "--model-dir=/tmp/dummy"
+                    - "--tokenizer=Qwen/Qwen2.5-7B"
+                    - "--output-dir=/tmp/output"
+                    - "--random-weights"
+                    - "--config=mini"
+                    - "--n-problems=2"
+                    - "--tp=32"
+                    - "--dp=1"
+
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
