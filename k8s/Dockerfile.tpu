@@ -31,7 +31,8 @@ RUN pip install \
     safetensors>=0.4.0 \
     tiktoken \
     datasets \
-    lm_eval
+    lm_eval \
+    gcsfs
 
 # Install CPU-only torch separately (needs its own index URL)
 RUN pip install torch --index-url https://download.pytorch.org/whl/cpu

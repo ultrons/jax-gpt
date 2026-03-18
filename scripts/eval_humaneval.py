@@ -196,15 +196,97 @@ def make_forward_fn(params, config, mesh, tp: int, axis_rules=None):
     return _call
 
 
+def _extract_function_body(text: str) -> str:
+    """Extract Python function body from model output.
+
+    Handles:
+    - Qwen3 thinking blocks (<think>...</think>) — strip, take content after
+    - Markdown code blocks (```python ... ```)
+    - Thinking preamble (text before first indented line)
+    - Repeated function signature (model re-states 'def ...')
+    """
+    # 0. Strip Qwen3 thinking block if present — take everything after </think>
+    if '</think>' in text:
+        text = text[text.find('</think>') + len('</think>'):].strip()
+
+    # 1. Prefer content inside a markdown python code block
+    if '```python' in text:
+        start = text.find('```python') + 9
+        end = text.find('```', start)
+        text = text[start:end].strip() if end > start else text[start:].strip()
+    elif '```' in text:
+        start = text.find('```') + 3
+        end = text.find('```', start)
+        text = text[start:end].strip() if end > start else text[start:].strip()
+
+    # 2. Strip any repeated 'def ...' signature the model may have emitted
+    lines = text.split('\n')
+    body_lines = []
+    skip_def = False
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith('def ') and not body_lines:
+            skip_def = True
+            continue
+        if skip_def and stripped.startswith('"""'):
+            # Skip repeated docstring too
+            in_doc = True
+            while lines:
+                l = lines.pop(0) if lines else ''
+                if l.lstrip().endswith('"""') and in_doc and l.lstrip() != '"""':
+                    break
+                if l.count('"""') >= 2:
+                    break
+            skip_def = False
+            continue
+        skip_def = False
+        body_lines.append(line)
+
+    text = '\n'.join(body_lines)
+
+    # 3. Drop leading non-code prose: find first indented line
+    lines = text.split('\n')
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if line.startswith('    ') or line.startswith('\t'):
+            start_idx = i
+            break
+
+    return '\n'.join(lines[start_idx:])
+
+
+def make_sample_fn(temperature: float):
+    """Return a JIT-compiled sampling function, defined once at startup.
+
+    Defining @jax.jit inside generate_completion creates a new JIT object per
+    call → recompilation on every problem. Defining it here and passing it in
+    as sample_fn ensures the kernel is compiled once and reused.
+
+    Logits are fully replicated P(None,None,None) — guaranteed by the
+    with_sharding_constraint AllGather in model.py's output_head.
+    """
+    @jax.jit
+    def _get_next(l, k):
+        logit = l[0, -1, :].astype(jnp.float32)
+        rng_new, subkey = jax.random.split(k)
+        if temperature <= 0.0:
+            next_tok = jnp.argmax(logit).astype(jnp.int32)
+        else:
+            next_tok = jax.random.categorical(
+                subkey, logit / temperature).astype(jnp.int32)
+        return next_tok, rng_new
+    return _get_next
+
+
 def generate_completion(
     fwd_fn,
     tok,
     config,
     prompt: str,
+    sample_fn,
     max_new_tokens: int = 256,
     temperature: float = 0.2,
     fixed_max_len: int | None = None,
-    prefill_bucket: int = 128,
 ) -> str:
     """Generate a completion for `prompt` using greedy / temperature sampling.
 
@@ -213,74 +295,83 @@ def generate_completion(
         tok: HuggingFace tokenizer.
         config: Qwen35Config.
         prompt: text prompt string.
+        sample_fn: pre-compiled JIT from make_sample_fn() — passed in to avoid
+            recompilation on every problem.
         max_new_tokens: max tokens to generate.
         temperature: sampling temperature (0 = greedy).
-        fixed_max_len: if set, all caches use this length (avoids recompilation
-            across problems with different prompt lengths).
-        prefill_bucket: round prefill length up to nearest multiple of this value
-            to reduce JIT recompilation (right-pad with eos token).
+        fixed_max_len: if set, all caches use this length so the decode JIT
+            compiles once regardless of prompt length variation.
 
     Returns:
         Generated text (decoded, without the prompt).
     """
     from jax_gpt.models.qwen35.cache import init_cache
 
-    input_ids = tok(prompt, return_tensors='np').input_ids[0]
+    # Qwen3.5 is chat-tuned — wrap raw HumanEval prompt with chat template.
+    # We do NOT force thinking mode: strip the trailing '<think>\n' that
+    # add_generation_prompt=True appends, so the model sees a plain
+    # '<|im_start|>assistant\n' prefix and generates freely.
+    # (With thinking mode forced: model consistently generates <|im_end|> immediately.)
+    rank = jax.process_index()
+    chat = [{'role': 'user', 'content':
+             'Complete the following Python function. '
+             'Output ONLY the indented function body, no explanation, no markdown:\n\n'
+             + prompt}]
+    formatted = tok.apply_chat_template(
+        chat, tokenize=False, add_generation_prompt=True)
+    # Strip the <think>\n (or <think>) suffix added by the Qwen3 template.
+    for _think_sfx in ('<think>\n', '<think>'):
+        if formatted.endswith(_think_sfx):
+            formatted = formatted[:-len(_think_sfx)]
+            break
+    input_ids = tok(formatted, return_tensors='np').input_ids[0]
     T = len(input_ids)
+    # One-time debug: print last 200 chars of formatted prompt to confirm template
+    if not hasattr(tok, '_debug_template_printed'):
+        tok._debug_template_printed = True
+        print(f"[DEBUG template tail] {repr(formatted[-200:])}", flush=True)
 
-    # Bucket prefill length to limit recompilation across problems.
-    # Right-pad with eos so we get the same shape for all prompts in the bucket.
-    bucket_T = math.ceil(T / prefill_bucket) * prefill_bucket
-    if bucket_T > T:
-        pad_id = tok.eos_token_id if tok.eos_token_id is not None else 0
-        input_ids = np.concatenate(
-            [input_ids, np.full(bucket_T - T, pad_id, dtype=np.int32)])
-    tokens = jnp.array(input_ids[None], dtype=jnp.int32)  # (1, bucket_T)
+    # Stop tokens — use tokenizer to get correct IDs (extended vocab: 248044/248046)
+    _stop_ids = {tok.eos_token_id,
+                 tok.convert_tokens_to_ids('<|endoftext|>'),
+                 tok.convert_tokens_to_ids('<|im_end|>')} - {None}
 
-    # Allocate cache. Use a fixed max_len when provided so the cache array
-    # shape is identical across all problems → decode step compiles once.
-    max_len = fixed_max_len if fixed_max_len is not None else bucket_T + max_new_tokens
+    # No right-padding — use exact prompt length to avoid EOS tokens polluting
+    # the KV cache (right-padding with EOS causes model to predict EOS immediately
+    # in decode since it attends back to the padded positions).
+    # Per-length recompilation is handled by the GCS compilation cache.
+    tokens = jnp.array(input_ids[None], dtype=jnp.int32)  # (1, T)
+
+    # Allocate cache. Use a fixed max_len so the cache array shape is identical
+    # across all problems → decode step compiles once regardless of prompt length.
+    max_len = fixed_max_len if fixed_max_len is not None else T + max_new_tokens
     cache = init_cache(config, batch_size=1, max_len=max_len, dtype=jnp.bfloat16)
 
     # ----- Prefill -----
-    logits, cache = fwd_fn(tokens, cache, False)  # (1, bucket_T, vocab)
-
-    # Grab the logit at the last *real* token position (not the padding tail).
-    # We need to pass this position through JIT to avoid materializing the
-    # full vocab-sharded logits on the host.
-    last_real_pos = T - 1
+    logits, cache = fwd_fn(tokens, cache, False)  # (1, T, vocab)
 
     # ----- Decode loop -----
     generated_ids: list[int] = []
     rng = jax.random.key(0)
 
-    # Sample next token inside JIT so sharded logits (vocab-dim sharded across
-    # TP devices) are never materialized on host — avoids "non-addressable
-    # device" error in multi-process JAX.
-    # Use last_real_pos (not -1) because prefill output may have padding tail.
-    if temperature <= 0.0:
-        _get_next = jax.jit(
-            lambda l, pos: jnp.argmax(l[0, pos, :]).astype(jnp.int32))
-    else:
-        @jax.jit
-        def _get_next_with_temp(l, pos, k):
-            rng_new, subkey = jax.random.split(k)
-            next_tok = jax.random.categorical(
-                subkey, (l[0, pos, :] / temperature).astype(jnp.float32))
-            return next_tok.astype(jnp.int32), rng_new
-
-    # Use -1 for decode steps (token_in is always length 1)
-    _decode_pos = jnp.array(-1, dtype=jnp.int32)
+    # _get_next is passed in as a pre-compiled JIT to avoid recompilation
+    # on every call to generate_completion (defining @jax.jit inside a
+    # function creates a new JIT object per call → recompile each problem).
 
     for step in range(max_new_tokens):
-        pos = jnp.array(last_real_pos, dtype=jnp.int32) if step == 0 else _decode_pos
-        if temperature <= 0.0:
-            next_id = int(_get_next(logits, pos))
-        else:
-            next_id_jax, rng = _get_next_with_temp(logits, pos, rng)
-            next_id = int(next_id_jax)
+        # All ranks must call the same JIT in lockstep (TP collective ops).
+        next_id_jax, rng = sample_fn(logits, rng)
+        next_id = int(next_id_jax)
 
-        if next_id == tok.eos_token_id:
+        # All ranks print their first token to verify cross-rank agreement.
+        if step == 0:
+            print(f"  [DEBUG rank{rank} tok0] id={next_id} "
+                  f"'{tok.decode([next_id])}'", flush=True)
+
+        if next_id in _stop_ids:
+            if not generated_ids:  # stopped on very first token
+                print(f"  [DEBUG stop] first token is stop token id={next_id} "
+                      f"'{tok.decode([next_id])}'", flush=True)
             break
         generated_ids.append(next_id)
 
@@ -288,7 +379,21 @@ def generate_completion(
         token_in = jnp.array([[next_id]], dtype=jnp.int32)  # (1, 1)
         logits, cache = fwd_fn(token_in, cache, True)
 
-    return tok.decode(generated_ids, skip_special_tokens=True)
+    raw = tok.decode(generated_ids, skip_special_tokens=False)  # keep special tokens for debug
+    # </think> is token 151668 — a special token stripped by skip_special_tokens=True.
+    # Find split point in token IDs directly, decode only the post-think suffix.
+    _THINK_CLOSE_ID = tok.convert_tokens_to_ids('</think>')  # 248069 for Qwen3.5-397B
+    if _THINK_CLOSE_ID in generated_ids:
+        suffix_ids = generated_ids[generated_ids.index(_THINK_CLOSE_ID) + 1:]
+        decoded_for_extraction = tok.decode(suffix_ids, skip_special_tokens=True)
+    else:
+        decoded_for_extraction = tok.decode(generated_ids, skip_special_tokens=True)
+    # Warn if we hit the token limit before closing thinking
+    hit_limit = len(generated_ids) == max_new_tokens
+    if hit_limit and _THINK_CLOSE_ID not in generated_ids:
+        print(f"  [WARN] hit max_new_tokens={max_new_tokens} without </think> — "
+              f"thinking overflowed; increase --max-new-tokens", flush=True)
+    return _extract_function_body(decoded_for_extraction), raw, generated_ids
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +461,7 @@ def main():
     parser.add_argument('--output-dir', default='/tmp/humaneval_out')
     parser.add_argument('--n-problems', type=int, default=164)
     parser.add_argument('--max-new-tokens', type=int, default=256)
-    parser.add_argument('--temperature', type=float, default=0.2)
+    parser.add_argument('--temperature', type=float, default=0.6)  # Qwen3 thinking mode: use 0.6
     parser.add_argument('--sharding', default='B', choices=['A', 'B'])
     parser.add_argument('--tp', type=int, default=None,
                         help='Tensor-parallel degree (default: all local chips)')
@@ -444,21 +549,24 @@ def main():
     print(f"[rank {rank}] dp_rank={dp_rank} Evaluating problems {start}..{end - 1} "
           f"({len(my_problems)} problems)")
 
-    # Pre-tokenize to find the max prompt length → fix cache shape so the
-    # decode JIT only compiles once regardless of prompt length variation.
-    PREFILL_BUCKET = 128
+    # Pre-tokenize with chat template to find max formatted prompt length.
+    # fixed_max_len keeps cache shape identical across problems so decode
+    # compiles only once. Prefill length varies per problem (no padding) —
+    # GCS compilation cache handles per-length recompilation across runs.
     from jax_gpt.models.qwen35.cache import init_cache
     if my_problems:
-        prompt_lens = [
-            len(tok(p['prompt'], return_tensors='np').input_ids[0])
-            for p in my_problems
-        ]
-        max_prompt_len = max(prompt_lens)
+        def _fmt_len(p):
+            chat = [{'role': 'user', 'content':
+                     'Complete the following Python function. '
+                     'Output only the function body (the indented code), no explanation:\n\n'
+                     + p['prompt']}]
+            fmt = tok.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+            return len(tok(fmt, return_tensors='np').input_ids[0])
+        max_prompt_len = max(_fmt_len(p) for p in my_problems)
     else:
-        max_prompt_len = PREFILL_BUCKET
-    max_prompt_bucketed = math.ceil(max_prompt_len / PREFILL_BUCKET) * PREFILL_BUCKET
-    fixed_max_len = max_prompt_bucketed + args.max_new_tokens
-    print(f"[rank {rank}] max_prompt_len={max_prompt_len}  "
+        max_prompt_len = 256
+    fixed_max_len = max_prompt_len + args.max_new_tokens
+    print(f"[rank {rank}] max_formatted_prompt_len={max_prompt_len}  "
           f"fixed_max_len={fixed_max_len}")
 
     # ------------------------------------------------------------------
@@ -467,11 +575,10 @@ def main():
     print(f"[rank {rank}] Compiling forward pass (prefill + decode)...")
     fwd_fn = make_forward_fn(params, cfg, mesh, tp, axis_rules=axis_rules)
 
-    # Warm-up: use the real fixed_max_len so the cache shape matches inference.
-    # Prefill with PREFILL_BUCKET tokens (smallest bucket) to trigger one compile.
-    print(f"[rank {rank}] Warming up JIT (prefill)...")
+    # Warm-up with a short dummy prompt to trigger decode JIT compile.
+    print(f"[rank {rank}] Warming up JIT (prefill + decode)...")
     t_compile = time.perf_counter()
-    _dummy_ids = jnp.ones((1, PREFILL_BUCKET), dtype=jnp.int32)
+    _dummy_ids = jnp.ones((1, 4), dtype=jnp.int32)
     _dummy_cache = init_cache(cfg, 1, fixed_max_len, dtype=jnp.bfloat16)
     _, _dc = fwd_fn(_dummy_ids, _dummy_cache, False)
     jax.effects_barrier()
@@ -482,6 +589,14 @@ def main():
     fwd_fn(_tok1, _dc, True)
     jax.effects_barrier()
     print(f"  Decode JIT compile:  {time.perf_counter() - t_compile:.1f}s")
+
+    # Build sampling JIT once — reused across all problems.
+    sample_fn = make_sample_fn(args.temperature)
+    # Warm up sampling JIT with dummy logits.
+    _dummy_logits = jnp.zeros((1, 1, cfg.vocab_size), dtype=jnp.bfloat16)
+    _, _ = sample_fn(_dummy_logits, jax.random.key(0))
+    jax.effects_barrier()
+    print(f"  Sample JIT compiled.")
 
     # ------------------------------------------------------------------
     # Eval loop
@@ -496,13 +611,13 @@ def main():
         global_idx = start + i
         t_start = time.perf_counter()
 
-        completion = generate_completion(
+        completion, raw_text, token_ids = generate_completion(
             fwd_fn, tok, cfg,
             prompt=problem['prompt'],
+            sample_fn=sample_fn,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             fixed_max_len=fixed_max_len,
-            prefill_bucket=PREFILL_BUCKET,
         )
         elapsed = time.perf_counter() - t_start
         passed = evaluate_completion(problem, completion)
@@ -521,6 +636,11 @@ def main():
         acc = n_pass / (i + 1)
         print(f"[rank {rank}] [{i + 1}/{len(my_problems)}] {status} "
               f"{problem['task_id']}  ({elapsed:.1f}s)  pass@1={acc:.3f}")
+        # Debug: dump raw tokens + text for first 10 problems on rank 0 → GCS
+        if i < 10 and rank == 0:
+            print(f"  [DEBUG raw]        {repr(raw_text[:500])}")
+            print(f"  [DEBUG completion] {repr(completion[:300])}")
+            print(f"  [DEBUG token_ids] {token_ids[:50]}", flush=True)
         sys.stdout.flush()
 
     # ------------------------------------------------------------------
@@ -612,6 +732,15 @@ def _merge_results(output_dir: Path, dp: int, n_total: int):
     print(f'  Pass@1:    {total_pass}/{total_evaluated} = {pass_at_1:.3f}')
     print(f'  Summary:   {summary_file}')
     print('=' * 60)
+
+    # Save to GCS so results survive pod termination
+    gcs_dest = 'gs://sivaibhav-exp/qwen-profiles/humaneval/summary.json'
+    try:
+        import subprocess as _sp
+        _sp.run(['gsutil', 'cp', str(summary_file), gcs_dest], check=True)
+        print(f'  GCS copy:  {gcs_dest}')
+    except Exception as e:
+        print(f'  WARNING: GCS copy failed: {e}')
 
 
 if __name__ == '__main__':

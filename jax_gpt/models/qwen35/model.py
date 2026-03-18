@@ -319,6 +319,14 @@ def forward(
     with jax.named_scope('output_head'):
         x = rms_norm(x, params['final_norm'], config.rms_norm_eps)
         logits = matmul_maybe_fp8(x, params['lm_head'])  # (B, T, vocab_size)
+        # AllGather vocab-sharded logits to all TP devices so that sampling
+        # (argmax or categorical) sees the full distribution on every rank.
+        # Without this, logits are P(None, None, 'tp') and sampling in a
+        # separate JIT would operate on each device's vocab shard independently.
+        if mesh is not None:
+            from jax.sharding import NamedSharding, PartitionSpec as P
+            logits = jax.lax.with_sharding_constraint(
+                logits, NamedSharding(mesh, P(None, None, None)))
 
     return logits, new_cache
 

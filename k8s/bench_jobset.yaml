@@ -1,0 +1,185 @@
+# Three parallel benchmark JobSets for W8A8 FP8 prefill/decode profiling.
+# Each runs on its own 32-chip v5p slice simultaneously.
+#
+# Deploy all three at once:
+#   kubectl apply -f k8s/bench_jobset.yaml
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-bench --prefix=true -f
+#
+# Cleanup:
+#   kubectl delete -f k8s/bench_jobset.yaml
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-bench-8k1k
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-bench
+            spec:
+              restartPolicy: Never
+              volumes:
+                - name: model-weights
+                  persistentVolumeClaim:
+                    claimName: oss-model-dev-pvc
+                    readOnly: true
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v6
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/bench_prefill_decode.py"]
+                  args:
+                    - "--model-dir=/mnt/model/qwen3.5-397b"
+                    - "--scenario=8k1k"
+                    - "--tp=32"
+                    - "--dp=1"
+                    - "--profile-dir=gs://sivaibhav-exp/qwen-profiles"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: model-weights
+                      mountPath: /mnt/model
+                      readOnly: true
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-bench-1k1k
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-bench
+            spec:
+              restartPolicy: Never
+              volumes:
+                - name: model-weights
+                  persistentVolumeClaim:
+                    claimName: oss-model-dev-pvc
+                    readOnly: true
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v6
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/bench_prefill_decode.py"]
+                  args:
+                    - "--model-dir=/mnt/model/qwen3.5-397b"
+                    - "--scenario=1k1k"
+                    - "--tp=32"
+                    - "--dp=1"
+                    - "--profile-dir=gs://sivaibhav-exp/qwen-profiles"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: model-weights
+                      mountPath: /mnt/model
+                      readOnly: true
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-bench-1k8k
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-bench
+            spec:
+              restartPolicy: Never
+              volumes:
+                - name: model-weights
+                  persistentVolumeClaim:
+                    claimName: oss-model-dev-pvc
+                    readOnly: true
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v6
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/bench_prefill_decode.py"]
+                  args:
+                    - "--model-dir=/mnt/model/qwen3.5-397b"
+                    - "--scenario=1k8k"
+                    - "--tp=32"
+                    - "--dp=1"
+                    - "--profile-dir=gs://sivaibhav-exp/qwen-profiles"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: model-weights
+                      mountPath: /mnt/model
+                      readOnly: true
