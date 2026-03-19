@@ -122,17 +122,22 @@ spec:
               containers:
                 - name: eval
                   # EDIT: replace with your image
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v32
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v34
                   imagePullPolicy: Always
 
                   command: ["python", "scripts/eval_humaneval.py"]
                   args:
                     - "--model-dir=/mnt/model/qwen3.5-397b"
                     - "--output-dir=/tmp/output"
-                    - "--n-problems=5"
+                    - "--n-problems=164"
                     - "--tp=32"
                     - "--dp=1"
-                    - "--max-new-tokens=512"
+                    - "--max-new-tokens=32768"
+                    - "--temperature=0.6"
+                    - "--top-k=20"
+                    - "--top-p=0.95"
+                    - "--presence-penalty=0.0"
+                    - "--enable-thinking"
 
                   env:
                     # GKE TPU admission webhook injects TPU_WORKER_ID and
