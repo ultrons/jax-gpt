@@ -184,13 +184,18 @@ def expert_forward_ep(
         group_sizes_local = jax.lax.dynamic_slice(
             group_sizes_all, (my_idx * e_local,), (e_local,))
 
-        # Start offset in the sorted array for my experts
+        # Start offset in the sorted array for my experts.
+        # BUG FIX: dynamic_slice with slice_size=M*k on an array of size M*k
+        # clamps start_offset to 0 (since max(0, min(start, N-N))=0), causing
+        # ALL devices to read from position 0 instead of their assigned range.
+        # Fix: use jnp.roll to rotate the sorted arrays so that this device's
+        # tokens start at position 0.  The mask below zeros out wrapped-around
+        # positions beyond n_local_tokens.
         start_offset = group_offsets[my_idx * e_local]
 
-        # Slice my tokens from the sorted array (use M*k as max, mask later)
-        x_local = jax.lax.dynamic_slice(x_sorted, (start_offset, 0), (M * k, D))
-        weights_local = jax.lax.dynamic_slice(sorted_weights, (start_offset,), (M * k,))
-        token_ids_local = jax.lax.dynamic_slice(sorted_token_ids, (start_offset,), (M * k,))
+        x_local = jnp.roll(x_sorted, -start_offset, axis=0)
+        weights_local = jnp.roll(sorted_weights, -start_offset, axis=0)
+        token_ids_local = jnp.roll(sorted_token_ids, -start_offset, axis=0)
 
         # How many tokens are actually mine
         n_local_tokens = jnp.sum(group_sizes_local)

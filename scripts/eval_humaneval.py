@@ -255,7 +255,7 @@ def _extract_function_body(text: str) -> str:
     return '\n'.join(lines[start_idx:])
 
 
-def make_sample_fn(temperature: float):
+def make_sample_fn(temperature: float, top_k: int = 0):
     """Return a JIT-compiled sampling function, defined once at startup.
 
     Defining @jax.jit inside generate_completion creates a new JIT object per
@@ -264,6 +264,9 @@ def make_sample_fn(temperature: float):
 
     Logits are fully replicated P(None,None,None) — guaranteed by the
     with_sharding_constraint AllGather in model.py's output_head.
+
+    top_k: if > 0, mask all tokens outside top-k before sampling.
+    HF recommends top_k=20 for Qwen3.5 thinking mode.
     """
     @jax.jit
     def _get_next(l, k):
@@ -272,8 +275,14 @@ def make_sample_fn(temperature: float):
         if temperature <= 0.0:
             next_tok = jnp.argmax(logit).astype(jnp.int32)
         else:
-            next_tok = jax.random.categorical(
-                subkey, logit / temperature).astype(jnp.int32)
+            scaled = logit / temperature
+            if top_k > 0:
+                # Sort descending and threshold at the k-th value.
+                # Avoids jax.lax.top_k whose (top_k,) output can cause scheckne
+                # on TP=32 meshes when top_k < n_devices.
+                kth = jnp.sort(scaled)[::-1][top_k - 1]
+                scaled = jnp.where(scaled >= kth, scaled, jnp.finfo(jnp.float32).min)
+            next_tok = jax.random.categorical(subkey, scaled).astype(jnp.int32)
         return next_tok, rng_new
     return _get_next
 
@@ -308,28 +317,27 @@ def generate_completion(
     from jax_gpt.models.qwen35.cache import init_cache
 
     # Qwen3.5 is chat-tuned — wrap raw HumanEval prompt with chat template.
-    # We do NOT force thinking mode: strip the trailing '<think>\n' that
-    # add_generation_prompt=True appends, so the model sees a plain
-    # '<|im_start|>assistant\n' prefix and generates freely.
-    # (With thinking mode forced: model consistently generates <|im_end|> immediately.)
+    # enable_thinking=False: model responds directly with code, no <think> block.
+    # Thinking mode caused unpredictable behavior on HumanEval: thinking overflow
+    # (>4096 tokens without </think>), premature EOS inside thinking block, and
+    # wrong code after thinking. Direct mode is the standard for code benchmarks.
     rank = jax.process_index()
     chat = [{'role': 'user', 'content':
              'Complete the following Python function. '
-             'Output ONLY the indented function body, no explanation, no markdown:\n\n'
+             'Return a ```python``` code block containing only the completed function '
+             '(signature + body), no explanation:\n\n'
              + prompt}]
     formatted = tok.apply_chat_template(
-        chat, tokenize=False, add_generation_prompt=True)
-    # Strip the <think>\n (or <think>) suffix added by the Qwen3 template.
-    for _think_sfx in ('<think>\n', '<think>'):
-        if formatted.endswith(_think_sfx):
-            formatted = formatted[:-len(_think_sfx)]
-            break
+        chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
     input_ids = tok(formatted, return_tensors='np').input_ids[0]
     T = len(input_ids)
     # One-time debug: print last 200 chars of formatted prompt to confirm template
-    if not hasattr(tok, '_debug_template_printed'):
-        tok._debug_template_printed = True
-        print(f"[DEBUG template tail] {repr(formatted[-200:])}", flush=True)
+    if not hasattr(tok, '_debug_prompt_printed'):
+        tok._debug_prompt_printed = True
+        print(f"[DEBUG prompt tail] {repr(formatted[-200:])}", flush=True)
+        # Print last 15 token IDs to verify special tokens are single tokens
+        print(f"[DEBUG last15 ids]  {input_ids[-15:].tolist()}", flush=True)
+        print(f"[DEBUG last15 dec]  {[tok.decode([i]) for i in input_ids[-15:]]}", flush=True)
 
     # Stop tokens — use tokenizer to get correct IDs (extended vocab: 248044/248046)
     _stop_ids = {tok.eos_token_id,
@@ -380,19 +388,9 @@ def generate_completion(
         logits, cache = fwd_fn(token_in, cache, True)
 
     raw = tok.decode(generated_ids, skip_special_tokens=False)  # keep special tokens for debug
-    # </think> is token 151668 — a special token stripped by skip_special_tokens=True.
-    # Find split point in token IDs directly, decode only the post-think suffix.
-    _THINK_CLOSE_ID = tok.convert_tokens_to_ids('</think>')  # 248069 for Qwen3.5-397B
-    if _THINK_CLOSE_ID in generated_ids:
-        suffix_ids = generated_ids[generated_ids.index(_THINK_CLOSE_ID) + 1:]
-        decoded_for_extraction = tok.decode(suffix_ids, skip_special_tokens=True)
-    else:
-        decoded_for_extraction = tok.decode(generated_ids, skip_special_tokens=True)
-    # Warn if we hit the token limit before closing thinking
-    hit_limit = len(generated_ids) == max_new_tokens
-    if hit_limit and _THINK_CLOSE_ID not in generated_ids:
-        print(f"  [WARN] hit max_new_tokens={max_new_tokens} without </think> — "
-              f"thinking overflowed; increase --max-new-tokens", flush=True)
+    decoded_for_extraction = tok.decode(generated_ids, skip_special_tokens=True)
+    if len(generated_ids) == max_new_tokens:
+        print(f"  [WARN] hit max_new_tokens={max_new_tokens}", flush=True)
     return _extract_function_body(decoded_for_extraction), raw, generated_ids
 
 
@@ -460,8 +458,9 @@ def main():
                         help='Path to the model directory (for tokenizer + weights)')
     parser.add_argument('--output-dir', default='/tmp/humaneval_out')
     parser.add_argument('--n-problems', type=int, default=164)
-    parser.add_argument('--max-new-tokens', type=int, default=256)
-    parser.add_argument('--temperature', type=float, default=0.6)  # Qwen3 thinking mode: use 0.6
+    parser.add_argument('--max-new-tokens', type=int, default=4096)
+    parser.add_argument('--temperature', type=float, default=0.6)  # HF recommended for thinking mode
+    parser.add_argument('--top-k', type=int, default=20)           # HF recommended for thinking mode
     parser.add_argument('--sharding', default='B', choices=['A', 'B'])
     parser.add_argument('--tp', type=int, default=None,
                         help='Tensor-parallel degree (default: all local chips)')
@@ -558,9 +557,11 @@ def main():
         def _fmt_len(p):
             chat = [{'role': 'user', 'content':
                      'Complete the following Python function. '
-                     'Output only the function body (the indented code), no explanation:\n\n'
+                     'Return a ```python``` code block containing only the completed function '
+                     '(signature + body), no explanation:\n\n'
                      + p['prompt']}]
-            fmt = tok.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+            fmt = tok.apply_chat_template(
+                chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
             return len(tok(fmt, return_tensors='np').input_ids[0])
         max_prompt_len = max(_fmt_len(p) for p in my_problems)
     else:
@@ -591,12 +592,43 @@ def main():
     print(f"  Decode JIT compile:  {time.perf_counter() - t_compile:.1f}s")
 
     # Build sampling JIT once — reused across all problems.
-    sample_fn = make_sample_fn(args.temperature)
+    sample_fn = make_sample_fn(args.temperature, top_k=args.top_k)
     # Warm up sampling JIT with dummy logits.
     _dummy_logits = jnp.zeros((1, 1, cfg.vocab_size), dtype=jnp.bfloat16)
     _, _ = sample_fn(_dummy_logits, jax.random.key(0))
     jax.effects_barrier()
     print(f"  Sample JIT compiled.")
+
+    # ------------------------------------------------------------------
+    # Sanity check: simple "2+2" generation to verify the model works.
+    # ALL ranks must participate in fwd_fn (TP collective ops require lockstep).
+    # Only rank 0 prints the result.
+    # Use fixed_max_len for the cache so we reuse the already-compiled decode
+    # kernel (different cache shape → recompile).
+    # ------------------------------------------------------------------
+    _sanity_chat = [{'role': 'user', 'content': 'What is 2+2? Answer with just the number.'}]
+    _sanity_fmt = tok.apply_chat_template(
+        _sanity_chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    _sanity_ids = tok(_sanity_fmt, return_tensors='np').input_ids[0]
+    _sanity_tokens = jnp.array(_sanity_ids[None], dtype=jnp.int32)
+    _sanity_cache = init_cache(cfg, 1, fixed_max_len, dtype=jnp.bfloat16)
+    _sanity_logits, _sanity_cache = fwd_fn(_sanity_tokens, _sanity_cache, False)
+    _sanity_gen = []
+    _sanity_rng = jax.random.key(1)
+    _sanity_stop = {tok.eos_token_id,
+                    tok.convert_tokens_to_ids('<|endoftext|>'),
+                    tok.convert_tokens_to_ids('<|im_end|>')} - {None}
+    for _step in range(20):
+        _next, _sanity_rng = sample_fn(_sanity_logits, _sanity_rng)
+        _nid = int(_next)
+        if _nid in _sanity_stop:
+            break
+        _sanity_gen.append(_nid)
+        _sanity_logits, _sanity_cache = fwd_fn(
+            jnp.array([[_nid]], dtype=jnp.int32), _sanity_cache, True)
+    if rank == 0:
+        print(f"[SANITY rank0] 2+2 answer: {repr(tok.decode(_sanity_gen, skip_special_tokens=True))}")
+        print(f"[SANITY rank0] token_ids: {_sanity_gen}", flush=True)
 
     # ------------------------------------------------------------------
     # Eval loop

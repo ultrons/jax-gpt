@@ -53,7 +53,7 @@ def _init_deltanet_attn_params(key: jax.Array, config: Qwen35Config,
         'conv_weight': (jax.random.normal(keys[4], (conv_dim, config.delta_conv_kernel), dtype=dtype) * 0.02),
         'A_log': jnp.log(jax.random.uniform(keys[5], (config.delta_n_v_heads,), minval=0.1, maxval=16.0)),
         'dt_bias': jnp.ones(config.delta_n_v_heads, dtype=dtype),
-        'norm_weight': jnp.zeros(config.delta_v_head_dim, dtype=dtype),
+        'norm_weight': jnp.ones(config.delta_v_head_dim, dtype=dtype),
         'out_proj': _init_linear(keys[6], value_dim, D, dtype=dtype, fp8=fp8),
     }
 
