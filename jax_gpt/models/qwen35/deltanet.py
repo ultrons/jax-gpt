@@ -24,8 +24,11 @@ from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
 
 
 def _l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
-    """L2 normalize along the last axis."""
-    return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+    """L2 normalize along the last axis.
+
+    Matches HF's l2norm: x * rsqrt(sum(x^2) + eps).
+    """
+    return x * jax.lax.rsqrt((x * x).sum(axis=-1, keepdims=True) + eps)
 
 
 def _causal_conv1d_update(
@@ -155,7 +158,8 @@ def deltanet_recurrent_step(
     # Compute decay and gate
     beta = jax.nn.sigmoid(b)  # (B, 1, n_v_heads)
     # g = -exp(A_log) * softplus(a + dt_bias)  (matches HF exactly)
-    g = -jnp.exp(params['A_log']) * jax.nn.softplus(a.squeeze(1) + params['dt_bias'])  # (B, n_v_heads)
+    # Cast A_log to float32 before exp to avoid bf16 overflow.
+    g = -jnp.exp(params['A_log'].astype(jnp.float32)) * jax.nn.softplus(a.squeeze(1) + params['dt_bias'])  # (B, n_v_heads)
 
     # L2 normalize Q, K
     scale = config_qk_head_dim ** -0.5
@@ -252,7 +256,8 @@ def deltanet_prefill(
     # Compute decay and gate
     beta = jax.nn.sigmoid(b)  # (B, T, n_v_heads)
     # g = -exp(A_log) * softplus(a + dt_bias)  (matches HF exactly)
-    g = -jnp.exp(params['A_log']) * jax.nn.softplus(a + params['dt_bias'])  # (B, T, n_v_heads)
+    # Cast A_log to float32 before exp to avoid bf16 overflow.
+    g = -jnp.exp(params['A_log'].astype(jnp.float32)) * jax.nn.softplus(a + params['dt_bias'])  # (B, T, n_v_heads)
 
     # L2 normalize Q, K
     scale = config_qk_head_dim ** -0.5
@@ -419,6 +424,10 @@ def _gated_rms_norm(
 ) -> jax.Array:
     """Gated RMSNorm: rms_norm(x) * weight * silu(gate).
 
+    Matches HF Qwen3_5MoeRMSNormGated: weight is initialized to ones and
+    applied directly (NOT zero-centered like Qwen3_5MoeRMSNorm which uses
+    1+weight).
+
     Args:
         x: (..., D)
         gate: (..., D) — gate input.
@@ -429,6 +438,6 @@ def _gated_rms_norm(
     x_f32 = x.astype(jnp.float32)
     variance = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
     x_normed = x_f32 * jax.lax.rsqrt(variance + eps)
-    x_normed = (1.0 + weight.astype(jnp.float32)) * x_normed
+    x_normed = weight.astype(jnp.float32) * x_normed
     result = x_normed * jax.nn.silu(gate.astype(jnp.float32))
     return result.astype(orig_dtype)

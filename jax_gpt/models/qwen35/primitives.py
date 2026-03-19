@@ -63,6 +63,9 @@ def apply_rotary_emb(
 ) -> jax.Array:
     """Apply RoPE to the first `rope_dim` dimensions of x.
 
+    Uses the half-split convention matching HuggingFace's rotate_half:
+    pairs dimension i with dimension i + rope_dim//2 (NOT adjacent pairs).
+
     Partial rotary: only the first `rope_dim` dims of each head are rotated,
     the rest pass through unchanged.
 
@@ -77,28 +80,29 @@ def apply_rotary_emb(
     x_rot = x[..., :rope_dim]
     x_pass = x[..., rope_dim:]
 
-    # Reshape for rotation: (..., rope_dim) -> (..., rope_dim//2, 2)
-    x_rot = x_rot.reshape(*x_rot.shape[:-1], rope_dim // 2, 2)
+    # Half-split convention (matches HF rotate_half):
+    # pair (x[i], x[i + rope_dim//2]) for i in 0..rope_dim//2-1
+    half = rope_dim // 2
+    x1 = x_rot[..., :half]    # first half
+    x2 = x_rot[..., half:]    # second half
+
     cos = freqs_cis[..., 0]  # (seq, rope_dim//2)
     sin = freqs_cis[..., 1]
 
-    # Broadcast cos/sin to match x_rot batch dims
-    # x_rot: (B, n_heads, T, rope_dim//2, 2)  or  (B, T, n_heads, rope_dim//2, 2)
-    # freqs_cis: (T, rope_dim//2, 2)
-    # We need cos/sin shaped for broadcasting. They come in as (T, rope_dim//2).
-    # Expand to match the head dims of x.
-    ndim = x_rot.ndim
-    # freqs are (T, rope_dim//2), we need to insert dims for batch and heads
-    for _ in range(ndim - 3):  # -3 because freqs already have (T, rope_dim//2) and we add one for the pair dim
+    # Broadcast cos/sin to match x's batch dims.
+    # x1/x2: (..., T, rope_dim//2), freqs: (T, rope_dim//2)
+    # Insert leading dims for batch and heads.
+    ndim = x1.ndim
+    for _ in range(ndim - 2):  # -2 because freqs have (T, rope_dim//2)
         cos = jnp.expand_dims(cos, 0)
         sin = jnp.expand_dims(sin, 0)
 
-    x0 = x_rot[..., 0]
-    x1 = x_rot[..., 1]
-    out0 = x0 * cos - x1 * sin
-    out1 = x1 * cos + x0 * sin
-    # Stack pairs back: (..., rope_dim//2, 2) -> (..., rope_dim)
-    x_rotated = jnp.stack([out0, out1], axis=-1).reshape(*x_rot.shape[:-2], rope_dim)
+    # rotate_half: cat(-x2, x1) then q*cos + rotate_half(q)*sin
+    # Expanding: out_first  = x1*cos - x2*sin
+    #            out_second = x2*cos + x1*sin
+    out_first = x1 * cos - x2 * sin
+    out_second = x2 * cos + x1 * sin
+    x_rotated = jnp.concatenate([out_first, out_second], axis=-1)
 
     if rope_dim < head_dim:
         return jnp.concatenate([x_rotated, x_pass], axis=-1)
