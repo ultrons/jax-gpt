@@ -255,7 +255,8 @@ def _extract_function_body(text: str) -> str:
     return '\n'.join(lines[start_idx:])
 
 
-def make_sample_fn(temperature: float, top_k: int = 0):
+def make_sample_fn(temperature: float, top_k: int = 0, top_p: float = 0.0,
+                   presence_penalty: float = 0.0, vocab_size: int = 0):
     """Return a JIT-compiled sampling function, defined once at startup.
 
     Defining @jax.jit inside generate_completion creates a new JIT object per
@@ -265,12 +266,24 @@ def make_sample_fn(temperature: float, top_k: int = 0):
     Logits are fully replicated P(None,None,None) — guaranteed by the
     with_sharding_constraint AllGather in model.py's output_head.
 
-    top_k: if > 0, mask all tokens outside top-k before sampling.
-    HF recommends top_k=20 for Qwen3.5 thinking mode.
+    Args:
+        top_k: if > 0, mask all tokens outside top-k before sampling.
+        top_p: if > 0, nucleus sampling — keep smallest set of tokens whose
+            cumulative probability exceeds top_p.
+        presence_penalty: if > 0, subtract this value from logits of tokens
+            that appear in the input. Requires presence_mask input.
+        vocab_size: vocabulary size (needed for presence_penalty mask shape).
     """
+    use_presence = presence_penalty > 0.0 and vocab_size > 0
+
     @jax.jit
-    def _get_next(l, k):
+    def _get_next(l, k, presence_mask):
         logit = l[0, -1, :].astype(jnp.float32)
+
+        # Presence penalty: penalize tokens already seen in input/output
+        if use_presence:
+            logit = logit - presence_penalty * presence_mask
+
         rng_new, subkey = jax.random.split(k)
         if temperature <= 0.0:
             next_tok = jnp.argmax(logit).astype(jnp.int32)
@@ -282,6 +295,14 @@ def make_sample_fn(temperature: float, top_k: int = 0):
                 # on TP=32 meshes when top_k < n_devices.
                 kth = jnp.sort(scaled)[::-1][top_k - 1]
                 scaled = jnp.where(scaled >= kth, scaled, jnp.finfo(jnp.float32).min)
+            if top_p > 0.0:
+                # Nucleus sampling: keep tokens whose cumulative prob >= 1-top_p
+                sorted_logits = jnp.sort(scaled)[::-1]
+                cumprobs = jnp.cumsum(jax.nn.softmax(sorted_logits))
+                # Find cutoff: first position where cumprob > top_p
+                cutoff_idx = jnp.searchsorted(cumprobs, top_p)
+                cutoff_val = sorted_logits[cutoff_idx]
+                scaled = jnp.where(scaled >= cutoff_val, scaled, jnp.finfo(jnp.float32).min)
             next_tok = jax.random.categorical(subkey, scaled).astype(jnp.int32)
         return next_tok, rng_new
     return _get_next
@@ -296,6 +317,7 @@ def generate_completion(
     max_new_tokens: int = 256,
     temperature: float = 0.2,
     fixed_max_len: int | None = None,
+    enable_thinking: bool = False,
 ) -> str:
     """Generate a completion for `prompt` using greedy / temperature sampling.
 
@@ -316,11 +338,6 @@ def generate_completion(
     """
     from jax_gpt.models.qwen35.cache import init_cache
 
-    # Qwen3.5 is chat-tuned — wrap raw HumanEval prompt with chat template.
-    # enable_thinking=False: model responds directly with code, no <think> block.
-    # Thinking mode caused unpredictable behavior on HumanEval: thinking overflow
-    # (>4096 tokens without </think>), premature EOS inside thinking block, and
-    # wrong code after thinking. Direct mode is the standard for code benchmarks.
     rank = jax.process_index()
     chat = [{'role': 'user', 'content':
              'Complete the following Python function. '
@@ -328,7 +345,8 @@ def generate_completion(
              '(signature + body), no explanation:\n\n'
              + prompt}]
     formatted = tok.apply_chat_template(
-        chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        chat, tokenize=False, add_generation_prompt=True,
+        enable_thinking=enable_thinking)
     input_ids = tok(formatted, return_tensors='np').input_ids[0]
     T = len(input_ids)
     # One-time debug: print last 200 chars of formatted prompt to confirm template
@@ -362,13 +380,14 @@ def generate_completion(
     generated_ids: list[int] = []
     rng = jax.random.key(0)
 
-    # _get_next is passed in as a pre-compiled JIT to avoid recompilation
-    # on every call to generate_completion (defining @jax.jit inside a
-    # function creates a new JIT object per call → recompile each problem).
+    # Build presence mask: mark all prompt token IDs as seen.
+    presence_mask = jnp.zeros(config.vocab_size, dtype=jnp.float32)
+    for tid in input_ids:
+        presence_mask = presence_mask.at[int(tid)].set(1.0)
 
     for step in range(max_new_tokens):
         # All ranks must call the same JIT in lockstep (TP collective ops).
-        next_id_jax, rng = sample_fn(logits, rng)
+        next_id_jax, rng = sample_fn(logits, rng, presence_mask)
         next_id = int(next_id_jax)
 
         # All ranks print their first token to verify cross-rank agreement.
@@ -382,6 +401,7 @@ def generate_completion(
                       f"'{tok.decode([next_id])}'", flush=True)
             break
         generated_ids.append(next_id)
+        presence_mask = presence_mask.at[next_id].set(1.0)
 
         # Single-token decode step
         token_in = jnp.array([[next_id]], dtype=jnp.int32)  # (1, 1)
@@ -459,8 +479,10 @@ def main():
     parser.add_argument('--output-dir', default='/tmp/humaneval_out')
     parser.add_argument('--n-problems', type=int, default=164)
     parser.add_argument('--max-new-tokens', type=int, default=4096)
-    parser.add_argument('--temperature', type=float, default=0.6)  # HF recommended for thinking mode
-    parser.add_argument('--top-k', type=int, default=20)           # HF recommended for thinking mode
+    parser.add_argument('--temperature', type=float, default=0.7)   # HF recommended (non-thinking)
+    parser.add_argument('--top-k', type=int, default=20)           # HF recommended
+    parser.add_argument('--top-p', type=float, default=0.8)        # HF recommended nucleus sampling
+    parser.add_argument('--presence-penalty', type=float, default=1.5)  # HF recommended
     parser.add_argument('--sharding', default='B', choices=['A', 'B'])
     parser.add_argument('--tp', type=int, default=None,
                         help='Tensor-parallel degree (default: all local chips)')
@@ -475,6 +497,10 @@ def main():
     parser.add_argument('--random-weights', action='store_true',
                         help='Use random weights instead of loading from disk '
                              '(for pipeline smoke-testing)')
+    parser.add_argument('--enable-thinking', action='store_true',
+                        help='Enable thinking mode (<think>...</think> before answer). '
+                             'Recommended for coding with temp=0.6, top_p=0.95, '
+                             'presence_penalty=0.0, max_new_tokens=32768+')
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -561,7 +587,8 @@ def main():
                      '(signature + body), no explanation:\n\n'
                      + p['prompt']}]
             fmt = tok.apply_chat_template(
-                chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                chat, tokenize=False, add_generation_prompt=True,
+                enable_thinking=args.enable_thinking)
             return len(tok(fmt, return_tensors='np').input_ids[0])
         max_prompt_len = max(_fmt_len(p) for p in my_problems)
     else:
@@ -592,10 +619,14 @@ def main():
     print(f"  Decode JIT compile:  {time.perf_counter() - t_compile:.1f}s")
 
     # Build sampling JIT once — reused across all problems.
-    sample_fn = make_sample_fn(args.temperature, top_k=args.top_k)
+    sample_fn = make_sample_fn(args.temperature, top_k=args.top_k,
+                               top_p=args.top_p,
+                               presence_penalty=args.presence_penalty,
+                               vocab_size=cfg.vocab_size)
     # Warm up sampling JIT with dummy logits.
     _dummy_logits = jnp.zeros((1, 1, cfg.vocab_size), dtype=jnp.bfloat16)
-    _, _ = sample_fn(_dummy_logits, jax.random.key(0))
+    _dummy_pmask = jnp.zeros(cfg.vocab_size, dtype=jnp.float32)
+    _, _ = sample_fn(_dummy_logits, jax.random.key(0), _dummy_pmask)
     jax.effects_barrier()
     print(f"  Sample JIT compiled.")
 
@@ -608,22 +639,29 @@ def main():
     # ------------------------------------------------------------------
     _sanity_chat = [{'role': 'user', 'content': 'What is 2+2? Answer with just the number.'}]
     _sanity_fmt = tok.apply_chat_template(
-        _sanity_chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        _sanity_chat, tokenize=False, add_generation_prompt=True,
+        enable_thinking=args.enable_thinking)
     _sanity_ids = tok(_sanity_fmt, return_tensors='np').input_ids[0]
     _sanity_tokens = jnp.array(_sanity_ids[None], dtype=jnp.int32)
     _sanity_cache = init_cache(cfg, 1, fixed_max_len, dtype=jnp.bfloat16)
     _sanity_logits, _sanity_cache = fwd_fn(_sanity_tokens, _sanity_cache, False)
     _sanity_gen = []
     _sanity_rng = jax.random.key(1)
+    _sanity_pmask = jnp.zeros(cfg.vocab_size, dtype=jnp.float32)
+    # Mark prompt tokens in presence mask
+    for _tid in _sanity_ids:
+        _sanity_pmask = _sanity_pmask.at[int(_tid)].set(1.0)
     _sanity_stop = {tok.eos_token_id,
                     tok.convert_tokens_to_ids('<|endoftext|>'),
                     tok.convert_tokens_to_ids('<|im_end|>')} - {None}
-    for _step in range(20):
-        _next, _sanity_rng = sample_fn(_sanity_logits, _sanity_rng)
+    _sanity_max = 200 if args.enable_thinking else 20
+    for _step in range(_sanity_max):
+        _next, _sanity_rng = sample_fn(_sanity_logits, _sanity_rng, _sanity_pmask)
         _nid = int(_next)
         if _nid in _sanity_stop:
             break
         _sanity_gen.append(_nid)
+        _sanity_pmask = _sanity_pmask.at[_nid].set(1.0)
         _sanity_logits, _sanity_cache = fwd_fn(
             jnp.array([[_nid]], dtype=jnp.int32), _sanity_cache, True)
     if rank == 0:
@@ -650,6 +688,7 @@ def main():
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             fixed_max_len=fixed_max_len,
+            enable_thinking=args.enable_thinking,
         )
         elapsed = time.perf_counter() - t_start
         passed = evaluate_completion(problem, completion)
