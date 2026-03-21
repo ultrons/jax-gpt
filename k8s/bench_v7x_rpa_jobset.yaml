@@ -1,0 +1,74 @@
+# RPA v3 decode benchmark JobSet for Qwen3.5-397B on v7x-64 (2×4×4).
+#
+# Identical to bench_v7x_jobset.yaml but with --use-rpa flag enabled.
+# Compares RPA (paged KV cache) vs contiguous KV cache decode performance.
+#
+# Deploy:
+#   kubectl apply -f k8s/bench_v7x_rpa_jobset.yaml
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-bench-v7x-rpa --prefix=true -f
+#
+# Cleanup:
+#   kubectl delete jobset qwen35-bench-v7x-rpa
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-bench-v7x-rpa
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 2
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-bench-v7x-rpa
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v49
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/qwen35_benchmark.py"]
+                  args:
+                    - "--config=full"
+                    - "--dtype=fp8"
+                    - "--sharding=B"
+                    - "--batch-size=128"
+                    - "--prompt-len=1024"
+                    - "--decode-steps=1024"
+                    - "--dp=8"
+                    - "--n-layers=60"
+                    - "--n-runs=3"
+                    - "--profile"
+                    - "--use-rpa"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://max-experiments/jax-cc/qwen35-bench-v7x-v49-rpa"
+                    - name: PROFILE_DIR
+                      value: "gs://max-experiments/qwen-profiles/v7x-rpa"
+                    - name: LIBTPU_INIT_ARGS
+                      value: "--xla_tpu_offload_gather_to_sparsecore=true --xla_tpu_enable_offloading_scatter_to_sparsecore=true --xla_tpu_enable_offloading_sort_to_sparsecore=true"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

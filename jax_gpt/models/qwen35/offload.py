@@ -27,7 +27,7 @@ import jax.numpy as jnp
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from jax_gpt.models.qwen35.block import group_forward
+from jax_gpt.models.qwen35.block import group_forward, HAS_RPA
 from jax_gpt.models.qwen35.cache import HybridCache, init_cache
 from jax_gpt.models.qwen35.config import Qwen35Config
 from jax_gpt.models.qwen35.primitives import precompute_rope_freqs, rms_norm
@@ -38,6 +38,15 @@ from jax_gpt.models.qwen35.sharding import (
     _param_logical_axes,
     _resolve_spec,
 )
+
+if HAS_RPA:
+    from jax_gpt.models.qwen35.block import group_forward_rpa
+    from jax_gpt.models.qwen35.paged_cache import (
+        PagedGQACache,
+        contiguous_to_paged,
+        make_decode_metadata,
+    )
+    from tpu_inference.kernels.ragged_paged_attention.v3.util import cdiv
 
 # HF uses this prefix for the language model weights in the multimodal checkpoint.
 # (weight_loader.py incorrectly uses 'model.layers.X' — only works for mini test models.)
@@ -218,8 +227,14 @@ def _shard_group(g_params: dict, mesh: Mesh, cfg: Qwen35Config,
 
 _jit_group_forward = jax.jit(
     group_forward,
-    static_argnames=('config', 'is_decode', 'n_devices', 'axis_name'),
+    static_argnames=('config', 'is_decode', 'n_devices', 'axis_name', 'mesh'),
 )
+
+if HAS_RPA:
+    _jit_group_forward_rpa = jax.jit(
+        group_forward_rpa,
+        static_argnames=('config', 'n_devices', 'axis_name', 'mesh'),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +250,8 @@ def forward_offload(
     cache: HybridCache | None = None,
     is_decode: bool = False,
     verbose: bool = True,
+    use_rpa: bool = False,
+    paged_cache: PagedGQACache | None = None,
 ) -> tuple[jax.Array, HybridCache]:
     """Full Qwen3.5 forward pass with one-group-at-a-time weight offloading.
 
@@ -248,11 +265,14 @@ def forward_offload(
     cache:      HybridCache for incremental decode, or None for prefill.
     is_decode:  True for single-token decode mode.
     verbose:    Print group progress.
+    use_rpa:    Use RPA v3 kernel for GQA decode (requires tpu-inference).
+    paged_cache: PagedGQACache for RPA decode, or None (will be created from
+                 contiguous cache on first use).
 
     Returns
     -------
     logits:    (B, T, vocab_size)
-    new_cache: Updated HybridCache.
+    new_cache: Updated HybridCache (or tuple with PagedGQACache when use_rpa=True).
     """
     if axis_rules is None:
         axis_rules = AXIS_RULES_B
@@ -314,12 +334,39 @@ def forward_offload(
                                      T, config.gqa_head_dim))
 
     # ------------------------------------------------------------------
+    # RPA setup: convert contiguous cache to paged on first decode
+    # ------------------------------------------------------------------
+    _use_rpa = use_rpa and is_decode and HAS_RPA
+    if _use_rpa and paged_cache is None and cache is not None:
+        # First decode step with RPA: convert contiguous GQA KV to paged
+        page_size = 64
+        paged_kv_list = contiguous_to_paged(
+            all_gqa_ks, all_gqa_vs,
+            prefill_len=int(cache_pos),
+            page_size=page_size,
+        )
+        pages_per_seq = cdiv(all_gqa_ks.shape[3], page_size)
+        paged_cache = PagedGQACache(
+            kv_pages=paged_kv_list,
+            kv_lens=jnp.full((B,), int(cache_pos), dtype=jnp.int32),
+            page_indices=jnp.arange(B * pages_per_seq, dtype=jnp.int32),
+            page_size=page_size,
+            pages_per_seq=pages_per_seq,
+        )
+
+    # ------------------------------------------------------------------
     # Group loop — load, shard, forward, discard
     # ------------------------------------------------------------------
     new_delta_Ms:   list[jax.Array] = []
     new_delta_convs: list[jax.Array] = []
     new_gqa_ks:     list[jax.Array] = []
     new_gqa_vs:     list[jax.Array] = []
+    new_paged_caches: list[jax.Array] = []
+
+    if _use_rpa:
+        cu_q_lens, distribution = make_decode_metadata(
+            B, paged_cache.kv_lens, paged_cache.pages_per_seq,
+        )
 
     for g in range(n_groups):
         if verbose:
@@ -334,16 +381,31 @@ def forward_offload(
         # Slice cache for this group
         g_dM   = all_delta_Ms[g]
         g_dC   = all_delta_convs[g]
-        g_gk   = all_gqa_ks[g]
-        g_gv   = all_gqa_vs[g]
 
         with mesh:
-            x, new_dM, new_dC, new_gk, new_gv = _jit_group_forward(
-                x, g_params,
-                g_dM, g_dC, g_gk, g_gv,
-                cache_pos, config, rope_freqs, is_decode,
-                n_devices=n_devices, mesh=mesh,
-            )
+            if _use_rpa:
+                x, new_dM, new_dC, updated_kv = _jit_group_forward_rpa(
+                    x, g_params,
+                    g_dM, g_dC,
+                    paged_cache.kv_pages[g],
+                    paged_cache.kv_lens,
+                    paged_cache.page_indices,
+                    cu_q_lens, distribution,
+                    cache_pos, config, rope_freqs,
+                    n_devices=n_devices, mesh=mesh,
+                )
+                new_paged_caches.append(updated_kv)
+            else:
+                g_gk = all_gqa_ks[g]
+                g_gv = all_gqa_vs[g]
+                x, new_dM, new_dC, new_gk, new_gv = _jit_group_forward(
+                    x, g_params,
+                    g_dM, g_dC, g_gk, g_gv,
+                    cache_pos, config, rope_freqs, is_decode,
+                    n_devices=n_devices, mesh=mesh,
+                )
+                new_gqa_ks.append(new_gk)
+                new_gqa_vs.append(new_gv)
 
         # Ensure XLA has committed the computation before we free params
         jax.effects_barrier()
@@ -354,8 +416,6 @@ def forward_offload(
 
         new_delta_Ms.append(new_dM)
         new_delta_convs.append(new_dC)
-        new_gqa_ks.append(new_gk)
-        new_gqa_vs.append(new_gv)
 
     if verbose:
         print()  # newline after progress
@@ -373,11 +433,29 @@ def forward_offload(
         (0 if cache_pos is None else int(cache_pos)) + T,
         dtype=jnp.int32,
     )
-    new_cache = HybridCache(
-        delta_M=jnp.stack(new_delta_Ms, axis=0),
-        delta_conv=jnp.stack(new_delta_convs, axis=0),
-        gqa_k=jnp.stack(new_gqa_ks, axis=0),
-        gqa_v=jnp.stack(new_gqa_vs, axis=0),
-        pos=new_pos,
-    )
-    return logits, new_cache
+
+    if _use_rpa:
+        new_cache = HybridCache(
+            delta_M=jnp.stack(new_delta_Ms, axis=0),
+            delta_conv=jnp.stack(new_delta_convs, axis=0),
+            gqa_k=cache.gqa_k,  # keep contiguous cache unchanged (paged is authoritative)
+            gqa_v=cache.gqa_v,
+            pos=new_pos,
+        )
+        new_paged = PagedGQACache(
+            kv_pages=new_paged_caches,
+            kv_lens=paged_cache.kv_lens + 1,
+            page_indices=paged_cache.page_indices,
+            page_size=paged_cache.page_size,
+            pages_per_seq=paged_cache.pages_per_seq,
+        )
+        return logits, new_cache, new_paged
+    else:
+        new_cache = HybridCache(
+            delta_M=jnp.stack(new_delta_Ms, axis=0),
+            delta_conv=jnp.stack(new_delta_convs, axis=0),
+            gqa_k=jnp.stack(new_gqa_ks, axis=0),
+            gqa_v=jnp.stack(new_gqa_vs, axis=0),
+            pos=new_pos,
+        )
+        return logits, new_cache

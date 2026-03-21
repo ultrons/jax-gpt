@@ -1,0 +1,73 @@
+# RPA decode debug: 4-layer (1 group) on v7x-64 — minimal flags.
+#
+# Purpose: Test if RPA decode actually works on v7x with shard_map + scan.
+# No XLA dump flags — just the baseline sparsecore offload flags.
+#
+# Deploy:
+#   kubectl apply -f k8s/bench_v7x_rpa_debug_jobset.yaml
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-rpa-debug --prefix=true -f
+#
+# Cleanup:
+#   kubectl delete jobset qwen35-rpa-debug
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-rpa-debug
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 2
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-rpa-debug
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v54
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/qwen35_benchmark.py"]
+                  args:
+                    - "--config=full"
+                    - "--dtype=fp8"
+                    - "--sharding=B"
+                    - "--batch-size=128"
+                    - "--prompt-len=1024"
+                    - "--decode-steps=32"
+                    - "--dp=8"
+                    - "--n-layers=4"
+                    - "--n-runs=1"
+                    - "--use-rpa"
+                    - "--skip-prefill"
+                    - "--profile"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: PROFILE_DIR
+                      value: "gs://max-experiments/profiles/qwen35-rpa-debug-v51"
+                    - name: LIBTPU_INIT_ARGS
+                      value: "--xla_tpu_offload_gather_to_sparsecore=true --xla_tpu_enable_offloading_scatter_to_sparsecore=true --xla_tpu_enable_offloading_sort_to_sparsecore=true"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

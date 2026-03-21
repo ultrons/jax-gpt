@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
+from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8, FP8_DTYPE, dynamic_quantize_fp8
 
 
 def _get_n_experts(gate_weight) -> int:
@@ -32,6 +32,35 @@ def _get_expert_weight(w, dtype=None):
         w_f = jnp.transpose(w_f, axes)
         return w_f.astype(dtype) if dtype is not None else w_f
     return w
+
+
+def _is_fp8_weight(w) -> bool:
+    """Check if weight is an fp8 quantized dict."""
+    return isinstance(w, dict) and 'w' in w and w['w'].dtype == FP8_DTYPE
+
+
+def _fp8_expert_components(w):
+    """Extract fp8 weight in ragged_dot layout (E, K, N) + per-output scale.
+
+    Stored: (E, N, K) fp8 + (E, N, 1) scale_inv.
+    Returns: (E, K, N) fp8, (E, N) scale_inv.
+    """
+    w_fp8 = jnp.transpose(w['w'], (0, 2, 1))
+    scale = w['scale_inv'].squeeze(-1)
+    return w_fp8, scale
+
+
+def _fp8_ragged_dot_rescaled(x_fp8, x_scale, w_fp8, group_sizes, w_scale,
+                              n_tokens):
+    """Native fp8 ragged_dot with activation + weight rescaling."""
+    out = jax.lax.ragged_dot(
+        x_fp8, w_fp8, group_sizes,
+        preferred_element_type=jnp.float32,
+    )
+    out = out * x_scale
+    w_scale_per_token = jnp.repeat(
+        w_scale, group_sizes, axis=0, total_repeat_length=n_tokens)
+    return out * w_scale_per_token
 
 
 def moe_routing(
@@ -80,8 +109,24 @@ def _sort_and_group(
     return x_sorted, group_sizes, sorted_weights, sorted_token_ids
 
 
-def _expert_swiglu(x_sorted, group_sizes, gate_w, up_w, down_w):
-    """SwiGLU expert computation via ragged_dot."""
+def _expert_swiglu(x_sorted, group_sizes, gate_w, up_w, down_w,
+                    gate_scale=None, up_scale=None, down_scale=None):
+    """SwiGLU expert computation via ragged_dot.
+
+    When weights are fp8 and scales are provided, uses native fp8 hardware.
+    """
+    if gate_w.dtype == FP8_DTYPE:
+        n = x_sorted.shape[0]
+        x_fp8, x_scale = dynamic_quantize_fp8(x_sorted)
+        gate_out = jax.nn.silu(
+            _fp8_ragged_dot_rescaled(
+                x_fp8, x_scale, gate_w, group_sizes, gate_scale, n))
+        up_out = _fp8_ragged_dot_rescaled(
+            x_fp8, x_scale, up_w, group_sizes, up_scale, n)
+        intermediate = gate_out * up_out
+        int_fp8, int_scale = dynamic_quantize_fp8(intermediate)
+        return _fp8_ragged_dot_rescaled(
+            int_fp8, int_scale, down_w, group_sizes, down_scale, n)
     gate_out = jax.nn.silu(jax.lax.ragged_dot(x_sorted, gate_w, group_sizes))
     up_out = jax.lax.ragged_dot(x_sorted, up_w, group_sizes)
     return jax.lax.ragged_dot(gate_out * up_out, down_w, group_sizes)
@@ -101,11 +146,25 @@ def expert_forward_single(
     gate_proj, up_proj, down_proj,
 ) -> jax.Array:
     """Single-device expert computation. No collectives."""
+    M, D = x.shape
+
+    if _is_fp8_weight(gate_proj):
+        gate_fp8, gate_s = _fp8_expert_components(gate_proj)
+        up_fp8, up_s = _fp8_expert_components(up_proj)
+        down_fp8, down_s = _fp8_expert_components(down_proj)
+        n_experts = gate_fp8.shape[0]
+        x_sorted, group_sizes, sorted_weights, sorted_token_ids = (
+            _sort_and_group(x, expert_indices, expert_weights, n_experts))
+        expert_out = _expert_swiglu(
+            x_sorted, group_sizes,
+            gate_fp8, up_fp8, down_fp8, gate_s, up_s, down_s)
+        return _scatter_back(
+            expert_out, sorted_weights, sorted_token_ids, M, D, x.dtype)
+
     gate_w = _get_expert_weight(gate_proj, x.dtype)
     up_w = _get_expert_weight(up_proj, x.dtype)
     down_w = _get_expert_weight(down_proj, x.dtype)
     n_experts = gate_w.shape[0]
-    M, D = x.shape
 
     x_sorted, group_sizes, sorted_weights, sorted_token_ids = _sort_and_group(
         x, expert_indices, expert_weights, n_experts,
@@ -124,11 +183,15 @@ def expert_forward_ep(
 ) -> jax.Array:
     """Expert-parallel MoE using shard_map.
 
-    Following the MaxText/Megablox pattern from Robert Dyro's presentation:
-    - shard_map gives each device explicit control via axis_index
-    - Each device slices group_sizes to its local experts
-    - Local ragged_dot on local expert weights (no all-gather)
-    - psum to reduce across EP devices
+    Memory-efficient implementation following MaxText/Megablox pattern:
+    - x (M, D) is passed replicated into shard_map — only ~1 GB all-gather
+      instead of the old approach which all-gathered the expanded (M*k, D)
+    - Sort, gather, and ragged_dot happen INSIDE shard_map per device
+    - Each device processes all tokens against its local expert shard
+    - psum combines results across EP devices
+
+    Memory per device: O(M * k * D) where M = B_local * T.
+    Old approach was O(M * k * TP * D) due to all-gather of expanded tensor.
 
     Args:
         x: (M, D) tokens.
@@ -143,83 +206,77 @@ def expert_forward_ep(
     gate_w = _get_expert_weight(gate_proj, x.dtype)
     up_w = _get_expert_weight(up_proj, x.dtype)
     down_w = _get_expert_weight(down_proj, x.dtype)
-    E_local = gate_w.shape[0]
     M, D = x.shape
     k = expert_indices.shape[1]
-    n_devices = mesh.shape[axis_name]
-    E_total = E_local * n_devices
 
-    # Compute group_sizes for ALL experts (on each device, same result)
-    flat_expert_ids = expert_indices.reshape(-1)  # (M*k,)
-    group_sizes_all = jnp.zeros(E_total, dtype=jnp.int32)
-    group_sizes_all = group_sizes_all.at[flat_expert_ids].add(1)
-
-    # Sort tokens by global expert id
-    flat_token_ids = jnp.repeat(jnp.arange(M), k)
-    flat_weights = expert_weights.reshape(-1)
-    sort_order = jnp.argsort(flat_expert_ids)
-    sorted_token_ids = flat_token_ids[sort_order]
-    sorted_weights = flat_weights[sort_order]
-    x_sorted = x[sorted_token_ids]  # (M*k, D) sorted by global expert
-
-    # The shard_map expert function: each device processes its local shard
-    # Precompute cumulative offsets for each device's expert range
-    # group_offsets[i] = sum of group_sizes for experts 0..i-1
-    group_offsets = jnp.concatenate([jnp.array([0]), jnp.cumsum(group_sizes_all)])
+    # Detect data-parallel axes: all non-trivial mesh axes except the EP axis.
+    # x is sharded along these axes (batch dim), and must stay sharded —
+    # using P() would force an all-gather of x across dp, blowing up memory.
+    dp_axes = tuple(name for name in mesh.axis_names
+                    if name != axis_name and mesh.shape[name] > 1)
+    if len(dp_axes) == 0:
+        act_pspec = P(None, None)          # no dp axis, x is replicated
+    elif len(dp_axes) == 1:
+        act_pspec = P(dp_axes[0], None)    # single dp axis (common case)
+    else:
+        act_pspec = P(dp_axes, None)       # multi-axis dp (dp + fsdp)
 
     @partial(shard_map, mesh=mesh,
-             in_specs=(P(), P(), P(), P(), P(axis_name, None, None),
-                       P(axis_name, None, None), P(axis_name, None, None), P()),
-             out_specs=P(),
+             in_specs=(act_pspec,                    # x: dp-sharded, tp-replicated
+                       act_pspec,                    # expert_indices: same as x
+                       act_pspec,                    # expert_weights: same as x
+                       P(axis_name, None, None),     # gate_w: E-sharded
+                       P(axis_name, None, None),     # up_w: E-sharded
+                       P(axis_name, None, None)),    # down_w: E-sharded
+             out_specs=act_pspec,
              check_rep=False)
-    def _expert_fn(x_sorted, sorted_weights, group_sizes_all, group_offsets,
-                   local_gate, local_up, local_down, sorted_token_ids):
-        # Which device am I?
+    def _expert_fn(x, indices, weights, local_gate, local_up, local_down):
         my_idx = jax.lax.axis_index(axis_name)
-
-        # E_local from the actual local weight shape (after shard_map splits)
         e_local = local_gate.shape[0]
+        m_local, d = x.shape  # per-dp-shard token count
 
-        # My local group sizes
-        group_sizes_local = jax.lax.dynamic_slice(
-            group_sizes_all, (my_idx * e_local,), (e_local,))
+        # Flatten (M_local, k) → (M_local*k,)
+        flat_idx = indices.reshape(-1)   # global expert ids
+        flat_w = weights.reshape(-1)
 
-        # Start offset in the sorted array for my experts.
-        # BUG FIX: dynamic_slice with slice_size=M*k on an array of size M*k
-        # clamps start_offset to 0 (since max(0, min(start, N-N))=0), causing
-        # ALL devices to read from position 0 instead of their assigned range.
-        # Fix: use jnp.roll to rotate the sorted arrays so that this device's
-        # tokens start at position 0.  The mask below zeros out wrapped-around
-        # positions beyond n_local_tokens.
-        start_offset = group_offsets[my_idx * e_local]
+        # Map to local expert range; non-local → e_local (sorts to end)
+        local_start = my_idx * e_local
+        valid = (flat_idx >= local_start) & (flat_idx < local_start + e_local)
+        mapped = jnp.where(valid, flat_idx - local_start, e_local)
 
-        x_local = jnp.roll(x_sorted, -start_offset, axis=0)
-        weights_local = jnp.roll(sorted_weights, -start_offset, axis=0)
-        token_ids_local = jnp.roll(sorted_token_ids, -start_offset, axis=0)
+        # Sort by mapped expert id — local expert tokens first
+        order = jnp.argsort(mapped)
 
-        # How many tokens are actually mine
-        n_local_tokens = jnp.sum(group_sizes_local)
+        # Gather sorted tokens (order // k gives original token index)
+        x_sorted = x[order // k]  # (M_local*k, D)
 
-        # Compute SwiGLU on local experts
-        local_out = _expert_swiglu(x_local, group_sizes_local,
-                                   local_gate, local_up, local_down)
+        # Group sizes for local experts via masked scatter-add
+        local_idx = jnp.where(valid, flat_idx - local_start, 0)
+        group_sizes = jnp.zeros(e_local, dtype=jnp.int32)
+        group_sizes = group_sizes.at[local_idx].add(valid.astype(jnp.int32))
 
-        # Mask out padding tokens (beyond my actual count)
-        mask = jnp.arange(M * k) < n_local_tokens
-        local_out = jnp.where(mask[:, None], local_out, 0.0)
-        weights_local = jnp.where(mask, weights_local, 0.0)
+        # SwiGLU via ragged_dot (processes first sum(group_sizes) rows)
+        gate_out = jax.nn.silu(
+            jax.lax.ragged_dot(x_sorted, local_gate, group_sizes))
+        up_out = jax.lax.ragged_dot(x_sorted, local_up, group_sizes)
+        expert_out = jax.lax.ragged_dot(
+            gate_out * up_out, local_down, group_sizes)
+
+        # Zero non-local positions and apply routing weights
+        sorted_valid = valid[order]
+        expert_out = jnp.where(sorted_valid[:, None], expert_out, 0.0)
+        expert_out = expert_out * flat_w[order][:, None]
 
         # Scatter weighted outputs back to token positions
-        weighted = local_out * weights_local[:, None]
-        output = jnp.zeros((M, D), dtype=x_sorted.dtype)
-        output = output.at[token_ids_local].add(weighted.astype(output.dtype))
+        output = jnp.zeros((m_local, d), dtype=x.dtype)
+        output = output.at[order // k].add(expert_out.astype(x.dtype))
 
-        # psum across all EP devices to combine expert contributions
+        # Sum across EP devices
         output = jax.lax.psum(output, axis_name)
         return output
 
-    return _expert_fn(x_sorted, sorted_weights, group_sizes_all, group_offsets,
-                      gate_w, up_w, down_w, sorted_token_ids)
+    return _expert_fn(x, expert_indices, expert_weights,
+                      gate_w, up_w, down_w)
 
 
 def shared_expert_forward(

@@ -116,7 +116,7 @@ def test_forward_matches_hf():
 
     # JAX forward (no cache)
     jax_logits, _ = forward(jax_params, jnp.array(input_ids), jax_cfg)
-    jax_logits_np = np.array(jax_logits)
+    jax_logits_np = np.array(jax_logits, dtype=np.float32)
 
     # Compare
     max_diff = np.max(np.abs(hf_logits - jax_logits_np))

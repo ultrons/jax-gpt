@@ -40,7 +40,10 @@ RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
 # Install project in editable mode
 RUN pip install -e /app
 
+# tpu-inference RPA v3 kernel and vllm logger shim are vendored in
+# third_party/ (already copied via COPY . /app above).
+
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app:/app/third_party
 
 ENTRYPOINT ["python"]
