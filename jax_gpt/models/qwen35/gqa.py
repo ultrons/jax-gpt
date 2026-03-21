@@ -95,31 +95,50 @@ def gqa_attention(
         k_full = k
         v_full = v
 
-    # Expand KV heads for GQA
-    if groups > 1:
-        k_full = jnp.repeat(k_full, groups, axis=1)
-        v_full = jnp.repeat(v_full, groups, axis=1)
-
     with jax.named_scope('sdpa'):
-        scale = head_dim ** -0.5
-        attn = jnp.matmul(q, jnp.swapaxes(k_full, -2, -1)) * scale
+        # Ensure Q, K, V share the same dtype (QK norm may promote Q/K to f32)
+        compute_dtype = q.dtype
+        k_full = k_full.astype(compute_dtype)
+        v_full = v_full.astype(compute_dtype)
 
-        # Causal mask
-        if cache_pos is not None:
+        # Transpose to (B, T, heads, head_dim) for jax.nn.dot_product_attention
+        q_btnh = jnp.transpose(q, (0, 2, 1, 3))       # (B, T, n_q_heads, head_dim)
+        k_bskh = jnp.transpose(k_full, (0, 2, 1, 3))  # (B, S, n_kv_heads, head_dim)
+        v_bskh = jnp.transpose(v_full, (0, 2, 1, 3))  # (B, S, n_kv_heads, head_dim)
+
+        if cache_pos is not None and T == 1:
+            # Decode (single token): attend to all filled cache positions
+            kv_len = cache_pos + 1
+            kv_seq_lengths = jnp.broadcast_to(kv_len, (B,))
+            out = jax.nn.dot_product_attention(
+                q_btnh, k_bskh, v_bskh,
+                is_causal=False,
+                key_value_seq_lengths=kv_seq_lengths,
+                implementation='xla',
+            )
+        elif cache_pos is not None:
+            # Prefill with cache: need causal mask + restrict to filled positions
+            # Build position-based causal mask: q_pos >= k_pos
             q_positions = cache_pos + jnp.arange(T)
-            k_positions = jnp.arange(attn.shape[-1])
-            mask = q_positions[:, None] >= k_positions[None, :]
+            S = k_bskh.shape[1]
+            k_positions = jnp.arange(S)
+            mask = q_positions[:, None] >= k_positions[None, :]  # (T, S)
+            # Expand for broadcast: (1, 1, T, S)
+            bias = jnp.where(mask[None, None, :, :], 0.0, jnp.finfo(q_btnh.dtype).min)
+            out = jax.nn.dot_product_attention(
+                q_btnh, k_bskh, v_bskh,
+                bias=bias,
+                implementation='xla',
+            )
         else:
-            mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-
-        attn = jnp.where(mask, attn, jnp.finfo(attn.dtype).min)
-        attn = jax.nn.softmax(attn, axis=-1)
-
-        # Attend
-        out = jnp.matmul(attn, v_full)  # (B, n_q_heads, T, head_dim)
-
-    # Transpose back
-    out = jnp.transpose(out, (0, 2, 1, 3)).reshape(B, T, n_q_heads * head_dim)
+            # Prefill (no cache): standard causal attention
+            out = jax.nn.dot_product_attention(
+                q_btnh, k_bskh, v_bskh,
+                is_causal=True,
+                implementation='xla',
+            )
+        # out: (B, T, n_q_heads, head_dim)
+        out = out.reshape(B, T, n_q_heads * head_dim)
 
     # Output gate (sigmoid)
     out = out * jax.nn.sigmoid(gate).astype(out.dtype)

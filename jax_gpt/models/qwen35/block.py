@@ -15,6 +15,12 @@ from jax_gpt.models.qwen35.gqa import gqa_attention
 from jax_gpt.models.qwen35.moe import moe_layer
 from jax_gpt.models.qwen35.primitives import rms_norm
 
+try:
+    from jax_gpt.models.qwen35.gqa_rpa import gqa_attention_rpa
+    HAS_RPA = True
+except ImportError:
+    HAS_RPA = False
+
 
 def deltanet_layer_forward(
     x: jax.Array,
@@ -96,6 +102,49 @@ def gqa_layer_forward(
     return x, new_k, new_v
 
 
+def gqa_layer_forward_rpa(
+    x: jax.Array,
+    params: dict,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    cache_pos: jax.Array,
+    config: Qwen35Config,
+    rope_freqs: jax.Array,
+    n_devices: int = 1, mesh=None,
+    axis_name: str = 'tp',
+) -> tuple[jax.Array, jax.Array]:
+    """Single GQA layer using RPA v3 kernel for decode."""
+
+    with jax.named_scope('gqa_attn_rpa'):
+        normed = rms_norm(x, params['attn_norm'], config.rms_norm_eps)
+        attn_out, updated_cache = gqa_attention_rpa(
+            normed, params['attn'],
+            config.gqa_n_q_heads, config.gqa_n_kv_heads, config.gqa_head_dim,
+            rope_freqs, config.gqa_rope_dim,
+            kv_cache=kv_cache,
+            kv_lens=kv_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            cache_pos=cache_pos,
+            mesh=mesh,
+            axis_name=axis_name,
+        )
+
+    x = x + attn_out
+
+    with jax.named_scope('gqa_moe'):
+        normed = rms_norm(x, params['moe_norm'], config.rms_norm_eps)
+        moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token,
+                            n_devices=n_devices, axis_name=axis_name, mesh=mesh)
+
+    x = x + moe_out
+    return x, updated_cache
+
+
 def group_forward(
     x: jax.Array,
     group_params: dict,
@@ -135,3 +184,50 @@ def group_forward(
         )
 
     return x, new_Ms, new_convs, new_gqa_k, new_gqa_v
+
+
+def group_forward_rpa(
+    x: jax.Array,
+    group_params: dict,
+    delta_Ms: jax.Array,
+    delta_convs: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    cache_pos: jax.Array,
+    config: Qwen35Config,
+    rope_freqs: jax.Array,
+    n_devices: int = 1, mesh=None,
+    axis_name: str = 'tp',
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Forward pass through one group using RPA for GQA decode.
+
+    Returns (x, new_Ms, new_convs, updated_kv_cache).
+    """
+
+    # Scan over DeltaNet layers (same as group_forward)
+    def _delta_step(carry, layer_inputs):
+        x_carry = carry
+        layer_params, M_i, conv_i = layer_inputs
+        x_carry, new_M, new_conv = deltanet_layer_forward(
+            x_carry, layer_params, M_i, conv_i, config, is_decode=True,
+            n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+        )
+        return x_carry, (new_M, new_conv)
+
+    delta_layer_params = group_params['delta_layers']
+    x, (new_Ms, new_convs) = jax.lax.scan(
+        _delta_step, x, (delta_layer_params, delta_Ms, delta_convs),
+    )
+
+    x, updated_cache = gqa_layer_forward_rpa(
+        x, group_params['gqa_layer'],
+        kv_cache, kv_lens, page_indices,
+        cu_q_lens, distribution, cache_pos,
+        config, rope_freqs,
+        n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+    )
+
+    return x, new_Ms, new_convs, updated_cache

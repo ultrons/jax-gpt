@@ -27,9 +27,15 @@ class HybridCache:
         delta_conv:  (n_groups, 3, B, d_model, conv_kernel)
             Causal conv1d state per DeltaNet layer.
 
-    GQA cache:
+    GQA cache (contiguous — used for prefill and non-RPA decode):
         gqa_k:       (n_groups, B, n_kv_heads, max_len, head_dim)
         gqa_v:       (n_groups, B, n_kv_heads, max_len, head_dim)
+
+    GQA cache (paged — used for RPA decode):
+        paged_kv:    (n_groups, total_pages, page_size, kv_packed_dim, packing, hd)
+            Stacked paged KV caches for all groups. None when not using RPA.
+        kv_lens:     i32[B] — current KV length per sequence. None when not using RPA.
+        page_indices: i32[B * pages_per_seq] — page lookup table. None when not using RPA.
 
     pos: scalar int — current sequence position.
     """
@@ -38,12 +44,16 @@ class HybridCache:
     gqa_k: jax.Array
     gqa_v: jax.Array
     pos: jax.Array  # scalar int32
+    paged_kv: jax.Array | None = None
+    kv_lens: jax.Array | None = None
+    page_indices: jax.Array | None = None
 
 
 # Register as pytree so lax.scan can carry it
 jax.tree_util.register_dataclass(
     HybridCache,
-    data_fields=['delta_M', 'delta_conv', 'gqa_k', 'gqa_v', 'pos'],
+    data_fields=['delta_M', 'delta_conv', 'gqa_k', 'gqa_v', 'pos',
+                 'paged_kv', 'kv_lens', 'page_indices'],
     meta_fields=[],
 )
 

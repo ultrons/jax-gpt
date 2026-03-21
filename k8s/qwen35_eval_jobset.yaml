@@ -122,7 +122,7 @@ spec:
               containers:
                 - name: eval
                   # EDIT: replace with your image
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v34
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v47
                   imagePullPolicy: Always
 
                   command: ["python", "scripts/eval_humaneval.py"]

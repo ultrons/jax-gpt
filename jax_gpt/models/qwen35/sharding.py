@@ -123,19 +123,26 @@ AXIS_RULES_B = {
 }
 
 
-def make_mesh(n_devices: int | None = None, axis_name: str = 'tp') -> Mesh:
-    """Create a 1D mesh over all available devices.
+def make_mesh(n_devices: int | None = None, axis_name: str = 'tp',
+              dp: int = 1) -> Mesh:
+    """Create a mesh over all available devices.
 
     Args:
         n_devices: number of devices (default: all available).
-        axis_name: mesh axis name.
+        axis_name: tensor-parallel axis name.
+        dp: data-parallel factor. When dp > 1, creates a 2D mesh
+            with shape (dp, n_devices // dp) and axes ('dp', axis_name).
 
     Returns:
-        Mesh with shape (n_devices,).
+        Mesh with shape (n_devices,) if dp=1, or (dp, tp) if dp>1.
     """
     devices = jax.devices()
     if n_devices is not None:
         devices = devices[:n_devices]
+    if dp > 1:
+        assert len(devices) % dp == 0, f"dp={dp} must divide n_devices={len(devices)}"
+        tp = len(devices) // dp
+        return Mesh(np.array(devices).reshape(dp, tp), ('dp', axis_name))
     return Mesh(np.array(devices), (axis_name,))
 
 
@@ -153,11 +160,22 @@ def _resolve_spec(
     1. Find the longest matching suffix in logical_axes → get logical spec
     2. Map each logical axis name through axis_rules → physical spec
     """
+    # Strip FP8 quantized param suffixes so that e.g.
+    # 'moe.gate_proj.w' matches logical key 'moe.gate_proj'.
+    match_path = path
+    is_fp8_w = False
+    for suffix in ('.w', '.scale_inv'):
+        if match_path.endswith(suffix):
+            if suffix == '.w':
+                is_fp8_w = True
+            match_path = match_path[:-len(suffix)]
+            break
+
     # Find best matching logical spec
     best_key = None
     best_len = -1
     for key in logical_axes:
-        if path.endswith(key) and len(key) > best_len:
+        if match_path.endswith(key) and len(key) > best_len:
             best_key = key
             best_len = len(key)
 
@@ -174,6 +192,14 @@ def _resolve_spec(
             physical.append(None)
         else:
             physical.append(axis_rules.get(axis))
+
+    # FP8 .w params are stored in (out, in) layout while logical specs
+    # assume (in, out).  Swap the last two axes so sharding targets the
+    # correct dimension.  Only applies to 2-axis specs (linear weights);
+    # expert weights have E as dim-0 which stays unchanged.
+    if is_fp8_w and len(physical) >= 2:
+        physical[-1], physical[-2] = physical[-2], physical[-1]
+
     return P(*physical)
 
 
@@ -256,6 +282,50 @@ def shard_params(
     return jax.tree_util.tree_map_with_path(_shard_leaf, params)
 
 
+def make_param_shardings(
+    params_structure: dict,
+    mesh: Mesh,
+    config: Qwen35Config,
+    axis_rules: dict[str, str | None] | None = None,
+) -> dict:
+    """Build a pytree of NamedSharding matching `params_structure`.
+
+    Unlike `shard_params`, this does NOT call `jax.device_put`.
+    It returns a pure sharding tree suitable for `jax.jit(..., out_shardings=...)`.
+
+    Args:
+        params_structure: nested dict with the same tree structure as params.
+            Leaves can be real arrays or `jax.ShapeDtypeStruct`.
+        mesh: device mesh.
+        config: model config.
+        axis_rules: logical→physical mapping. Defaults to AXIS_RULES_B.
+    """
+    if axis_rules is None:
+        axis_rules = AXIS_RULES_B
+
+    logical_axes = _param_logical_axes(config)
+
+    def _make_sharding(path, leaf):
+        path_str = _flatten_path(path)
+        spec = _resolve_spec(path_str, logical_axes, axis_rules)
+        ndim = leaf.ndim if hasattr(leaf, 'ndim') else len(leaf.shape)
+        spec = _pad_spec_to_ndim(spec, ndim)
+        shape = leaf.shape
+        safe_axes = []
+        for i, axis in enumerate(spec):
+            if axis is not None:
+                axis_size = mesh.shape[axis]
+                if shape[i] % axis_size != 0:
+                    safe_axes.append(None)
+                else:
+                    safe_axes.append(axis)
+            else:
+                safe_axes.append(None)
+        return NamedSharding(mesh, P(*safe_axes))
+
+    return jax.tree_util.tree_map_with_path(_make_sharding, params_structure)
+
+
 def _safe_spec(spec: P, shape: tuple, mesh: Mesh) -> P:
     """Replace sharding axes that don't evenly divide the dim with None."""
     safe = []
@@ -284,16 +354,17 @@ def shard_cache(
 
     tp_axis = axis_rules.get('delta_v_heads')
     gqa_kv_axis = axis_rules.get('gqa_kv_heads')
+    dp_axis = 'dp' if 'dp' in mesh.axis_names else None
 
     # delta_M: (n_groups, 3, B, n_v_heads, qk_head_dim, v_head_dim)
     delta_M_spec = _safe_spec(
-        P(None, None, None, tp_axis, None, None), cache.delta_M.shape, mesh)
+        P(None, None, dp_axis, tp_axis, None, None), cache.delta_M.shape, mesh)
     # delta_conv: (n_groups, 3, B, conv_dim, kernel)
     delta_conv_spec = _safe_spec(
-        P(None, None, None, tp_axis, None), cache.delta_conv.shape, mesh)
+        P(None, None, dp_axis, tp_axis, None), cache.delta_conv.shape, mesh)
     # gqa_k/v: (n_groups, B, n_kv_heads, max_len, head_dim)
     gqa_spec = _safe_spec(
-        P(None, None, gqa_kv_axis, None, None), cache.gqa_k.shape, mesh)
+        P(None, dp_axis, gqa_kv_axis, None, None), cache.gqa_k.shape, mesh)
     # pos: scalar
     pos_spec = P()
 
@@ -310,6 +381,7 @@ def make_cache_sharding(
     config: Qwen35Config,
     mesh: Mesh,
     axis_rules: dict[str, str | None] | None = None,
+    batch_size: int = 128,
 ) -> dict:
     """Build cache_sharding dict for forward() sharding constraints.
 
@@ -317,39 +389,50 @@ def make_cache_sharding(
     leading n_groups axis, since they're used inside the lax.scan body).
 
     Dims that aren't divisible by the mesh axis are set to None (replicated).
+
+    Args:
+        batch_size: actual batch size, used for divisibility checks on the
+            batch dimension (dp axis). Must be divisible by dp.
     """
     if axis_rules is None:
         axis_rules = AXIS_RULES_B
 
     tp_axis = axis_rules.get('delta_v_heads')
     gqa_kv_axis = axis_rules.get('gqa_kv_heads')
+    dp_axis = 'dp' if 'dp' in mesh.axis_names else None
 
     # Per-group shapes (no leading n_groups dim — inside scan body):
     # delta_M: (3, B, n_v_heads, qk_head_dim, v_head_dim)
-    delta_M_spec = P(None, None, tp_axis, None, None)
+    delta_M_spec = P(None, dp_axis, tp_axis, None, None)
     # delta_conv: (3, B, conv_dim, kernel)
-    delta_conv_spec = P(None, None, tp_axis, None)
+    delta_conv_spec = P(None, dp_axis, tp_axis, None)
     # gqa_k/v: (B, n_kv_heads, max_len, head_dim)
-    gqa_spec = P(None, gqa_kv_axis, None, None)
+    gqa_spec = P(dp_axis, gqa_kv_axis, None, None)
 
-    # Safe-check divisibility
+    # Safe-check divisibility — use actual batch_size (not placeholder B=1)
+    # so that dp_axis isn't incorrectly dropped when B=1 % dp != 0.
     n_delta = config.full_attention_interval - 1
-    delta_M_shape = (n_delta, 1, config.delta_n_v_heads, config.delta_qk_head_dim, config.delta_v_head_dim)
+    delta_M_shape = (n_delta, batch_size, config.delta_n_v_heads, config.delta_qk_head_dim, config.delta_v_head_dim)
     delta_M_spec = _safe_spec(delta_M_spec, delta_M_shape, mesh)
 
     key_dim = config.delta_n_qk_heads * config.delta_qk_head_dim
     value_dim = config.delta_n_v_heads * config.delta_v_head_dim
     conv_dim = key_dim * 2 + value_dim
-    delta_conv_shape = (n_delta, 1, conv_dim, config.delta_conv_kernel)
+    delta_conv_shape = (n_delta, batch_size, conv_dim, config.delta_conv_kernel)
     delta_conv_spec = _safe_spec(delta_conv_spec, delta_conv_shape, mesh)
 
-    gqa_shape = (1, config.gqa_n_kv_heads, 1, config.gqa_head_dim)
+    gqa_shape = (batch_size, config.gqa_n_kv_heads, 1, config.gqa_head_dim)
     gqa_spec = _safe_spec(gqa_spec, gqa_shape, mesh)
+
+    # paged_kv per-group: (total_pages, page_size, kv_dim, pk, head_dim)
+    # Shard total_pages on dp (pages are laid out contiguously per sequence).
+    paged_kv_spec = P(dp_axis, None, None, None, None)
 
     return {
         'delta_M': delta_M_spec,
         'delta_conv': delta_conv_spec,
         'gqa_kv': gqa_spec,
+        'paged_kv': paged_kv_spec,
     }
 
 

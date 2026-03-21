@@ -1,0 +1,75 @@
+# Baseline benchmark JobSet for Qwen3.5-397B on v5p-128 (4×4×4).
+#
+# Cluster:   mlperf-rl-v5p-128 (cloud-tpu-multipod-dev, europe-west4)
+# Topology:  4×4×4 = 64 chips = 16 hosts × 4 chips (ct5p-hightpu-4t)
+# Sharding:  Config B (TP=64)
+# Weights:   Random (init_params) — no PV/PVC needed
+# Layers:    4 (1 group) — full model = 15 groups of identical layers,
+#            so multiply per-layer numbers by 15 for full-model estimate.
+#            This avoids CPU OOM during init (full 397B ~400 GB > host RAM).
+# Workload:  Prefill 8K + Decode 1K, B=8, FP8 (W8A8)
+#            Start with B=8 to validate, then scale up toward B=128.
+#
+# Deploy:
+#   kubectl apply -f k8s/bench_v5p128_jobset.yaml
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-bench-v5p128 --prefix=true -f
+#
+# Cleanup:
+#   kubectl delete jobset qwen35-bench-v5p128
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-bench-v5p128
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-bench-v5p128
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+                cloud.google.com/gke-tpu-topology: 4x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v35
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/qwen35_benchmark.py"]
+                  args:
+                    - "--config=full"
+                    - "--dtype=fp8"
+                    - "--sharding=B"
+                    - "--batch-size=4"
+                    - "--prompt-len=8192"
+                    - "--decode-steps=1024"
+                    - "--dp=2"
+                    - "--n-layers=4"
+                    - "--n-runs=3"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://max-experiments/jax-cc/qwen35-bench"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

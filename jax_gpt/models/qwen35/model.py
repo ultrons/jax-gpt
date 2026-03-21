@@ -12,10 +12,19 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
-from jax_gpt.models.qwen35.block import group_forward
+from jax_gpt.models.qwen35.block import group_forward, HAS_RPA
 from jax_gpt.models.qwen35.cache import HybridCache, init_cache
 from jax_gpt.models.qwen35.config import Qwen35Config
 from jax_gpt.models.qwen35.primitives import precompute_rope_freqs, rms_norm
+
+if HAS_RPA:
+    from jax_gpt.models.qwen35.block import group_forward_rpa
+    from jax_gpt.models.qwen35.paged_cache import make_decode_metadata
+
+    _jit_group_forward_rpa = jax.jit(
+        group_forward_rpa,
+        static_argnames=('config', 'n_devices', 'axis_name', 'mesh'),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +223,8 @@ def forward(
     n_devices: int = 1,
     axis_name: str = 'tp',
     mesh=None,
+    last_logit_only: bool = False,
+    use_rpa: bool = False,
 ) -> tuple[jax.Array, HybridCache | None]:
     """Full model forward pass.
 
@@ -258,31 +269,94 @@ def forward(
         gqa_ks = None
         gqa_vs = None
 
-    # Scan over groups
-    def _group_step(carry, group_inputs):
-        x_carry = carry
-        g_params, g_delta_M, g_delta_conv, g_gqa_k, g_gqa_v = group_inputs
+    # Determine whether to use RPA path
+    _use_rpa = use_rpa and is_decode and HAS_RPA and cache is not None
 
-        x_carry, new_dM, new_dC, new_gk, new_gv = group_forward(
-            x_carry, g_params,
-            g_delta_M, g_delta_conv,
-            g_gqa_k, g_gqa_v,
-            cache_pos, config, rope_freqs, is_decode,
-            n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+    if _use_rpa:
+        # ----- RPA scan: paged KV cache -----
+        paged_kv = cache.paged_kv       # (n_groups, total_pages, ps, kv_dim, pk, hd)
+        kv_lens = cache.kv_lens          # (B,)
+        page_indices = cache.page_indices  # (B * pages_per_seq,)
+        # Infer pages_per_seq from shape: total_pages_per_group / B
+        pages_per_seq = paged_kv.shape[1] // B
+
+        # With dp sharding, shard_map splits batch across dp devices.
+        # Compute dp-local metadata: each shard processes B_local sequences
+        # with local page indices [0, B_local*pps).
+        if mesh is not None and 'dp' in mesh.axis_names:
+            dp = mesh.shape['dp']
+            B_local = B // dp
+        else:
+            B_local = B
+        cu_q_lens, distribution = make_decode_metadata(B_local, kv_lens, pages_per_seq)
+        # Local page indices: contiguous 0-based mapping for B_local sequences.
+        # Each dp shard's paged_kv is [0, B_local*pps) pages, so local indices
+        # are always arange(B_local * pages_per_seq) — replicated across shards.
+        page_indices_local = jnp.arange(B_local * pages_per_seq, dtype=jnp.int32)
+
+        def _group_step_rpa(carry, group_inputs):
+            x_carry = carry
+            g_params, g_delta_M, g_delta_conv, g_paged_kv = group_inputs
+
+            x_carry, new_dM, new_dC, updated_kv = group_forward_rpa(
+                x_carry, g_params,
+                g_delta_M, g_delta_conv,
+                g_paged_kv, kv_lens, page_indices_local,
+                cu_q_lens, distribution,
+                cache_pos, config, rope_freqs,
+                n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+            )
+
+            if cache_sharding is not None:
+                new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
+                new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
+                if 'paged_kv' in cache_sharding:
+                    updated_kv = jax.lax.with_sharding_constraint(updated_kv, cache_sharding['paged_kv'])
+
+            return x_carry, (new_dM, new_dC, updated_kv)
+
+        scan_inputs = (
+            params['groups'], delta_Ms, delta_convs, paged_kv,
+        )
+        x, (new_dMs, new_dConvs, new_paged_kv) = jax.lax.scan(
+            _group_step_rpa, x, scan_inputs,
+        )
+        new_cache = HybridCache(
+            delta_M=new_dMs,
+            delta_conv=new_dConvs,
+            gqa_k=cache.gqa_k,  # keep contiguous unchanged
+            gqa_v=cache.gqa_v,
+            pos=cache_pos + T,
+            paged_kv=new_paged_kv,
+            kv_lens=kv_lens + 1,
+            page_indices=page_indices,
         )
 
-        # Apply sharding constraints on cache outputs to prevent XLA
-        # from inferring incompatible sharding (e.g. n_kv_heads=2
-        # can't be split across TP=8).
-        if cache_sharding is not None:
-            new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
-            new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
-            new_gk = jax.lax.with_sharding_constraint(new_gk, cache_sharding['gqa_kv'])
-            new_gv = jax.lax.with_sharding_constraint(new_gv, cache_sharding['gqa_kv'])
+    elif cache is not None:
+        # ----- Standard scan: contiguous KV cache -----
+        def _group_step(carry, group_inputs):
+            x_carry = carry
+            g_params, g_delta_M, g_delta_conv, g_gqa_k, g_gqa_v = group_inputs
 
-        return x_carry, (new_dM, new_dC, new_gk, new_gv)
+            x_carry, new_dM, new_dC, new_gk, new_gv = group_forward(
+                x_carry, g_params,
+                g_delta_M, g_delta_conv,
+                g_gqa_k, g_gqa_v,
+                cache_pos, config, rope_freqs, is_decode,
+                n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+            )
 
-    if cache is not None:
+            # Apply sharding constraints on cache outputs to prevent XLA
+            # from inferring incompatible sharding (e.g. n_kv_heads=2
+            # can't be split across TP=8).
+            if cache_sharding is not None:
+                new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
+                new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
+                new_gk = jax.lax.with_sharding_constraint(new_gk, cache_sharding['gqa_kv'])
+                new_gv = jax.lax.with_sharding_constraint(new_gv, cache_sharding['gqa_kv'])
+
+            return x_carry, (new_dM, new_dC, new_gk, new_gv)
+
         scan_inputs = (
             params['groups'], delta_Ms, delta_convs, gqa_ks, gqa_vs,
         )
@@ -318,7 +392,9 @@ def forward(
 
     with jax.named_scope('output_head'):
         x = rms_norm(x, params['final_norm'], config.rms_norm_eps)
-        logits = matmul_maybe_fp8(x, params['lm_head'])  # (B, T, vocab_size)
+        if last_logit_only:
+            x = x[:, -1:, :]  # (B, 1, D) — only last position
+        logits = matmul_maybe_fp8(x, params['lm_head'])  # (B, T_or_1, vocab_size)
         # AllGather vocab-sharded logits to all TP devices so that sampling
         # (argmax or categorical) sees the full distribution on every rank.
         # Without this, logits are P(None, None, 'tp') and sampling in a
@@ -327,6 +403,125 @@ def forward(
             from jax.sharding import NamedSharding, PartitionSpec as P
             logits = jax.lax.with_sharding_constraint(
                 logits, NamedSharding(mesh, P(None, None, None)))
+
+    return logits, new_cache
+
+
+# ---------------------------------------------------------------------------
+# RPA decode (per-group JIT — avoids scan+Pallas OOM)
+# ---------------------------------------------------------------------------
+
+_jit_group_forward = jax.jit(
+    group_forward,
+    static_argnames=('config', 'is_decode', 'n_devices', 'axis_name', 'mesh'),
+)
+
+
+def forward_rpa_decode(
+    params: dict,
+    tokens: jax.Array,
+    config: Qwen35Config,
+    cache: HybridCache,
+    cache_sharding: dict | None = None,
+    n_devices: int = 1,
+    axis_name: str = 'tp',
+    mesh=None,
+    last_logit_only: bool = True,
+) -> tuple[jax.Array, HybridCache]:
+    """Decode forward pass using RPA, with per-group JIT to avoid OOM.
+
+    Unlike forward(..., use_rpa=True) which puts the RPA Pallas kernel inside
+    a jax.lax.scan (causing a multi-GB compiled program), this function uses
+    a Python for-loop over groups with separately JITted group_forward_rpa.
+    Each group reuses the same compiled program (~200 MB instead of ~4 GB).
+
+    Args:
+        params: nested dict pytree from init_params (all groups stacked).
+        tokens: (B, 1) int32 token ids (single decode step).
+        config: model config.
+        cache: HybridCache with paged_kv, kv_lens, page_indices populated.
+        cache_sharding: optional dict with PartitionSpecs for cache arrays.
+        n_devices: number of devices.
+        axis_name: TP axis name.
+        mesh: device mesh (required for shard_map in RPA kernel).
+        last_logit_only: if True, return logits for last position only.
+
+    Returns:
+        (logits, updated_cache)
+    """
+    B, T = tokens.shape
+    n_groups = config.n_groups
+
+    with jax.named_scope('embedding'):
+        x = params['embed'][tokens]
+
+    rope_freqs = precompute_rope_freqs(
+        config.gqa_rope_dim,
+        config.max_position_embeddings,
+        config.gqa_rope_theta,
+    )
+
+    cache_pos = cache.pos
+    paged_kv = cache.paged_kv        # (n_groups, total_pages, ps, kv_dim, pk, hd)
+    kv_lens = cache.kv_lens          # (B,)
+    page_indices = cache.page_indices  # (B * pages_per_seq,)
+
+    # Infer pages_per_seq
+    pages_per_seq = paged_kv.shape[1] // B
+    cu_q_lens, distribution = make_decode_metadata(B, kv_lens, pages_per_seq)
+
+    # Per-group loop — each call reuses the same compiled program.
+    # Update arrays in-place with .at[g].set() to avoid accumulating
+    # 15 per-group copies (which would OOM during the final jnp.stack).
+    result_delta_M = cache.delta_M
+    result_delta_conv = cache.delta_conv
+    result_paged_kv = paged_kv
+
+    ctx = mesh if mesh is not None else __import__('contextlib').nullcontext()
+
+    for g in range(n_groups):
+        # Extract this group's params (index leading axis of stacked tree)
+        g_params = jax.tree.map(lambda leaf: leaf[g], params['groups'])
+        g_dM = cache.delta_M[g]
+        g_dC = cache.delta_conv[g]
+        g_paged = paged_kv[g]
+
+        with ctx:
+            x, new_dM, new_dC, updated_kv = _jit_group_forward_rpa(
+                x, g_params,
+                g_dM, g_dC,
+                g_paged, kv_lens, page_indices,
+                cu_q_lens, distribution,
+                cache_pos, config, rope_freqs,
+                n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+            )
+
+        # Update in-place to avoid holding 15 copies simultaneously
+        result_delta_M = result_delta_M.at[g].set(new_dM)
+        result_delta_conv = result_delta_conv.at[g].set(new_dC)
+        result_paged_kv = result_paged_kv.at[g].set(updated_kv)
+        del new_dM, new_dC, updated_kv
+
+    with jax.named_scope('output_head'):
+        x = rms_norm(x, params['final_norm'], config.rms_norm_eps)
+        if last_logit_only:
+            x = x[:, -1:, :]
+        logits = matmul_maybe_fp8(x, params['lm_head'])
+        if mesh is not None:
+            from jax.sharding import NamedSharding, PartitionSpec as P
+            logits = jax.lax.with_sharding_constraint(
+                logits, NamedSharding(mesh, P(None, None, None)))
+
+    new_cache = HybridCache(
+        delta_M=result_delta_M,
+        delta_conv=result_delta_conv,
+        gqa_k=cache.gqa_k,
+        gqa_v=cache.gqa_v,
+        pos=cache_pos + T,
+        paged_kv=result_paged_kv,
+        kv_lens=kv_lens + 1,
+        page_indices=page_indices,
+    )
 
     return logits, new_cache
 
