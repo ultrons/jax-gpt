@@ -45,7 +45,7 @@ spec:
                 cloud.google.com/gke-tpu-topology: 2x4x4
               containers:
                 - name: bench
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v54
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v55
                   imagePullPolicy: Always
                   command: ["python", "scripts/qwen35_benchmark.py"]
                   args:
@@ -65,7 +65,7 @@ spec:
                     - name: PYTHONUNBUFFERED
                       value: "1"
                     - name: PROFILE_DIR
-                      value: "gs://max-experiments/profiles/qwen35-rpa-debug-v51"
+                      value: "gs://max-experiments/profiles/qwen35-rpa-debug-v55"
                     - name: LIBTPU_INIT_ARGS
                       value: "--xla_tpu_offload_gather_to_sparsecore=true --xla_tpu_enable_offloading_scatter_to_sparsecore=true --xla_tpu_enable_offloading_sort_to_sparsecore=true"
                   resources:

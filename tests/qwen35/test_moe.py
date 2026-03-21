@@ -11,6 +11,7 @@ from jax_gpt.models.qwen35.moe import (
     moe_routing,
     shared_expert_forward,
 )
+from jax_gpt.models.qwen35.quantize import quantize_params_fp8
 
 
 def _make_moe_params(cfg: Qwen35Config, key: jax.Array) -> dict:
@@ -107,3 +108,23 @@ def test_moe_nonzero_output():
     x = jax.random.normal(jax.random.key(15), (B, T, cfg.d_model))
     out = moe_layer(x, params, cfg.n_experts_per_token)
     assert jnp.any(out != 0)
+
+
+def test_moe_fp8_close_to_bf16():
+    """FP8 native ragged_dot should produce similar output to dequantized path."""
+    cfg = Qwen35Config.mini()
+    params = _make_moe_params(cfg, jax.random.key(20))
+    B, T = 2, 4
+
+    x = jax.random.normal(jax.random.key(21), (B, T, cfg.d_model))
+    out_bf16 = moe_layer(x, params, cfg.n_experts_per_token)
+
+    params_fp8 = quantize_params_fp8(params)
+    out_fp8 = moe_layer(x, params_fp8, cfg.n_experts_per_token)
+
+    assert out_fp8.shape == out_bf16.shape
+    assert not jnp.any(jnp.isnan(out_fp8))
+    # fp8 quantization introduces some error — allow ~10% relative tolerance
+    assert jnp.allclose(out_fp8, out_bf16, atol=0.5, rtol=0.15), (
+        f"max diff: {jnp.max(jnp.abs(out_fp8 - out_bf16)):.4f}"
+    )
