@@ -37,6 +37,7 @@ def align_to(x, a):
 class MetadataRef:
     gm_id_to_group_id: jax.Array
     gm_id_to_m_offset: jax.Array
+    rhs_group_offset: jax.Array   # int32[1] — offset added to group_id in rhs index maps
 
 
 @jax.tree_util.register_dataclass
@@ -59,9 +60,10 @@ class Dimensions:
     size_m: int
     size_k: int
     size_n: int
-    size_group: int
+    size_group: int        # routing group count (for fill_metadata loop / scratch sizing)
     size_lhs_group: int
     size_lhs_sublane: int
+    size_rhs_group: int = 0  # actual rhs dim-0 (may be > size_group for stacked weights)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,19 +112,24 @@ class IndexMaps:
 
         return (pl.ds(row_start, row_size), 0, k_id)
 
+    def _shifted_group_id(self, gm_id: jax.Array) -> jax.Array:
+        """Get group_id shifted by rhs_group_offset for stacked weight indexing."""
+        group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+        return group_id + self.metadata_ref.rhs_group_offset[0]
+
     def rhs_weight_index_map(self, n_id: jax.Array, gm_id: jax.Array,
                              k_id: jax.Array):
-        group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+        group_id = self._shifted_group_id(gm_id)
         return (group_id, k_id, n_id)
 
     def rhs_bias_index_map(self, n_id: jax.Array, gm_id: jax.Array,
                            _: jax.Array):
-        group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+        group_id = self._shifted_group_id(gm_id)
         return (group_id, 0, n_id)
 
     def rhs_scale_index_map(self, n_id: jax.Array, gm_id: jax.Array,
                             k_id: jax.Array):
-        group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+        group_id = self._shifted_group_id(gm_id)
         b_id = (k_id *
                 self.cfgs.tiles.tile_k) // self.cfgs.rhs_cfgs.quant_block_size
         b_tile_id = b_id // self.cfgs.num_quant_blocks_per_tile_k
@@ -607,9 +614,10 @@ def kernel_main(
     # Scalar prefetch
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
     group_offset_ref: jax.Array,  # int32[1]
+    rhs_group_offset_ref: jax.Array,  # int32[1] — offset for stacked weight indexing
     # In
     lhs_ref: jax.Array,  # [size_m, size_k]
-    rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
+    rhs_ref: WeightsRef,  # [size_rhs_group, size_k, size_n]
     # Out
     out_ref: jax.Array,  # [size_m, size_n]
     # Scratch memory
@@ -651,14 +659,18 @@ def kernel_main(
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.dims.size_n, cfgs.tiles.tile_n)
 
+    # Copy rhs_group_offset into metadata for use by DMA index maps.
+    metadata_ref.rhs_group_offset[0] = rhs_group_offset_ref[0]
+
     # Pack along K (2nd minor dim) so that pltpu.bitcast can unpack inside the
     # kernel.
     # [G, K, N] -> [G, K//packing, N] uint32
+    size_rhs_g = cfgs.dims.size_rhs_group or cfgs.dims.size_group
     if cfgs.rhs_cfgs.quant_dtype is not None:
         rhs_weight = rhs_ref.weight
         rhs_weight = rhs_weight.bitcast(jnp.uint32)
         assert rhs_weight.shape == (
-            cfgs.dims.size_group,
+            size_rhs_g,
             cfgs.dims.size_k // cfgs.rhs_cfgs.packing,
             cfgs.dims.size_n,
         )
@@ -791,17 +803,21 @@ def validate_inputs(
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
-    size_group, size_k, size_n = rhs.shape
+    size_rhs_group, size_k, size_n = rhs.shape
     size_lhs_group = group_sizes.shape[0]
 
-    assert size_group <= size_lhs_group
+    # size_rhs_group >= size_lhs_group when weights are stacked across layers
+    # (e.g. (45*E_local, K, N) for 45 layers of E_local experts each).
+    # size_group = routing group count, used for fill_metadata loop / scratch.
+    size_group = min(size_rhs_group, size_lhs_group)
+
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k, size_n)
+    assert rhs.shape == (size_rhs_group, size_k, size_n)
     if rhs_bias is not None:
-        assert rhs_bias.shape == (size_group, 1, size_n)
+        assert rhs_bias.shape == (size_rhs_group, 1, size_n)
     if rhs_scale is not None:
         num_quant_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n)
+        assert rhs_scale.shape == (size_rhs_group, num_quant_blocks, 1, size_n)
         assert size_k % num_quant_blocks == 0
 
     assert group_offset.shape == (1, )
@@ -816,6 +832,7 @@ def validate_inputs(
         size_group=size_group,
         size_lhs_group=size_lhs_group,
         size_lhs_sublane=size_lhs_sublane,
+        size_rhs_group=size_rhs_group,
     )
 
 
@@ -977,12 +994,13 @@ def get_metadata(cfgs: GmmConfigs):
 ])
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
-    rhs: jax.Array,  # [size_group, size_k, size_n]
+    rhs: jax.Array,  # [size_rhs_group, size_k, size_n]
     group_sizes: jax.Array,  # int32[size_lhs_group]
     rhs_scale: jax.Array
-    | None = None,  # [size_group, num_blocks, 1, out_size]
-    rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
+    | None = None,  # [size_rhs_group, num_blocks, 1, out_size]
+    rhs_bias: jax.Array | None = None,  # [size_rhs_group, 1, out_size]
     group_offset: jax.Array | None = None,  # int32[1]
+    rhs_group_offset: jax.Array | None = None,  # int32[1] — stacked weight offset
     *,
     tile_info: TileSizes | TileFn = calculate_tiling,
     vmem_limit_bytes: int | None = None,
@@ -1025,6 +1043,12 @@ def gmm_v2(
         if jnp.isscalar(group_offset):
             group_offset = group_offset[None]
 
+    if rhs_group_offset is None:
+        rhs_group_offset = jnp.array([0], dtype=jnp.int32)
+    else:
+        if jnp.isscalar(rhs_group_offset):
+            rhs_group_offset = rhs_group_offset[None]
+
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
@@ -1066,6 +1090,7 @@ def gmm_v2(
         MetadataRef(
             gm_id_to_group_id=pltpu.SMEM((max_num_gm, ), jnp.int32),
             gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1, ), jnp.int32),
+            rhs_group_offset=pltpu.SMEM((1, ), jnp.int32),
         ),
     ]
 
@@ -1103,7 +1128,7 @@ def gmm_v2(
         functools.partial(kernel_main, cfgs=cfgs),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=3,
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 WeightsRef(
@@ -1122,4 +1147,4 @@ def gmm_v2(
         name=get_scope_name(dims, tiles),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:, :dims.size_n]
+    )(group_sizes, group_offset, rhs_group_offset, lhs, rhs_weights)[:, :dims.size_n]

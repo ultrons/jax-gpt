@@ -341,24 +341,55 @@ def forward(
         # device time as XLA slice_bitcast_fusion retiling when sliced from
         # stacked (n_groups, n_delta, E, K, N) arrays.
         #
-        # Strategy: separate MoE from group params, reshape
-        # (15, 3, ...) → (45, ...) (merge group+layer dims only, NOT
-        # expert dim which is sharded), then dynamic_slice_in_dim +
-        # squeeze. This reduces double-slice to single-slice overhead.
-        # Non-MoE params use dynamic_index_in_dim (old approach).
+        # When moe_backend == 'gmm': pass stacked expert weights to
+        # gmm_v2 with rhs_group_offset. The Pallas kernel's DMA index map
+        # reads weights directly from the stacked array — no JAX-level
+        # squeeze at all. Only small MoE params (gate_weight, shared_*)
+        # are sliced per-layer.
+        #
+        # When moe_backend != 'gmm': use v69 approach — separate MoE,
+        # reshape to (45, ...), dynamic_slice_in_dim + squeeze.
         n_delta = config.full_attention_interval - 1
         n_groups = config.n_groups
 
+        _expert_keys = {'gate_proj', 'up_proj', 'down_proj'}
+        _use_gmm_stacking = moe_backend == 'gmm' and groups_list is None
+
+        stacked_delta_expert = None
+        stacked_gqa_expert = None
+
         if groups_list is None:
-            # Separate MoE weights from delta layers and GQA
             delta_moe_raw = params['groups']['delta_layers']['moe']
             gqa_moe_raw = params['groups']['gqa_layer']['moe']
-            # Reshape (n_groups, n_delta, ...) → (n_groups*n_delta, ...)
-            delta_moe_flat = jax.tree.map(
-                lambda a: a.reshape(n_groups * n_delta, *a.shape[2:]),
-                delta_moe_raw)
-            # Reshape (n_groups, ...) → (n_groups, ...)  (no change needed)
-            gqa_moe_flat = gqa_moe_raw
+
+            if _use_gmm_stacking:
+                # ── gmm stacking: keep expert weights 4D, slice only small params
+                delta_expert_raw = {k: v for k, v in delta_moe_raw.items()
+                                    if k in _expert_keys}
+                delta_small_raw = {k: v for k, v in delta_moe_raw.items()
+                                   if k not in _expert_keys}
+                gqa_expert_raw = {k: v for k, v in gqa_moe_raw.items()
+                                  if k in _expert_keys}
+                gqa_small_raw = {k: v for k, v in gqa_moe_raw.items()
+                                 if k not in _expert_keys}
+
+                # Stacked expert weights: (15, 3, E, K, N) → (45, E, K, N)
+                stacked_delta_expert = jax.tree.map(
+                    lambda a: a.reshape(n_groups * n_delta, *a.shape[2:]),
+                    delta_expert_raw)
+                stacked_gqa_expert = gqa_expert_raw  # (15, E, K, N) — already 4D
+
+                # Small params: (15, 3, ...) → (45, ...) for per-layer slicing
+                delta_moe_flat = jax.tree.map(
+                    lambda a: a.reshape(n_groups * n_delta, *a.shape[2:]),
+                    delta_small_raw)
+                gqa_moe_flat = gqa_small_raw
+            else:
+                # ── v69 approach: slice ALL MoE params
+                delta_moe_flat = jax.tree.map(
+                    lambda a: a.reshape(n_groups * n_delta, *a.shape[2:]),
+                    delta_moe_raw)
+                gqa_moe_flat = gqa_moe_raw
 
         if _use_rpa:
             result_delta_M = delta_Ms
@@ -388,6 +419,9 @@ def forward(
                     moe_backend=moe_backend,
                     delta_moe_list=g_delta_moe_list,
                     gqa_moe=g_gqa_moe,
+                    stacked_delta_expert_weights=stacked_delta_expert,
+                    stacked_gqa_expert_weights=stacked_gqa_expert,
+                    group_idx=g if _use_gmm_stacking else None,
                 )
                 if cache_sharding is not None:
                     new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
@@ -437,6 +471,9 @@ def forward(
                     moe_backend=moe_backend,
                     delta_moe_list=g_delta_moe_list,
                     gqa_moe=g_gqa_moe,
+                    stacked_delta_expert_weights=stacked_delta_expert,
+                    stacked_gqa_expert_weights=stacked_gqa_expert,
+                    group_idx=g if _use_gmm_stacking else None,
                 )
                 if cache_sharding is not None:
                     new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
@@ -488,6 +525,9 @@ def forward(
                     moe_backend=moe_backend,
                     delta_moe_list=g_delta_moe_list,
                     gqa_moe=g_gqa_moe,
+                    stacked_delta_expert_weights=stacked_delta_expert,
+                    stacked_gqa_expert_weights=stacked_gqa_expert,
+                    group_idx=g if _use_gmm_stacking else None,
                 )
             new_cache = None
 

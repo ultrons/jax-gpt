@@ -32,6 +32,8 @@ def deltanet_layer_forward(
     n_devices: int = 1, mesh=None,
     axis_name: str = 'tp',
     moe_backend: MoeBackend = 'ragged_dot',
+    stacked_expert_weights: dict | None = None,
+    layer_idx: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Single DeltaNet layer: pre-norm -> attention -> residual -> pre-norm -> MoE -> residual."""
 
@@ -62,7 +64,9 @@ def deltanet_layer_forward(
         normed = rms_norm(x, params['moe_norm'], config.rms_norm_eps)
         moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token,
                             n_devices=n_devices, axis_name=axis_name, mesh=mesh,
-                            moe_backend=moe_backend)
+                            moe_backend=moe_backend,
+                            stacked_expert_weights=stacked_expert_weights,
+                            layer_idx=layer_idx)
 
     x = x + moe_out
     return x, new_M, new_conv
@@ -79,6 +83,8 @@ def gqa_layer_forward(
     n_devices: int = 1, mesh=None,
     axis_name: str = 'tp',
     moe_backend: MoeBackend = 'ragged_dot',
+    stacked_expert_weights: dict | None = None,
+    layer_idx: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Single GQA layer: pre-norm -> attention -> residual -> pre-norm -> MoE -> residual."""
 
@@ -97,7 +103,9 @@ def gqa_layer_forward(
         normed = rms_norm(x, params['moe_norm'], config.rms_norm_eps)
         moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token,
                             n_devices=n_devices, axis_name=axis_name, mesh=mesh,
-                            moe_backend=moe_backend)
+                            moe_backend=moe_backend,
+                            stacked_expert_weights=stacked_expert_weights,
+                            layer_idx=layer_idx)
 
     x = x + moe_out
     # Ensure cache dtypes match input for scan carry compatibility
@@ -121,6 +129,8 @@ def gqa_layer_forward_rpa(
     n_devices: int = 1, mesh=None,
     axis_name: str = 'tp',
     moe_backend: MoeBackend = 'ragged_dot',
+    stacked_expert_weights: dict | None = None,
+    layer_idx: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Single GQA layer using RPA v3 kernel for decode."""
 
@@ -146,7 +156,9 @@ def gqa_layer_forward_rpa(
         normed = rms_norm(x, params['moe_norm'], config.rms_norm_eps)
         moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token,
                             n_devices=n_devices, axis_name=axis_name, mesh=mesh,
-                            moe_backend=moe_backend)
+                            moe_backend=moe_backend,
+                            stacked_expert_weights=stacked_expert_weights,
+                            layer_idx=layer_idx)
 
     x = x + moe_out
     return x, updated_cache
@@ -168,6 +180,9 @@ def group_forward(
     moe_backend: MoeBackend = 'ragged_dot',
     delta_moe_list: list[dict] | None = None,
     gqa_moe: dict | None = None,
+    stacked_delta_expert_weights: dict | None = None,
+    stacked_gqa_expert_weights: dict | None = None,
+    group_idx: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Forward pass through one 4-layer group (3 DeltaNet + 1 GQA).
 
@@ -177,6 +192,12 @@ def group_forward(
             to avoid XLA retiling from stacked array slicing.
         gqa_moe: Optional MoE param dict for the GQA layer. When provided,
             overrides group_params['gqa_layer']['moe'].
+        stacked_delta_expert_weights: Optional dict with stacked expert weights
+            (gate_proj, up_proj, down_proj) across all delta layers, shape
+            (total_delta_layers, E, K, N). Used with gmm backend to eliminate
+            squeeze entirely — gmm_v2's rhs_group_offset indexes directly.
+        stacked_gqa_expert_weights: Same for GQA layers.
+        group_idx: Group index, used to compute per-layer indices for stacked weights.
     """
 
     # Unrolled DeltaNet layers (3 iterations) — see group_forward_rpa comment.
@@ -187,10 +208,19 @@ def group_forward(
         layer_p = jax.tree.map(lambda a: a[i], delta_layer_params)
         if delta_moe_list is not None:
             layer_p = {**layer_p, 'moe': delta_moe_list[i]}
+
+        stacked_ew = None
+        l_idx = None
+        if stacked_delta_expert_weights is not None and group_idx is not None:
+            stacked_ew = stacked_delta_expert_weights
+            l_idx = group_idx * n_delta + i
+
         x, new_M, new_conv = deltanet_layer_forward(
             x, layer_p, delta_Ms[i], delta_convs[i], config, is_decode,
             n_devices=n_devices, mesh=mesh, axis_name=axis_name,
             moe_backend=moe_backend,
+            stacked_expert_weights=stacked_ew,
+            layer_idx=l_idx,
         )
         new_Ms_list.append(new_M)
         new_convs_list.append(new_conv)
@@ -200,12 +230,21 @@ def group_forward(
     gqa_p = group_params['gqa_layer']
     if gqa_moe is not None:
         gqa_p = {**gqa_p, 'moe': gqa_moe}
+
+    stacked_gqa_ew = None
+    gqa_l_idx = None
+    if stacked_gqa_expert_weights is not None and group_idx is not None:
+        stacked_gqa_ew = stacked_gqa_expert_weights
+        gqa_l_idx = group_idx
+
     x, new_gqa_k, new_gqa_v = gqa_layer_forward(
             x, gqa_p,
             gqa_k, gqa_v, cache_pos,
             config, rope_freqs,
             n_devices=n_devices, mesh=mesh, axis_name=axis_name,
             moe_backend=moe_backend,
+            stacked_expert_weights=stacked_gqa_ew,
+            layer_idx=gqa_l_idx,
         )
 
     return x, new_Ms, new_convs, new_gqa_k, new_gqa_v
@@ -229,6 +268,9 @@ def group_forward_rpa(
     moe_backend: MoeBackend = 'ragged_dot',
     delta_moe_list: list[dict] | None = None,
     gqa_moe: dict | None = None,
+    stacked_delta_expert_weights: dict | None = None,
+    stacked_gqa_expert_weights: dict | None = None,
+    group_idx: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Forward pass through one group using RPA for GQA decode.
 
@@ -238,6 +280,10 @@ def group_forward_rpa(
             to avoid XLA retiling from stacked array slicing.
         gqa_moe: Optional MoE param dict for the GQA layer. When provided,
             overrides group_params['gqa_layer']['moe'].
+        stacked_delta_expert_weights: Optional dict with stacked expert weights
+            across all delta layers. See group_forward docstring.
+        stacked_gqa_expert_weights: Same for GQA layers.
+        group_idx: Group index for computing per-layer indices.
 
     Returns (x, new_Ms, new_convs, updated_kv_cache).
     """
@@ -254,10 +300,19 @@ def group_forward_rpa(
         layer_p = jax.tree.map(lambda a: a[i], delta_layer_params)
         if delta_moe_list is not None:
             layer_p = {**layer_p, 'moe': delta_moe_list[i]}
+
+        stacked_ew = None
+        l_idx = None
+        if stacked_delta_expert_weights is not None and group_idx is not None:
+            stacked_ew = stacked_delta_expert_weights
+            l_idx = group_idx * n_delta + i
+
         x, new_M, new_conv = deltanet_layer_forward(
             x, layer_p, delta_Ms[i], delta_convs[i], config, is_decode=True,
             n_devices=n_devices, mesh=mesh, axis_name=axis_name,
             moe_backend=moe_backend,
+            stacked_expert_weights=stacked_ew,
+            layer_idx=l_idx,
         )
         new_Ms_list.append(new_M)
         new_convs_list.append(new_conv)
@@ -267,6 +322,13 @@ def group_forward_rpa(
     gqa_p = group_params['gqa_layer']
     if gqa_moe is not None:
         gqa_p = {**gqa_p, 'moe': gqa_moe}
+
+    stacked_gqa_ew = None
+    gqa_l_idx = None
+    if stacked_gqa_expert_weights is not None and group_idx is not None:
+        stacked_gqa_ew = stacked_gqa_expert_weights
+        gqa_l_idx = group_idx
+
     x, updated_cache = gqa_layer_forward_rpa(
         x, gqa_p,
         kv_cache, kv_lens, page_indices,
@@ -274,6 +336,8 @@ def group_forward_rpa(
         config, rope_freqs,
         n_devices=n_devices, mesh=mesh, axis_name=axis_name,
         moe_backend=moe_backend,
+        stacked_expert_weights=stacked_gqa_ew,
+        layer_idx=gqa_l_idx,
     )
 
     return x, new_Ms, new_convs, updated_cache

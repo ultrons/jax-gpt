@@ -1,0 +1,76 @@
+# v71: gmm_v2 rhs_group_offset stacking — eliminate squeeze for expert weights
+#
+# Key change: Expert weights (gate_proj, up_proj, down_proj) stay stacked as
+# 4D (n_layers, E, K, N) arrays. gmm_v2's rhs_group_offset indexes directly
+# into the stacked array via DMA, bypassing JAX-level squeeze entirely.
+# Only small MoE params (gate_weight, shared_*) are sliced per-layer.
+#
+# Deploy:
+#   kubectl apply -f k8s/bench_v71_gmm_stacking_decode_jobset.yaml
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-v71-decode --prefix=true -f --max-log-requests=8
+#
+# Cleanup:
+#   kubectl delete jobset qwen35-v71-decode
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-v71-decode
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 2
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-v71-decode
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v71
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/qwen35_benchmark.py"]
+                  args:
+                    - "--config=full"
+                    - "--dtype=fp8"
+                    - "--sharding=B"
+                    - "--batch-size=256"
+                    - "--prompt-len=1024"
+                    - "--decode-steps=32"
+                    - "--dp=8"
+                    - "--n-runs=3"
+                    - "--use-rpa"
+                    - "--skip-prefill"
+                    - "--scan-mode=unrolled"
+                    - "--moe-backend=gmm"
+                    - "--profile"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: PROFILE_DIR
+                      value: "gs://sivaibhav-exp/qwen-profiles/v71-gmm-stacking-decode"
+                    - name: LIBTPU_INIT_ARGS
+                      value: "--xla_tpu_offload_gather_to_sparsecore=true --xla_tpu_enable_offloading_scatter_to_sparsecore=true --xla_tpu_enable_offloading_sort_to_sparsecore=true"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
