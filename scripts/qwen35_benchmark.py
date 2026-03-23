@@ -301,6 +301,7 @@ def run_decode_benchmark(
     use_rpa: bool = False,
     scan_mode: str = 'scan',
     moe_backend: str = 'ragged_dot',
+    micro_batches: int = 1,
 ):
     """Benchmark decode latency.
 
@@ -333,6 +334,9 @@ def run_decode_benchmark(
 
     if use_rpa and HAS_RPA and scan_mode == 'unrolled':
         # Unrolled RPA: single JIT with Python for-loop over groups.
+        # NOTE: donate_argnums=(2,) would save ~6 GB HBM but breaks the benchmark
+        # loop: the warmup call donates cache_after, then the run loop tries to
+        # reuse it. Needs a per-run cache copy strategy to fix properly.
         @jax.jit
         def decode_step(p, tok, c):
             logits, new_c = forward(
@@ -373,6 +377,8 @@ def run_decode_benchmark(
     # 60 layers due to XLA copying all expert weights) and create the paged
     # cache directly from zeros.  Decode latency is identical regardless of
     # cache contents — it's a pure shape/sharding benchmark.
+    _paged = False
+
     if use_rpa:
         from tpu_inference.kernels.ragged_paged_attention.v3.util import cdiv
 
@@ -439,6 +445,160 @@ def run_decode_benchmark(
         if mesh is not None and 'dp' in mesh.axis_names:
             first_token = jax.device_put(first_token, NamedSharding(mesh, P(dp_axis)))
         print(f"  Paged KV shape: {paged_kv.shape}")
+
+        # ── Paged decode path (micro_batches > 1) ─────────────────────────
+        # Compile a smaller JIT for page_B sequences to avoid
+        # RuntimeProgramAllocationFailure at large batch sizes.  Each
+        # micro-batch has its own cache; donate_argnums=(2,) aliases the
+        # input/output buffer so the update is in-place (no extra copy).
+        if micro_batches > 1 and scan_mode == 'unrolled':
+            import functools
+            _paged = True
+            assert B % micro_batches == 0, (
+                f"decode_micro_batches ({micro_batches}) must divide "
+                f"batch_size ({B})"
+            )
+            page_B = B // micro_batches
+            page_total_pages = page_B * pages_per_seq
+            print(f"  Paged decode: {micro_batches} micro-batches × BS={page_B}")
+
+            # Build sharded zero arrays directly via make_array_from_callback
+            # to avoid init_cache + shard_cache which would try to replicate
+            # large gqa_k/v tensors on device (90 GB OOM with params already loaded).
+            # Reuse sharding specs from the existing input cache.
+            cpu = jax.devices('cpu')[0]
+            dm_global = (n_groups, 3, page_B) + cache.delta_M.shape[3:]
+            dc_global = (n_groups, 3, page_B) + cache.delta_conv.shape[3:]
+
+            def _sharded_zeros(global_shape, sharding, dtype):
+                def cb(idx):
+                    shard_shape = tuple(
+                        (s.stop - s.start) if s.start is not None else d
+                        for s, d in zip(idx, global_shape)
+                    )
+                    with jax.default_device(cpu):
+                        return jnp.zeros(shard_shape, dtype=dtype)
+                return jax.make_array_from_callback(global_shape, sharding, cb)
+
+            page_caches = []
+            for _mi in range(micro_batches):
+                page_delta_M = _sharded_zeros(dm_global, cache.delta_M.sharding, cache_dtype)
+                page_delta_conv = _sharded_zeros(dc_global, cache.delta_conv.sharding, cache_dtype)
+
+                if mesh is not None:
+                    pkv_shape = (n_groups, page_total_pages, page_size,
+                                 kv_packed, n_kv_heads, head_dim)
+                    pkv_sharding = NamedSharding(mesh, P(None, dp_axis, None, None, None, None))
+                    def _pkv_cb(idx, _sh=pkv_shape):
+                        shard_shape = tuple(
+                            (s.stop - s.start) if s.start is not None else d
+                            for s, d in zip(idx, _sh)
+                        )
+                        with jax.default_device(cpu):
+                            return jnp.zeros(shard_shape, dtype=cache_dtype)
+                    page_pkv = jax.make_array_from_callback(pkv_shape, pkv_sharding, _pkv_cb)
+                    page_kv_lens = jax.make_array_from_callback(
+                        (page_B,), NamedSharding(mesh, P(dp_axis)),
+                        lambda idx: np.full(
+                            (idx[0].stop - idx[0].start,), prefill_len, dtype=np.int32))
+                    page_pi = jax.make_array_from_callback(
+                        (page_total_pages,), NamedSharding(mesh, P(dp_axis)),
+                        lambda idx: np.arange(idx[0].start, idx[0].stop, dtype=np.int32))
+                else:
+                    page_pkv = jnp.zeros(
+                        (n_groups, page_total_pages, page_size,
+                         kv_packed, n_kv_heads, head_dim),
+                        dtype=cache_dtype)
+                    page_kv_lens = jnp.full((page_B,), prefill_len, dtype=jnp.int32)
+                    page_pi = jnp.arange(page_total_pages, dtype=jnp.int32)
+
+                dummy_k = jnp.zeros((n_groups, 1, 1, 1, 1), dtype=cache_dtype)
+                page_caches.append(HybridCache(
+                    delta_M=page_delta_M,
+                    delta_conv=page_delta_conv,
+                    gqa_k=dummy_k,
+                    gqa_v=jnp.zeros_like(dummy_k),
+                    pos=jnp.array(prefill_len, dtype=jnp.int32),
+                    paged_kv=page_pkv,
+                    kv_lens=page_kv_lens,
+                    page_indices=page_pi,
+                ))
+            print(f"  Paged KV shape per micro-batch: {page_caches[0].paged_kv.shape}")
+
+            @functools.partial(jax.jit, donate_argnums=(2,))
+            def decode_step_micro(p, tok, c):
+                logits, new_c = forward(
+                    p, tok[:, None], cfg, cache=c, is_decode=True,
+                    cache_sharding=cache_sharding, n_devices=n_devices,
+                    mesh=mesh, use_rpa=True, scan_mode='unrolled',
+                    moe_backend=moe_backend,
+                )
+                return jnp.argmax(logits[:, 0, :], axis=-1), new_c
+
+            # Warmup = first real decode step on page 0 (cache donated in-place)
+            tok_page0 = first_token[:page_B]
+            if mesh is not None and dp_axis is not None:
+                tok_page0 = jax.device_put(tok_page0, NamedSharding(mesh, P(dp_axis)))
+            print("  Compiling paged decode step...")
+            t_compile = time.perf_counter()
+            _, page_caches[0] = decode_step_micro(params, tok_page0, page_caches[0])
+            jax.effects_barrier()
+            compile_ms = (time.perf_counter() - t_compile) * 1000
+            print(f"  Paged decode compilation: {compile_ms:.0f} ms")
+
+            with maybe_profile("decode", profile):
+                async_run_times = []
+                for run_idx in range(n_runs):
+                    tok = first_token
+                    t0_run = time.perf_counter()
+                    for _step in range(n_decode_steps):
+                        page_toks = []
+                        for mi in range(micro_batches):
+                            s = mi * page_B
+                            tok_mi = tok[s:s + page_B]
+                            if mesh is not None and dp_axis is not None:
+                                tok_mi = jax.device_put(
+                                    tok_mi, NamedSharding(mesh, P(dp_axis)))
+                            next_tok_mi, page_caches[mi] = decode_step_micro(
+                                params, tok_mi, page_caches[mi])
+                            page_toks.append(next_tok_mi)
+                        tok = jnp.concatenate(page_toks, axis=0)
+                    tok.block_until_ready()
+                    async_run_times.append((time.perf_counter() - t0_run) * 1000)
+
+            tok = first_token
+            sync_times = []
+            dispatch_times = []
+            for _step in range(n_decode_steps):
+                t_step = time.perf_counter()
+                page_toks = []
+                for mi in range(micro_batches):
+                    s = mi * page_B
+                    tok_mi = tok[s:s + page_B]
+                    if mesh is not None and dp_axis is not None:
+                        tok_mi = jax.device_put(
+                            tok_mi, NamedSharding(mesh, P(dp_axis)))
+                    next_tok_mi, page_caches[mi] = decode_step_micro(
+                        params, tok_mi, page_caches[mi])
+                    page_toks.append(next_tok_mi)
+                tok = jnp.concatenate(page_toks, axis=0)
+                dispatch_times.append((time.perf_counter() - t_step) * 1000)
+                tok.block_until_ready()
+                sync_times.append((time.perf_counter() - t_step) * 1000)
+            elapsed_total = sum(async_run_times) / 1000
+
+            # Compute summary metrics (same formulas as non-paged path below)
+            avg_async_total_ms = sum(async_run_times) / len(async_run_times)
+            avg_async_step_ms = avg_async_total_ms / n_decode_steps
+            if len(async_run_times) > 1:
+                avg_steady_async_ms = sum(async_run_times[1:]) / len(async_run_times[1:]) / n_decode_steps
+            else:
+                avg_steady_async_ms = avg_async_step_ms
+            avg_sync_ms = sum(sync_times[1:]) / len(sync_times[1:]) if len(sync_times) > 1 else sync_times[0]
+            avg_dispatch_ms = sum(dispatch_times[1:]) / len(dispatch_times[1:]) if len(dispatch_times) > 1 else dispatch_times[0]
+            avg_steady_ms = avg_steady_async_ms
+            avg_all_ms = avg_async_step_ms
+
     else:
         # Non-RPA: run prefill to fill contiguous KV cache
         print("  Compiling prefill (for decode)...")
@@ -451,7 +611,7 @@ def run_decode_benchmark(
 
     use_compiled_loop = False  # while_loop OOMs (copies closed-over params)
 
-    if True:
+    if not _paged:
         # Standard path: per-step Python loop
         print("  Compiling decode step...")
         t_compile = time.perf_counter()
@@ -582,6 +742,11 @@ def main():
                              'unrolled uses Python for-loop inside JIT to avoid XLA copy insertion OOM.')
     parser.add_argument('--moe-backend', default='ragged_dot', choices=['ragged_dot', 'gmm'],
                         help='MoE expert matmul backend: ragged_dot (XLA) or gmm (Pallas kernel).')
+    parser.add_argument('--decode-micro-batches', type=int, default=1,
+                        help='Split decode into N micro-batches (each BS/N) to reduce JIT '
+                             'compilation HBM footprint. Use 2 for BS=2048 if '
+                             'RuntimeProgramAllocationFailure occurs. '
+                             'Requires --use-rpa --scan-mode=unrolled.')
     args = parser.parse_args()
 
     if args.max_seq_len is None:
@@ -905,6 +1070,7 @@ def main():
                 use_rpa=args.use_rpa,
                 scan_mode=args.scan_mode,
                 moe_backend=args.moe_backend,
+                micro_batches=args.decode_micro_batches,
             )
 
     # Post-benchmark peak memory report
