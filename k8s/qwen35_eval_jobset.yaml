@@ -1,15 +1,15 @@
-# JobSet for Qwen3.5-397B HumanEval on mlperf-v5p (cloud-tpu-multipod-dev).
+# JobSet for Qwen3.5-397B HumanEval on mlperf-rl-v5p-128 (cloud-tpu-multipod-dev).
 #
-# Topology:  2×4×4 v5p = 32 chips = 8 hosts × 4 chips (ct5p-hightpu-4t)
-# Sharding:  TP=32 (all chips), DP=1
-# Memory:    32 chips × 96 GB = 3,072 GB >> 794 GB model (fits with ~2.3× headroom)
+# Topology:  4×4×4 v5p = 64 chips = 16 hosts × 4 chips (ct5p-hightpu-4t)
+# Sharding:  TP=32, DP=2
+# Memory:    64 chips × 96 GB = 6,144 GB >> 794 GB model (fits with ~7.7× headroom)
 #
-# JobSet creates one child Job with 8 indexed pods (one per TPU host).
+# JobSet creates one child Job with 16 indexed pods (one per TPU host).
 # All pods restart together if any fails — required for JAX collective ops.
-# Kueue (multislice-queue) handles admission on mlperf-v5p.
+# Kueue (multislice-queue) handles admission on mlperf-rl-v5p-128.
 #
 # Prerequisites:
-#   1. JobSet CRD installed on mlperf-v5p (already present).
+#   1. JobSet CRD installed on mlperf-rl-v5p-128 (already present).
 #
 #   2. Model weights disk in cloud-tpu-multipod-dev:
 #        Created from snapshot of oss-model-dev (tpu-vm-gke-testing).
@@ -88,13 +88,13 @@ spec:
 
   replicatedJobs:
     - name: slice
-      # replicas=1: one TPU slice (4×4×4 = 8 hosts)
+      # replicas=1: one TPU slice (4×4×4 = 16 hosts)
       replicas: 1
       template:
         spec:
-          # 8 indexed pods, one per TPU host in the 2×4×4 slice (4 chips each)
-          completions: 8
-          parallelism: 8
+          # 16 indexed pods, one per TPU host in the 4×4×4 slice (4 chips each)
+          completions: 16
+          parallelism: 16
           completionMode: Indexed
           # No backoff — let JobSet handle restarts at the JobSet level
           backoffLimit: 0
@@ -116,13 +116,13 @@ spec:
               # ---- Node selector (TPU v5p pool) ---------------------------
               nodeSelector:
                 cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
-                cloud.google.com/gke-tpu-topology: 2x4x4
+                cloud.google.com/gke-tpu-topology: 4x4x4
 
               # ---- Containers ---------------------------------------------
               containers:
                 - name: eval
                   # EDIT: replace with your image
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v47
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v67-eval
                   imagePullPolicy: Always
 
                   command: ["python", "scripts/eval_humaneval.py"]
@@ -131,7 +131,7 @@ spec:
                     - "--output-dir=/tmp/output"
                     - "--n-problems=164"
                     - "--tp=32"
-                    - "--dp=1"
+                    - "--dp=2"
                     - "--max-new-tokens=32768"
                     - "--temperature=0.6"
                     - "--top-k=20"

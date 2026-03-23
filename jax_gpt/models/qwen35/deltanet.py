@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 
 from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
+from jax_gpt.models.qwen35.pallas_deltanet import fused_deltanet_step
 
 
 def _l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
@@ -104,6 +105,7 @@ def deltanet_recurrent_step(
     config_n_v_heads: int,
     config_qk_head_dim: int,
     config_v_head_dim: int,
+    mesh=None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Single-step DeltaNet recurrent update (decode mode).
 
@@ -122,6 +124,7 @@ def deltanet_recurrent_step(
         state: (B, n_v_heads, qk_head_dim, v_head_dim) recurrent state M.
         conv_state: (B, conv_dim, kernel_size) conv1d sliding window.
         config_*: static config values.
+        mesh: device mesh for shard_map (required for multi-device Pallas).
 
     Returns:
         (output, new_state, new_conv_state)
@@ -177,20 +180,45 @@ def deltanet_recurrent_step(
     v = v[:, 0]  # (B, n_v_heads, v_head_dim)
     beta = beta[:, 0]  # (B, n_v_heads)
 
-    # Recurrent step (compute in float32, cast state back to STATE dtype for scan carry)
-    state_dtype = state.dtype  # preserve cache dtype (may differ from activation dtype)
-    # state: (B, n_v_heads, qk_head_dim, v_head_dim)
+    # Fused recurrent step — single Pallas kernel reads state once from HBM
+    # instead of 3 separate einsums (decay, readout+update, query).
+    state_dtype = state.dtype
     state_f32 = state.astype(jnp.float32)
-    g_factor = jnp.exp(g.astype(jnp.float32))[..., None, None]
-    new_state = state_f32 * g_factor
+    g_factor = jnp.exp(g.astype(jnp.float32))  # (B, H) — kernel handles broadcasting
+    q_f32 = q.astype(jnp.float32)
+    k_f32 = k.astype(jnp.float32)
+    v_f32 = v.astype(jnp.float32)
+    beta_f32 = beta.astype(jnp.float32)
 
-    kv_mem = jnp.einsum('bhkv,bhk->bhv', new_state, k.astype(jnp.float32))
-    delta = (v.astype(jnp.float32) - kv_mem) * beta.astype(jnp.float32)[..., None]
-
-    new_state = new_state + jnp.einsum('bhk,bhv->bhkv', k.astype(jnp.float32), delta)
+    if mesh is not None:
+        # Pallas kernels can't be auto-partitioned — wrap in shard_map.
+        # State is P('dp', 'tp', None, None); q/k/v/g/beta follow same pattern.
+        from jax.experimental.shard_map import shard_map
+        from jax.sharding import PartitionSpec as P
+        dp = 'dp' if 'dp' in mesh.axis_names else None
+        tp = 'tp' if 'tp' in mesh.axis_names else None
+        new_state, output = shard_map(
+            fused_deltanet_step,
+            mesh=mesh,
+            in_specs=(
+                P(dp, tp, None, None),  # state: (B, H, dk, dv)
+                P(dp, tp, None),        # q: (B, H, dk)
+                P(dp, tp, None),        # k: (B, H, dk)
+                P(dp, tp, None),        # v: (B, H, dv)
+                P(dp, tp),              # g_factor: (B, H)
+                P(dp, tp),              # beta: (B, H)
+            ),
+            out_specs=(
+                P(dp, tp, None, None),  # new_state: (B, H, dk, dv)
+                P(dp, tp, None),        # output: (B, H, dv)
+            ),
+            check_rep=False,
+        )(state_f32, q_f32, k_f32, v_f32, g_factor, beta_f32)
+    else:
+        new_state, output = fused_deltanet_step(
+            state_f32, q_f32, k_f32, v_f32, g_factor, beta_f32,
+        )
     new_state = new_state.astype(state_dtype)
-
-    output = jnp.einsum('bhkv,bhk->bhv', new_state.astype(jnp.float32), q.astype(jnp.float32))
 
     # Gated RMSNorm (applied per-head, weight is per v_head_dim)
     output = output.reshape(B * config_n_v_heads, config_v_head_dim)

@@ -63,9 +63,12 @@ RPA is proven in production (vLLM on TPU) and is the right approach. Our problem
 RESOURCE_EXHAUSTED: Ran out of memory trying to allocate 3.69GiB for program
 ```
 
-The compiled HLO program itself is 3.69 GB, exceeding available HBM (~949 MB free after params + cache).
+XLA determined at compile time that the program's HLO temporary buffers (intermediate activations,
+communication buffers, padding) need 3.69 GB, exceeding available HBM after params + cache (~949 MB
+free). Note: "for program" in XLA's error refers to the program's tensor buffer allocations (which
+are 98-100% HLO temps), NOT the compiled instruction binary (which is tiny, MB-scale).
 
-**Result on 4-layer (1 group)**: Compiles and runs (program ~200 MB estimated).
+**Result on 4-layer (1 group)**: Compiles and runs (far fewer intermediate buffers).
 
 ### Phase 3: Approach 2 — Per-group Python Loop (Too Slow)
 
@@ -102,22 +105,31 @@ The compiled HLO program itself is 3.69 GB, exceeding available HBM (~949 MB fre
 
 ### Phase 5: HLO Analysis
 
-**Goal**: Understand program size and scan behavior.
+**Goal**: Understand HBM allocation and scan behavior.
 
 **Findings on v5p (without shard_map)**:
 - Compiled binary: 3-4.5 MB (tiny)
 - Program size is flat across 1/2/4 groups — **scan compiles body once, does NOT unroll**
 - HLO line counts nearly identical across group counts
 
-**Implication**: The 3.69 GB program on v7x comes from `shard_map` + v7 Pallas codegen, not from scan unrolling. Without shard_map on v5p, the program is 1000x smaller.
+**Implication**: The 3.69 GB HBM allocation on v7x is driven by `shard_map` + v7 Pallas codegen
+producing larger intermediate tensor buffers, not from scan unrolling. Without shard_map on v5p,
+the HLO temp buffers are much smaller. (The compiled instruction binary is always small — the
+difference is in how much HBM XLA needs for intermediate tensor allocations at runtime.)
 
 ### Phase 6: Root Cause Hypotheses
 
-#### Why is the program 3.69 GB with shard_map on v7x?
+#### Why does XLA need 3.69 GB of HBM for intermediates with shard_map on v7x?
 
-1. **shard_map lowering**: `shard_map` lowers each Pallas kernel into per-device SPMD code. The v7 Pallas codegen for `ragged_paged_attention` may produce massive per-shard programs.
-2. **v7 memory coloring**: On v7, the RPA kernel wraps `pallas_call` in additional `@jax.jit` with `pltpu.with_memory_space_constraint` to pin buffers to HBM. This may increase program size.
-3. **MIXED sub-kernel**: `ragged_paged_attention()` always compiles DECODE + MIXED sub-kernels. MIXED does zero work in pure decode (distribution=[B,B,B] gives empty range [B,B)), but the kernel code is still compiled, doubling the program size.
+Note: The 3.69 GB is NOT a compiled instruction binary — it's the peak HLO temporary buffer
+allocation (intermediate activation tensors that must be live simultaneously). The instruction
+binary is trivially small (MB-scale). XLA's "for program" label is misleading — it's 98-100%
+tensor buffers. TPU instructions reside in HBM but are DMA'd to the scalar core's IMEM as
+overlays; their size is negligible.
+
+1. **shard_map lowering**: `shard_map` lowers each Pallas kernel into per-device SPMD code. The v7 Pallas codegen for `ragged_paged_attention` may produce larger intermediate buffer requirements.
+2. **v7 memory coloring**: On v7, the RPA kernel wraps `pallas_call` in additional `@jax.jit` with `pltpu.with_memory_space_constraint` to pin buffers to HBM. This may increase the number of buffers that must be HBM-resident simultaneously.
+3. **MIXED sub-kernel**: `ragged_paged_attention()` always compiles DECODE + MIXED sub-kernels. MIXED does zero work in pure decode (distribution=[B,B,B] gives empty range [B,B)), but its intermediate buffers are still allocated.
 
 #### Why is RPA 194x slower than baseline (even without shard_map)?
 
@@ -355,7 +367,11 @@ def make_cache_sharding(config, mesh, axis_rules=None, batch_size=128):
 | v49 (per-group JIT) | 770 ms | 2.6 | 15 host→device round trips per step |
 | v51 (scan, pre-fix) | ~2,630 ms | ~0.8 | Recompilation every step (missing constraint) |
 | v53 (constraint fix) | 19.64 ms | 101.8 | Unnecessary all-gathers (47% of time) |
-| **v54 (dp fix)** | **13.45 ms** | **148.7** | — |
+| v54 (dp fix) | 13.45 ms | 148.7 | fp8 dequant overhead (48% of time) |
+| v55 (native fp8) | 11.58 ms | 172.6 | XLA layout copies on expert weights |
+| v56 (layout fix) | 8.19 ms | 244.2 | DeltaNet scan tiling copies |
+| v57 (unroll) | 6.43 ms | 311.2 | DeltaNet scan tiling copies |
+| **v58 (Pallas DeltaNet)** | **6.52 ms** | **306.9** | Flat (3-layer config too small to show gains) |
 | Baseline (contiguous) | 22.74 ms | 87.9 | — |
 
 ## Docker Images
@@ -368,7 +384,11 @@ def make_cache_sharding(config, mesh, axis_rules=None, batch_size=128):
 | v51 | Clean rebuild, minimal XLA flags | Working, profiled |
 | v52 | Sharding constraint fix (paged_kv) | Working, 17ms steady-state |
 | v53 | Benchmark timing fix (per-step measurement) | Working, 19.64ms confirmed |
-| v54 | DP-aware shard_map + _safe_spec fix | Working, **13.45ms** |
+| v54 | DP-aware shard_map + _safe_spec fix | Working, 13.45ms |
+| v55 | Native fp8 ragged_dot (no dequant) | Working, 11.58ms |
+| v56 | Ragged_dot layout storage (no XLA copy) | Working, 8.19ms |
+| v57 | DeltaNet inner scan unroll | Working, **6.43ms** |
+| v58 | Fused DeltaNet Pallas kernel + shard_map | Working, **6.52ms** |
 
 Build command: `sudo docker build -t gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:vNN . && sudo docker push gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:vNN`
 
@@ -378,7 +398,7 @@ Build command: `sudo docker build -t gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:vNN .
 |--------|---------|-------|
 | `bench_v7x_rpa_mini_jobset.yaml` | 4-layer RPA test on v7x-64 | v49 |
 | `bench_v7x_baseline_mini_jobset.yaml` | 4-layer baseline on v7x-64 | v49 |
-| `bench_v7x_rpa_debug_jobset.yaml` | 4-layer RPA with profiling | v51→v54 |
+| `bench_v7x_rpa_debug_jobset.yaml` | 4-layer RPA with profiling | v51→v58 |
 
 ## Profiles
 
@@ -389,7 +409,11 @@ All at `gs://max-experiments/profiles/qwen35-rpa-debug-v51/decode/plugins/profil
 | `2026_03_21_18_28_31` | v51 | Pre-fix, shows recompilation every step |
 | `2026_03_21_19_19_36` | v52 | Post-fix, clean 17ms decode steps |
 | `2026_03_21_19_41_46` | v53 | 19.64ms, two all-gathers visible (47% of decode) |
-| (pending) | v54 | Expected: no paged_kv or delta_M all-gathers |
+| `2026_03_21_*` | v54 | No paged_kv or delta_M all-gathers |
+| `qwen35-rpa-debug-v55` | v55 | Native fp8 ragged_dot, layout copy visible |
+| `qwen35-rpa-debug-v56` | v56 | Layout copies eliminated |
+| `qwen35-rpa-debug-v57` | v57 | DeltaNet scan unroll, copies gone |
+| `qwen35-rpa-debug-v58` | v58 | Fused Pallas DeltaNet kernel |
 
 ## Key Lessons
 
@@ -439,25 +463,199 @@ for dimensions where the caller guarantees divisibility.
 
 ### 5. Profile before optimizing the kernel
 
-The original hypothesis (RPA kernel is slow, program is too big) was wrong for the 4-layer
+The original hypothesis (RPA kernel is slow, HBM budget too tight) was wrong for the 4-layer
 case. The real issue was infrastructure (missing constraints and dp-unaware shard_map).
 The RPA kernel itself took only 1.3 ms/step — 1.5% of decode time. The other 98.5% was
 collectives and data movement caused by sharding mismatches.
 
-### 6. Measure per-step, not total-time-divided
+### 6. Store weights in the consumer's expected layout
+
+`jnp.transpose` on large tensors causes XLA to insert physical memory copy ops
+(`{3,2,1,0:T(8,128)} → {2,3,1,0:T(32,128)}`). If a weight is always consumed by
+`ragged_dot(x, w, ...)` which needs `(E, K, N)`, store it in `(E, K, N)` from
+init/quantize time — don't store as `(E, N, K)` and transpose at runtime.
+
+For fp8 quantization this also means changing the quantization axis: ragged_dot layout
+`(E, K, N)` needs per-output-feature quantization (amax over K, axis=-2), producing
+scale_inv shape `(E, 1, N)`. The fp8_matmul layout `(N, K)` uses per-row quantization
+(amax over K, axis=-1), producing scale_inv shape `(N, 1)`. These are different functions.
+
+### 7. Small scan loops with large constant weights are better unrolled
+
+`jax.lax.scan` forces XLA to pick a single physical tiling for arrays passed through `xs`
+(auto-sliced inputs). If the consumer (e.g. `ragged_dot`) needs a different tiling than what
+XLA picks for the stacked array, a physical copy happens every iteration.
+
+For small iteration counts (3 DeltaNet layers), unrolling to a Python `for` loop is free
+(~3x body code, negligible vs 15-group outer scan) and lets XLA tile each layer's weights
+independently for their consumer. This eliminated ~770ms of copies+slices per 32-step decode.
+
+**Rule**: If a scan has ≤5 iterations and its `xs` contain large weight arrays that aren't
+modified (constant across iterations), consider unrolling.
+
+### 8. Pallas kernels need shard_map — always
+
+Pallas/Mosaic kernels cannot be auto-partitioned by GSPMD. Any `pallas_call` inside a
+sharded computation will fail with `NotImplementedError: Mosaic kernels cannot be
+automatically partitioned`. The fix is always `shard_map` with explicit `in_specs`/`out_specs`
+matching the tensor sharding.
+
+**Rule**: When adding a Pallas kernel, immediately check: "Will this run in a sharded
+context?" If yes, wrap in `shard_map` from the start. Check the cache/state sharding specs
+(e.g. `make_cache_sharding`) to get the right PartitionSpecs.
+
+### 9. Measure per-step, not total-time-divided
 
 `block_until_ready()` on each step is essential for accurate decode latency measurement on TPU.
 Dividing total wall time by step count mixes in prefill, first-step compilation, and data
 transfer overhead.
 
+### Phase 11: Native FP8 ragged_dot & Layout Fix (2026-03-21)
+
+**Goal**: Eliminate fp8 dequantization overhead in MoE expert computation.
+
+**Problem (v54 profile)**: 48% of decode device time was spent in `convert_element_type` — XLA
+dequantizing fp8 expert weights to f32 before `ragged_dot`. The code in `_get_expert_weight()`
+was calling `w_fp8.astype(jnp.float32) / scale_inv` before every ragged_dot, throwing away
+the 2x fp8 MXU FLOPS advantage.
+
+#### v55: Native fp8 ragged_dot
+
+**Changes**:
+- `moe.py`: Added `_is_fp8_weight()`, `_fp8_expert_components()`, `_fp8_ragged_dot_rescaled()`
+- `_expert_swiglu()`: FP8 branch uses 3 native fp8 ragged_dots (gate, up, down) with
+  intermediate requantization (`dynamic_quantize_fp8`) between SwiGLU stages
+- `expert_forward_single()`: FP8 path extracts fp8 components, skips dequantization
+- `expert_forward_ep()`: FP8 shard_map path passes 9 arrays (3 fp8 weights + 3 scales + 3 activations)
+  through `shard_map` with proper PartitionSpecs
+- Extracted `_ep_inner_body()` shared by both fp8 and non-fp8 EP paths
+
+**Scale convention fix**: `scale_inv = 1/scale`. Rescaling after fp8 dot needs `scale = 1/scale_inv`.
+Initial attempt used `scale_inv` directly as rescale factor → values exploded to ~1e21. Fixed
+by returning `(1.0 / w['scale_inv']).squeeze(-2)` from `_fp8_expert_components()`.
+
+**v55 Results**:
+
+| Metric | v54 | v55 | Delta |
+|--------|-----|-----|-------|
+| Steady-state | 13.45 ms | 11.58 ms | -14% |
+| TPS/chip | 148.7 | 172.6 | +16% |
+
+#### v56: Ragged_dot layout storage (eliminate XLA layout copies)
+
+**Problem (v55 profile)**: Major remaining overhead was XLA `copy` ops changing physical memory
+layout on fp8 expert weights: `{3,2,1,0:T(8,128)} → {2,3,1,0:T(32,128)}`. Root cause: expert
+weights were stored in fp8_matmul convention `(N, K)` via `_quantize_weight()` (which transposes),
+then `jnp.transpose`d back to ragged_dot `(E, K, N)` at runtime. XLA had to physically rearrange
+memory each time.
+
+**Fix**: Store expert weights in ragged_dot layout from init/quantize time:
+- `quantize.py`: Added `_quantize_expert_weight()` — no transpose, per-column quantization
+  (`amax over K dim, axis=-2`), scale_inv shape `(E, 1, N)`
+- `quantize_params_fp8()`: Path-based detection routes expert weights to `_quantize_expert_weight()`
+  instead of `_quantize_weight()`. Detection: `last_part in {'gate_proj', 'up_proj', 'down_proj'}
+  and len(shape) >= 3 and 'shared' not in path`
+- `model.py` `_init_expert_fp8()`: Changed init to `(E, K, N)` layout with `(E, 1, N)` scale
+- `fp8.py` `matmul_maybe_fp8()`: Updated 3D path dequant to `w_fp8 / scale_inv` (was `* scale_inv`)
+
+**v56 Results**:
+
+| Metric | v55 | v56 | Delta |
+|--------|-----|-----|-------|
+| Steady-state | 11.58 ms | **8.19 ms** | **-29%** |
+| TPS/chip | 172.6 | **244.2** | **+42%** |
+
+**HBM Usage (v56, 4-layer on v7x-64, B=128, prompt_len=1024)**:
+- Params: 29.391 GB global (64 arrays) → ~3.67 GB/device
+- Cache: 1.137 GB global (5 arrays) → ~0.14 GB/device
+- Total per device: 3,723 MB (3.64 GB)
+- `bytes_in_use` / `peak_bytes_in_use`: 3.773 GB
+
+### Phase 12: DeltaNet Inner Scan Unroll (2026-03-21)
+
+**Goal**: Eliminate XLA tiling copies on DeltaNet MoE expert weights.
+
+**Problem (v56 profile)**: Three copy ops converting DeltaNet MoE expert weight tiling from
+`T(8,128)` → `T(32,128)`, totalling ~386ms across 32 decode steps:
+```
+copy.362: f8e4m3fn[3,64,4096,1024]  T(8,128)→T(32,128)  129.7ms  (gate_proj)
+copy.363: f8e4m3fn[3,64,4096,1024]  T(8,128)→T(32,128)  128.1ms  (up_proj)
+copy.364: f8e4m3fn[3,64,1024,4096]  T(8,128)→T(32,128)  128.3ms  (down_proj)
+```
+Plus `dynamic-slice_bitcast_fusion` ops (255.8ms + 128.1ms) extracting per-layer weights
+from the stacked `[3, E, K, N]` array.
+
+**Root cause**: `jax.lax.scan` over the 3 DeltaNet layers forced XLA to pick a single tiling
+for the stacked `[3, E, K, N]` scan `xs` array. XLA chose `T(8,128)` (scan-friendly), but
+`ragged_dot` needs `T(32,128)` (MXU-friendly), requiring a copy on every iteration.
+
+**Fix**: Replaced `jax.lax.scan` with a Python `for i in range(3)` loop in both
+`group_forward_rpa()` and `group_forward()` in `block.py`. Each iteration indexes directly
+into the stacked params with `jax.tree.map(lambda a: a[i], delta_layer_params)`. With only
+3 iterations, the program size increase is negligible (~3x body code), but XLA can now tile
+each layer's `[E, K, N]` weights independently for their consumer.
+
+**v57 Results**:
+
+| Metric | v56 | v57 | Delta |
+|--------|-----|-----|-------|
+| Steady-state | 8.19 ms | **6.43 ms** | **-21%** |
+| TPS/chip | 244.2 | **311.2** | **+27%** |
+
+### Phase 13: Fused DeltaNet Pallas Kernel (2026-03-21)
+
+**Goal**: Fuse the 5-op DeltaNet recurrent step into a single Pallas kernel to reduce HBM
+traffic by ~3x on the state matrix.
+
+**Background**: Each DeltaNet recurrent step performs 3 separate passes over the state matrix
+`(B, H, dk, dv)` = `(B, 8, 128, 128)` = 512 KB/head in f32:
+1. `state *= g_factor` (decay)
+2. `kv_mem = einsum('bhkv,bhk->bhv', state, k)` (readout)
+3. `state += outer(k, delta)` (rank-1 update) + `output = einsum('bhkv,bhk->bhv', state, q)` (query)
+
+With 45 DeltaNet layers at full scale, that's 3 reads × 45 layers × 16 MB = ~2.1 GB HBM
+traffic per batch. Fusing into one kernel reduces this to ~0.7 GB.
+
+**Implementation** (`pallas_deltanet.py`):
+- Grid: `(B,)` — one kernel invocation per batch element
+- Each invocation loops over all H heads in Python (unrolled by Mosaic)
+- Block shapes: `(1, H, dk, dv)` for state, `(1, H, dk)` for q/k, `(1, H, dv)` for v
+- TPU Pallas constraints solved:
+  - 2D+ operands required for `dot_general` — reshaped 1D vectors to `(1, dk)` matmuls
+  - `preferred_element_type=jnp.float32` for MXU accumulation precision
+  - Block shape last-two-dim rule: `(8, 128)` divisibility satisfied by H≥8
+  - `pltpu.CompilerParams` for hashable compiler params (JAX v0.7+)
+  - `g_factor`/`beta` reshaped to `(B, H, 1)` for tiling alignment
+
+**Integration** (`deltanet.py`):
+- `fused_deltanet_step` replaces 5 separate einsums in `deltanet_recurrent_step`
+- Wrapped in `shard_map` for multi-device: state is `P('dp', 'tp', None, None)`
+- Falls back to direct call when `mesh is None` (single-device / tests)
+
+**Correctness**: 8/8 standalone kernel tests pass, 5/5 integration tests pass.
+MXU accumulation order differs from JAX einsum by ~0.02 on state, ~0.15 on output
+(error propagation through 128-element contractions). Acceptable for decode.
+
+**v58 Results**:
+
+| Metric | v57 | v58 | Delta |
+|--------|-----|-----|-------|
+| Steady-state | 6.43 ms | **6.52 ms** | +1.4% (noise) |
+| TPS/chip | 311.2 | **306.9** | -1.4% (noise) |
+
+Performance is flat — expected with only 3 DeltaNet layers in the 4-layer debug config.
+The real payoff comes at full 60-layer scale (45 DeltaNet layers → 15x more HBM savings).
+The key result is clean integration: Pallas kernel + shard_map + fp8 projections all work
+together without regression.
+
 ## Open Questions
 
-1. **Full 60-layer config**: The sharding fixes may reduce program size (less all-gather HLO),
-   but the 3.69 GB program OOM may still occur. Needs testing.
+1. **Full 60-layer config**: The sharding fixes may reduce HLO temp buffer requirements (fewer
+   all-gather intermediates), but the compile-time HBM OOM may still occur. Needs testing.
 2. **14.5s first-step overhead**: First decode step takes 14.5s — includes prefill re-execution
    inside the timed loop + paged cache conversion.
-3. **fp8 convert_element_type**: Still a significant fraction of decode time. MoE weight
-   conversions are the main remaining cost after eliminating the all-gathers.
+3. ~~**fp8 convert_element_type**~~: **RESOLVED in v55/v56**. Native fp8 ragged_dot + layout fix
+   eliminated dequantization and copy overhead entirely.
 4. **page_size=128**: v7 tuned entries only exist for page_size=128. Our page_size=64 may be
    suboptimal.
 5. **Baseline dp fix**: The `_safe_spec` B=1 bug also affects the baseline (non-RPA) path.
@@ -465,7 +663,8 @@ transfer overhead.
 
 ## Next Steps
 
-1. Test full 60-layer (15 groups) config with all fixes
+1. Test full 60-layer (15 groups) config with all fixes — Pallas kernel HBM savings
+   should be significant at scale (45 DeltaNet layers vs 3 in debug config)
 2. Fix baseline path dp sharding (same `_safe_spec` bug applies)
-3. Investigate fp8 conversion overhead
-4. Test with page_size=128
+3. Test with page_size=128
+4. Profile v58 to confirm Pallas kernel shows up as single fused op

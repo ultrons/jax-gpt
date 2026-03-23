@@ -23,7 +23,7 @@ if HAS_RPA:
 
     _jit_group_forward_rpa = jax.jit(
         group_forward_rpa,
-        static_argnames=('config', 'n_devices', 'axis_name', 'mesh'),
+        static_argnames=('config', 'n_devices', 'axis_name', 'mesh', 'moe_backend'),
     )
 
 
@@ -94,15 +94,15 @@ def _init_moe_params(key: jax.Array, config: Qwen35Config,
     I = config.moe_intermediate_size
     SI = config.shared_expert_intermediate_size
 
-    # Expert weights: 3D (E, D, I) — for fp8, quantize with transposed last two dims
+    # Expert weights: 3D (E, K, N) in ragged_dot layout — no transpose needed
     if fp8:
         from jax_gpt.models.qwen35.fp8 import FP8_DTYPE
         def _init_expert_fp8(k, shape):
-            # Generate in (E, out, in) layout for fp8, with scale_inv
-            E_, out_, in_ = shape[0], shape[2], shape[1]  # transpose D,I -> I,D or D,I -> I,D
-            w = jax.random.normal(k, (E_, out_, in_), dtype=jnp.bfloat16) * 0.02
+            # Store in ragged_dot layout (E, K, N) with per-output scale (E, 1, N)
+            E_, K_, N_ = shape
+            w = jax.random.normal(k, (E_, K_, N_), dtype=jnp.bfloat16) * 0.02
             return {'w': w.astype(FP8_DTYPE),
-                    'scale_inv': jnp.ones((E_, out_, 1), dtype=jnp.float32)}
+                    'scale_inv': jnp.ones((E_, 1, N_), dtype=jnp.float32)}
         gate_proj = _init_expert_fp8(keys[1], (E, D, I))
         up_proj = _init_expert_fp8(keys[2], (E, D, I))
         down_proj = _init_expert_fp8(keys[3], (E, I, D))
@@ -225,6 +225,8 @@ def forward(
     mesh=None,
     last_logit_only: bool = False,
     use_rpa: bool = False,
+    scan_mode: str = 'scan',
+    moe_backend: str = 'ragged_dot',
 ) -> tuple[jax.Array, HybridCache | None]:
     """Full model forward pass.
 
@@ -238,11 +240,19 @@ def forward(
             Keys: 'delta_M', 'delta_conv', 'gqa_kv'. When provided,
             jax.lax.with_sharding_constraint is applied to cache outputs
             inside the scan to prevent XLA from inferring incompatible sharding.
+        scan_mode: 'scan' (default) uses jax.lax.scan over groups.
+            'unrolled' uses a Python for-loop over groups inside the JIT,
+            avoiding XLA WhileOp copy insertion that OOMs with large MoE
+            expert weights. Trades longer compilation for no scan copies.
+        moe_backend: 'ragged_dot' (XLA) or 'gmm' (Pallas kernel).
 
     Returns:
         (logits, updated_cache)
         logits: (B, T, vocab_size)
     """
+    assert scan_mode in ('scan', 'unrolled'), (
+        f"scan_mode must be 'scan' or 'unrolled', got {scan_mode!r}"
+    )
     B, T = tokens.shape
 
     with jax.named_scope('embedding'):
@@ -272,28 +282,217 @@ def forward(
     # Determine whether to use RPA path
     _use_rpa = use_rpa and is_decode and HAS_RPA and cache is not None
 
+    # RPA metadata (used by both scan and unrolled RPA paths)
     if _use_rpa:
-        # ----- RPA scan: paged KV cache -----
         paged_kv = cache.paged_kv       # (n_groups, total_pages, ps, kv_dim, pk, hd)
         kv_lens = cache.kv_lens          # (B,)
         page_indices = cache.page_indices  # (B * pages_per_seq,)
-        # Infer pages_per_seq from shape: total_pages_per_group / B
         pages_per_seq = paged_kv.shape[1] // B
 
-        # With dp sharding, shard_map splits batch across dp devices.
-        # Compute dp-local metadata: each shard processes B_local sequences
-        # with local page indices [0, B_local*pps).
         if mesh is not None and 'dp' in mesh.axis_names:
             dp = mesh.shape['dp']
             B_local = B // dp
         else:
             B_local = B
         cu_q_lens, distribution = make_decode_metadata(B_local, kv_lens, pages_per_seq)
-        # Local page indices: contiguous 0-based mapping for B_local sequences.
-        # Each dp shard's paged_kv is [0, B_local*pps) pages, so local indices
-        # are always arange(B_local * pages_per_seq) — replicated across shards.
         page_indices_local = jnp.arange(B_local * pages_per_seq, dtype=jnp.int32)
 
+    # ── Unrolled path: Python for-loop inside JIT ──────────────────────
+    # Traces 15 sequential group calls into one XLA program.
+    # No WhileOp → no XLA copy insertion of expert weights.
+    #
+    # If params contains 'groups_list' (a Python list of pre-split per-group
+    # dicts), we use those directly — avoids the expensive jax.tree.map(a[g])
+    # squeeze/slice operations that dominate device time when slicing from
+    # stacked (n_groups, ...) arrays.
+    groups_list = params.get('groups_list', None)
+
+    def _slice_group(groups, g):
+        """Slice group g from stacked params using dynamic_index_in_dim.
+
+        Uses dynamic_index_in_dim instead of static a[g] indexing to prevent
+        XLA from fusing all 15 group slices into one giant retiling op.
+        Static a[g] causes XLA to pre-materialize all 15 slices with a tiling
+        change (T(8,128) -> T(32,128)), consuming 58% of decode device time.
+        """
+        g_idx = jnp.int32(g)
+        return jax.tree.map(
+            lambda a: jax.lax.dynamic_index_in_dim(a, g_idx, axis=0, keepdims=False),
+            groups)
+
+    def _slice_moe_flat(moe_flat, idx):
+        """Slice one layer's MoE params from the flattened (n_groups*n_delta, ...)
+        array using dynamic_slice_in_dim + squeeze.
+
+        Preserves rank during the dynamic_slice (4D→4D for weights), then
+        squeezes the leading dim. The squeeze still triggers XLA
+        slice_bitcast_fusion, but this is better than double-slicing from the
+        original (n_groups, n_delta, ...) stacked array.
+        """
+        idx_arr = jnp.int32(idx)
+        return jax.tree.map(
+            lambda a: jax.lax.dynamic_slice_in_dim(a, idx_arr, 1, axis=0).squeeze(0),
+            moe_flat)
+
+    if scan_mode == 'unrolled':
+        # ── Separate MoE weights for reduced squeeze overhead ──────────
+        # MoE expert weights (gate_proj, up_proj, down_proj) are the
+        # largest tensors (~96GB each for gate/up) and cause 58% of decode
+        # device time as XLA slice_bitcast_fusion retiling when sliced from
+        # stacked (n_groups, n_delta, E, K, N) arrays.
+        #
+        # Strategy: separate MoE from group params, reshape
+        # (15, 3, ...) → (45, ...) (merge group+layer dims only, NOT
+        # expert dim which is sharded), then dynamic_slice_in_dim +
+        # squeeze. This reduces double-slice to single-slice overhead.
+        # Non-MoE params use dynamic_index_in_dim (old approach).
+        n_delta = config.full_attention_interval - 1
+        n_groups = config.n_groups
+
+        if groups_list is None:
+            # Separate MoE weights from delta layers and GQA
+            delta_moe_raw = params['groups']['delta_layers']['moe']
+            gqa_moe_raw = params['groups']['gqa_layer']['moe']
+            # Reshape (n_groups, n_delta, ...) → (n_groups*n_delta, ...)
+            delta_moe_flat = jax.tree.map(
+                lambda a: a.reshape(n_groups * n_delta, *a.shape[2:]),
+                delta_moe_raw)
+            # Reshape (n_groups, ...) → (n_groups, ...)  (no change needed)
+            gqa_moe_flat = gqa_moe_raw
+
+        if _use_rpa:
+            result_delta_M = delta_Ms
+            result_delta_conv = delta_convs
+            result_paged_kv = paged_kv
+
+            for g in range(n_groups):
+                if groups_list is not None:
+                    g_params = groups_list[g]
+                    g_delta_moe_list = None
+                    g_gqa_moe = None
+                else:
+                    g_params = _slice_group(params['groups'], g)
+                    g_delta_moe_list = [
+                        _slice_moe_flat(delta_moe_flat, g * n_delta + i)
+                        for i in range(n_delta)
+                    ]
+                    g_gqa_moe = _slice_moe_flat(gqa_moe_flat, g)
+
+                x, new_dM, new_dC, updated_kv = group_forward_rpa(
+                    x, g_params,
+                    delta_Ms[g], delta_convs[g],
+                    paged_kv[g], kv_lens, page_indices_local,
+                    cu_q_lens, distribution,
+                    cache_pos, config, rope_freqs,
+                    n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+                    moe_backend=moe_backend,
+                    delta_moe_list=g_delta_moe_list,
+                    gqa_moe=g_gqa_moe,
+                )
+                if cache_sharding is not None:
+                    new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
+                    new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
+                    if 'paged_kv' in cache_sharding:
+                        updated_kv = jax.lax.with_sharding_constraint(updated_kv, cache_sharding['paged_kv'])
+                result_delta_M = result_delta_M.at[g].set(new_dM)
+                result_delta_conv = result_delta_conv.at[g].set(new_dC)
+                result_paged_kv = result_paged_kv.at[g].set(updated_kv)
+
+            new_cache = HybridCache(
+                delta_M=result_delta_M,
+                delta_conv=result_delta_conv,
+                gqa_k=cache.gqa_k,
+                gqa_v=cache.gqa_v,
+                pos=cache_pos + T,
+                paged_kv=result_paged_kv,
+                kv_lens=kv_lens + 1,
+                page_indices=page_indices,
+            )
+
+        elif cache is not None:
+            result_delta_M = delta_Ms
+            result_delta_conv = delta_convs
+            result_gqa_k = gqa_ks
+            result_gqa_v = gqa_vs
+
+            for g in range(n_groups):
+                if groups_list is not None:
+                    g_params = groups_list[g]
+                    g_delta_moe_list = None
+                    g_gqa_moe = None
+                else:
+                    g_params = _slice_group(params['groups'], g)
+                    g_delta_moe_list = [
+                        _slice_moe_flat(delta_moe_flat, g * n_delta + i)
+                        for i in range(n_delta)
+                    ]
+                    g_gqa_moe = _slice_moe_flat(gqa_moe_flat, g)
+
+                x, new_dM, new_dC, new_gk, new_gv = group_forward(
+                    x, g_params,
+                    delta_Ms[g], delta_convs[g],
+                    gqa_ks[g], gqa_vs[g],
+                    cache_pos, config, rope_freqs, is_decode,
+                    n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+                    moe_backend=moe_backend,
+                    delta_moe_list=g_delta_moe_list,
+                    gqa_moe=g_gqa_moe,
+                )
+                if cache_sharding is not None:
+                    new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
+                    new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
+                    new_gk = jax.lax.with_sharding_constraint(new_gk, cache_sharding['gqa_kv'])
+                    new_gv = jax.lax.with_sharding_constraint(new_gv, cache_sharding['gqa_kv'])
+                result_delta_M = result_delta_M.at[g].set(new_dM)
+                result_delta_conv = result_delta_conv.at[g].set(new_dC)
+                result_gqa_k = result_gqa_k.at[g].set(new_gk)
+                result_gqa_v = result_gqa_v.at[g].set(new_gv)
+
+            new_cache = HybridCache(
+                delta_M=result_delta_M,
+                delta_conv=result_delta_conv,
+                gqa_k=result_gqa_k,
+                gqa_v=result_gqa_v,
+                pos=cache_pos + T,
+            )
+
+        else:
+            # No cache — prefill with unrolled groups
+            key_dim = config.delta_n_qk_heads * config.delta_qk_head_dim
+            value_dim = config.delta_n_v_heads * config.delta_v_head_dim
+            conv_dim = key_dim * 2 + value_dim
+            dummy_dM = jnp.zeros((n_delta, B,
+                                  config.delta_n_v_heads, config.delta_qk_head_dim, config.delta_v_head_dim))
+            dummy_dC = jnp.zeros((n_delta, B, conv_dim, config.delta_conv_kernel))
+            dummy_gK = jnp.zeros((B, config.gqa_n_kv_heads, T, config.gqa_head_dim))
+            dummy_gV = jnp.zeros((B, config.gqa_n_kv_heads, T, config.gqa_head_dim))
+
+            for g in range(n_groups):
+                if groups_list is not None:
+                    g_params = groups_list[g]
+                    g_delta_moe_list = None
+                    g_gqa_moe = None
+                else:
+                    g_params = _slice_group(params['groups'], g)
+                    g_delta_moe_list = [
+                        _slice_moe_flat(delta_moe_flat, g * n_delta + i)
+                        for i in range(n_delta)
+                    ]
+                    g_gqa_moe = _slice_moe_flat(gqa_moe_flat, g)
+
+                x, _, _, _, _ = group_forward(
+                    x, g_params,
+                    dummy_dM, dummy_dC, dummy_gK, dummy_gV,
+                    None, config, rope_freqs, False,
+                    n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+                    moe_backend=moe_backend,
+                    delta_moe_list=g_delta_moe_list,
+                    gqa_moe=g_gqa_moe,
+                )
+            new_cache = None
+
+    # ── Scan path (default): jax.lax.scan over groups ──────────────────
+    elif _use_rpa:
         def _group_step_rpa(carry, group_inputs):
             x_carry = carry
             g_params, g_delta_M, g_delta_conv, g_paged_kv = group_inputs
@@ -305,6 +504,7 @@ def forward(
                 cu_q_lens, distribution,
                 cache_pos, config, rope_freqs,
                 n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+                moe_backend=moe_backend,
             )
 
             if cache_sharding is not None:
@@ -324,7 +524,7 @@ def forward(
         new_cache = HybridCache(
             delta_M=new_dMs,
             delta_conv=new_dConvs,
-            gqa_k=cache.gqa_k,  # keep contiguous unchanged
+            gqa_k=cache.gqa_k,
             gqa_v=cache.gqa_v,
             pos=cache_pos + T,
             paged_kv=new_paged_kv,
@@ -333,7 +533,6 @@ def forward(
         )
 
     elif cache is not None:
-        # ----- Standard scan: contiguous KV cache -----
         def _group_step(carry, group_inputs):
             x_carry = carry
             g_params, g_delta_M, g_delta_conv, g_gqa_k, g_gqa_v = group_inputs
@@ -344,11 +543,9 @@ def forward(
                 g_gqa_k, g_gqa_v,
                 cache_pos, config, rope_freqs, is_decode,
                 n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+                moe_backend=moe_backend,
             )
 
-            # Apply sharding constraints on cache outputs to prevent XLA
-            # from inferring incompatible sharding (e.g. n_kv_heads=2
-            # can't be split across TP=8).
             if cache_sharding is not None:
                 new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
                 new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
@@ -371,7 +568,6 @@ def forward(
             pos=cache_pos + T,
         )
     else:
-        # No cache: still need dummy arrays for scan signature consistency
         n_groups = config.n_groups
         n_delta = config.full_attention_interval - 1
         key_dim = config.delta_n_qk_heads * config.delta_qk_head_dim
@@ -383,6 +579,19 @@ def forward(
         dummy_dC = jnp.zeros((n_groups, n_delta, B, conv_dim, config.delta_conv_kernel))
         dummy_gK = jnp.zeros((n_groups, B, config.gqa_n_kv_heads, T, config.gqa_head_dim))
         dummy_gV = jnp.zeros((n_groups, B, config.gqa_n_kv_heads, T, config.gqa_head_dim))
+
+        def _group_step(carry, group_inputs):
+            x_carry = carry
+            g_params, g_delta_M, g_delta_conv, g_gqa_k, g_gqa_v = group_inputs
+            x_carry, new_dM, new_dC, new_gk, new_gv = group_forward(
+                x_carry, g_params,
+                g_delta_M, g_delta_conv,
+                g_gqa_k, g_gqa_v,
+                None, config, rope_freqs, False,
+                n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+                moe_backend=moe_backend,
+            )
+            return x_carry, (new_dM, new_dC, new_gk, new_gv)
 
         scan_inputs = (
             params['groups'], dummy_dM, dummy_dC, dummy_gK, dummy_gV,
@@ -413,7 +622,7 @@ def forward(
 
 _jit_group_forward = jax.jit(
     group_forward,
-    static_argnames=('config', 'is_decode', 'n_devices', 'axis_name', 'mesh'),
+    static_argnames=('config', 'is_decode', 'n_devices', 'axis_name', 'mesh', 'moe_backend'),
 )
 
 
@@ -427,6 +636,7 @@ def forward_rpa_decode(
     axis_name: str = 'tp',
     mesh=None,
     last_logit_only: bool = True,
+    moe_backend: str = 'ragged_dot',
 ) -> tuple[jax.Array, HybridCache]:
     """Decode forward pass using RPA, with per-group JIT to avoid OOM.
 
@@ -468,7 +678,17 @@ def forward_rpa_decode(
 
     # Infer pages_per_seq
     pages_per_seq = paged_kv.shape[1] // B
-    cu_q_lens, distribution = make_decode_metadata(B, kv_lens, pages_per_seq)
+
+    # With dp sharding, shard_map splits batch across dp devices.
+    # Compute dp-local metadata: each shard processes B_local sequences.
+    if mesh is not None and 'dp' in mesh.axis_names:
+        dp = mesh.shape['dp']
+        B_local = B // dp
+    else:
+        B_local = B
+    cu_q_lens, distribution = make_decode_metadata(B_local, kv_lens, pages_per_seq)
+    # Local page indices: contiguous 0-based mapping for B_local sequences.
+    page_indices_local = jnp.arange(B_local * pages_per_seq, dtype=jnp.int32)
 
     # Per-group loop — each call reuses the same compiled program.
     # Update arrays in-place with .at[g].set() to avoid accumulating
@@ -490,10 +710,11 @@ def forward_rpa_decode(
             x, new_dM, new_dC, updated_kv = _jit_group_forward_rpa(
                 x, g_params,
                 g_dM, g_dC,
-                g_paged, kv_lens, page_indices,
+                g_paged, kv_lens, page_indices_local,
                 cu_q_lens, distribution,
                 cache_pos, config, rope_freqs,
                 n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+                moe_backend=moe_backend,
             )
 
         # Update in-place to avoid holding 15 copies simultaneously

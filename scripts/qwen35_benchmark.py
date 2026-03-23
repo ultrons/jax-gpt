@@ -246,6 +246,8 @@ def get_axis_rules(name: str) -> dict | None:
 def run_prefill_benchmark(
     params, cfg, cache, tokens, cache_sharding,
     n_runs: int, profile: bool, mesh, n_devices: int = 1,
+    scan_mode: str = 'scan',
+    moe_backend: str = 'ragged_dot',
 ):
     """Benchmark prefill latency."""
     B, T = tokens.shape
@@ -254,7 +256,8 @@ def run_prefill_benchmark(
     def prefill(p, t, c):
         return forward(p, t, cfg, cache=c, is_decode=False,
                        cache_sharding=cache_sharding, n_devices=n_devices, mesh=mesh,
-                       last_logit_only=True)
+                       last_logit_only=True, scan_mode=scan_mode,
+                       moe_backend=moe_backend)
 
     # Warm-up
     print("  Compiling prefill...")
@@ -275,12 +278,19 @@ def run_prefill_benchmark(
     avg_ms = (elapsed / n_runs) * 1000
     tokens_per_sec = (B * T * n_runs) / elapsed
 
-    tps_per_chip = tokens_per_sec / n_devices
+    # P2: Fix TPS/chip — divide by physical chips, not devices (TCs)
+    n_chips = n_devices
+    try:
+        from third_party.tpu_inference.tpu_info import get_num_cores_per_chip
+        n_chips = n_devices // get_num_cores_per_chip()
+    except (ImportError, Exception):
+        pass
+    tps_per_chip = tokens_per_sec / n_chips
 
     print(f"\n  PREFILL RESULTS")
     print(f"  {'Avg latency:':<20s} {avg_ms:.2f} ms")
     print(f"  {'Throughput:':<20s} {tokens_per_sec:,.0f} tokens/sec")
-    print(f"  {'TPS/chip:':<20s} {tps_per_chip:,.1f} tokens/sec/chip")
+    print(f"  {'TPS/chip:':<20s} {tps_per_chip:,.1f} tokens/sec/chip ({n_chips} chips)")
     print(f"  {'Tokens:':<20s} {B} × {T} = {B*T}")
     return avg_ms, tokens_per_sec
 
@@ -289,6 +299,8 @@ def run_decode_benchmark(
     params, cfg, cache, prompt_tokens, n_decode_steps, cache_sharding,
     n_runs: int, profile: bool, mesh, n_devices: int = 1,
     use_rpa: bool = False,
+    scan_mode: str = 'scan',
+    moe_backend: str = 'ragged_dot',
 ):
     """Benchmark decode latency.
 
@@ -303,153 +315,237 @@ def run_decode_benchmark(
     def prefill_fn(p, t, c):
         return forward(p, t, cfg, cache=c, is_decode=False,
                        cache_sharding=cache_sharding, n_devices=n_devices,
-                       mesh=mesh, last_logit_only=True)
+                       mesh=mesh, last_logit_only=True, scan_mode=scan_mode,
+                       moe_backend=moe_backend)
 
-    if use_rpa and HAS_RPA:
-        # RPA decode: use forward() with use_rpa=True inside a single JIT.
-        # For small configs (few groups) the scan+Pallas program fits in HBM.
-        # For large configs (60L/15 groups), the program may be >3 GB and OOM —
-        # in that case fall back to forward_rpa_decode (per-group JIT).
+    # Dispatch optimization: AOT compile and call with pre-flattened args.
+    # The standard jax.jit dispatch path takes ~84ms/step on multi-host TPU
+    # due to buffer binding overhead: 74 pytree leaves × 64 devices = 4,736
+    # buffer handles per dispatch.
+    #
+    # Strategy: define the function normally (params as arg), compile once via
+    # jax.jit().lower().compile(), then in the hot loop call via the Compiled
+    # object which has a faster dispatch path.
+    n_param_leaves = len(jax.tree.leaves(params))
+    n_cache_leaves = len(jax.tree.leaves(cache))
+    print(f"  Dispatch pytree: {n_param_leaves} param + {n_cache_leaves} cache"
+          f" + 1 tok = {n_param_leaves + n_cache_leaves + 1} leaves")
+
+    if use_rpa and HAS_RPA and scan_mode == 'unrolled':
+        # Unrolled RPA: single JIT with Python for-loop over groups.
         @jax.jit
-        def decode_step_rpa(p, tok, c):
+        def decode_step(p, tok, c):
             logits, new_c = forward(
                 p, tok[:, None], cfg, cache=c, is_decode=True,
                 cache_sharding=cache_sharding, n_devices=n_devices,
-                mesh=mesh, use_rpa=True,
+                mesh=mesh, use_rpa=True, scan_mode='unrolled',
+                moe_backend=moe_backend,
             )
             next_token = jnp.argmax(logits[:, 0, :], axis=-1)
             return next_token, new_c
 
-        decode_step = decode_step_rpa
+    elif use_rpa and HAS_RPA:
+        # Legacy per-group JIT path (scan_mode='scan' + use_rpa).
+        # Each group call is separately JITted inside forward_rpa_decode,
+        # so this function must NOT be wrapped in @jax.jit.
+        def decode_step(p, tok, c):
+            logits, new_c = forward_rpa_decode(
+                p, tok[:, None], cfg, cache=c,
+                cache_sharding=cache_sharding, n_devices=n_devices,
+                mesh=mesh, moe_backend=moe_backend,
+            )
+            next_token = jnp.argmax(logits[:, 0, :], axis=-1).block_until_ready()
+            return next_token, new_c
+
     else:
         @jax.jit
         def decode_step(p, tok, c):
             logits, new_c = forward(
                 p, tok[:, None], cfg, cache=c, is_decode=True,
-                cache_sharding=cache_sharding, n_devices=n_devices, mesh=mesh,
+                cache_sharding=cache_sharding, n_devices=n_devices,
+                mesh=mesh, scan_mode=scan_mode,
+                moe_backend=moe_backend,
             )
             next_token = jnp.argmax(logits[:, 0, :], axis=-1)
             return next_token, new_c
 
-    # Warm-up: compile prefill
-    print("  Compiling prefill (for decode)...")
-    t_compile = time.perf_counter()
-    logits, cache_after = prefill_fn(params, prompt_tokens, cache)
-    logits.block_until_ready()
-    first_token = jnp.argmax(logits[:, 0, :], axis=-1)
-    compile_prefill_ms = (time.perf_counter() - t_compile) * 1000
-    print(f"  Prefill compilation: {compile_prefill_ms:.0f} ms")
-
-    # Convert contiguous cache to paged for RPA decode
+    # For RPA decode, we can skip the full-model prefill (which may OOM at
+    # 60 layers due to XLA copying all expert weights) and create the paged
+    # cache directly from zeros.  Decode latency is identical regardless of
+    # cache contents — it's a pure shape/sharding benchmark.
     if use_rpa:
-        from jax_gpt.models.qwen35.paged_cache import contiguous_to_paged
         from tpu_inference.kernels.ragged_paged_attention.v3.util import cdiv
 
         page_size = 64
-        prefill_len = int(cache_after.pos)
-        max_len = cache_after.gqa_k.shape[3]  # may be global shape
+        prefill_len = prompt_tokens.shape[1]  # pretend we prefilled this many tokens
+        max_len = cache.gqa_k.shape[3]
         pages_per_seq = cdiv(max_len, page_size)
+        n_groups = cache.delta_M.shape[0]
+        total_pages = B * pages_per_seq
 
-        print(f"  Converting to paged KV cache (page_size={page_size}, "
+        print(f"  Skipping full prefill (decode-only benchmark).")
+        print(f"  Creating paged KV cache directly (page_size={page_size}, "
               f"pages_per_seq={pages_per_seq})...")
-        t_convert = time.perf_counter()
-        paged_list = contiguous_to_paged(
-            cache_after.gqa_k, cache_after.gqa_v,
-            prefill_len=prefill_len,
-            page_size=page_size,
-        )
-        # Stack per-group paged caches: (n_groups, total_pages, ps, kv_dim, pk, hd)
-        paged_kv = jnp.stack(paged_list, axis=0)
-        kv_lens = jnp.full((B,), prefill_len, dtype=jnp.int32)
-        page_indices = jnp.arange(B * pages_per_seq, dtype=jnp.int32)
 
-        # Apply DP sharding to paged arrays: pages dim holds B sequences
-        # contiguously (seq_i owns pages [i*pps, (i+1)*pps)), so we shard
-        # on the pages axis which splits by batch.
+        cache_dtype = cache.delta_M.dtype
+        kv_packed = 2  # K and V packed together
+        n_kv_heads = cfg.gqa_n_kv_heads
+        head_dim = cfg.gqa_head_dim
+
         if mesh is not None:
             from jax.sharding import NamedSharding, PartitionSpec as P
             dp_axis = 'dp' if 'dp' in mesh.axis_names else None
-            # paged_kv: (n_groups, total_pages, ps, kv_dim, pk, hd) — shard total_pages on dp
-            paged_kv = jax.device_put(paged_kv, NamedSharding(mesh, P(None, dp_axis, None, None, None, None)))
-            kv_lens = jax.device_put(kv_lens, NamedSharding(mesh, P(dp_axis)))
-            page_indices = jax.device_put(page_indices, NamedSharding(mesh, P(dp_axis)))
+            cpu = jax.devices('cpu')[0]
 
-        # Replace contiguous GQA cache with minimal dummy to free HBM
-        dummy_gqa_k = jnp.zeros((cache_after.gqa_k.shape[0], 1, 1, 1, 1),
-                                dtype=cache_after.gqa_k.dtype)
+            paged_kv_shape = (n_groups, total_pages, page_size, kv_packed, n_kv_heads, head_dim)
+            paged_kv_sharding = NamedSharding(mesh, P(None, dp_axis, None, None, None, None))
+            def _paged_cb(idx):
+                shard_shape = tuple(
+                    (s.stop - s.start) if s.start is not None else dim
+                    for s, dim in zip(idx, paged_kv_shape)
+                )
+                with jax.default_device(cpu):
+                    return jnp.zeros(shard_shape, dtype=cache_dtype)
+            paged_kv = jax.make_array_from_callback(paged_kv_shape, paged_kv_sharding, _paged_cb)
+
+            kv_lens_sharding = NamedSharding(mesh, P(dp_axis))
+            kv_lens = jax.make_array_from_callback(
+                (B,), kv_lens_sharding,
+                lambda idx: np.full(((idx[0].stop - idx[0].start),), prefill_len, dtype=np.int32))
+            page_indices_sharding = NamedSharding(mesh, P(dp_axis))
+            page_indices = jax.make_array_from_callback(
+                (total_pages,), page_indices_sharding,
+                lambda idx: np.arange(idx[0].start, idx[0].stop, dtype=np.int32))
+        else:
+            paged_kv = jnp.zeros((n_groups, total_pages, page_size, kv_packed, n_kv_heads, head_dim),
+                                  dtype=cache_dtype)
+            kv_lens = jnp.full((B,), prefill_len, dtype=jnp.int32)
+            page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+
+        dummy_gqa_k = jnp.zeros((n_groups, 1, 1, 1, 1), dtype=cache_dtype)
         dummy_gqa_v = jnp.zeros_like(dummy_gqa_k)
 
         cache_after = HybridCache(
-            delta_M=cache_after.delta_M,
-            delta_conv=cache_after.delta_conv,
+            delta_M=cache.delta_M,
+            delta_conv=cache.delta_conv,
             gqa_k=dummy_gqa_k,
             gqa_v=dummy_gqa_v,
-            pos=cache_after.pos,
+            pos=jnp.array(prefill_len, dtype=jnp.int32),
             paged_kv=paged_kv,
             kv_lens=kv_lens,
             page_indices=page_indices,
         )
-        convert_ms = (time.perf_counter() - t_convert) * 1000
-        print(f"  Paged cache conversion: {convert_ms:.0f} ms")
+        first_token = jnp.ones((B,), dtype=jnp.int32)
+        if mesh is not None and 'dp' in mesh.axis_names:
+            first_token = jax.device_put(first_token, NamedSharding(mesh, P(dp_axis)))
         print(f"  Paged KV shape: {paged_kv.shape}")
+    else:
+        # Non-RPA: run prefill to fill contiguous KV cache
+        print("  Compiling prefill (for decode)...")
+        t_compile = time.perf_counter()
+        logits, cache_after = prefill_fn(params, prompt_tokens, cache)
+        logits.block_until_ready()
+        first_token = jnp.argmax(logits[:, 0, :], axis=-1)
+        compile_prefill_ms = (time.perf_counter() - t_compile) * 1000
+        print(f"  Prefill compilation: {compile_prefill_ms:.0f} ms")
 
-    # Warm-up: compile single decode step
-    print("  Compiling decode step...")
-    t_compile = time.perf_counter()
-    next_tok, cache_step = decode_step(params, first_token, cache_after)
-    next_tok.block_until_ready()
-    compile_ms = (time.perf_counter() - t_compile) * 1000
-    print(f"  Decode compilation: {compile_ms:.0f} ms")
+    use_compiled_loop = False  # while_loop OOMs (copies closed-over params)
 
-    # Free warm-up results to reclaim HBM before timed loop
-    del cache_step, next_tok
-    jax.effects_barrier()
+    if True:
+        # Standard path: per-step Python loop
+        print("  Compiling decode step...")
+        t_compile = time.perf_counter()
+        next_tok, cache_step = decode_step(params, first_token, cache_after)
+        next_tok.block_until_ready()
+        compile_ms = (time.perf_counter() - t_compile) * 1000
+        print(f"  Decode compilation: {compile_ms:.0f} ms")
 
-    # Timed runs — measure decode steps separately from prefill
-    with maybe_profile("decode", profile):
-        step_times = []  # per-step wall times across all runs
-        t0_total = time.perf_counter()
-        for _ in range(n_runs):
-            logits, c = prefill_fn(params, prompt_tokens, cache)
-            tok = jnp.argmax(logits[:, 0, :], axis=-1)
+        del cache_step, next_tok
+        jax.effects_barrier()
 
+        # Async dispatch: dispatch all steps without per-step blocking.
+        # This pipelines host dispatch with device execution, hiding the
+        # ~2s per-step dispatch overhead (24.5x speedup measured in v65).
+        with maybe_profile("decode", profile):
+            async_run_times = []
+            for run_idx in range(n_runs):
+                if use_rpa:
+                    c = cache_after
+                    tok = first_token
+                else:
+                    logits, c = prefill_fn(params, prompt_tokens, cache)
+                    tok = jnp.argmax(logits[:, 0, :], axis=-1)
+                tok.block_until_ready()
+
+                t0_run = time.perf_counter()
+                for _step in range(n_decode_steps):
+                    tok, c = decode_step(params, tok, c)
+                tok.block_until_ready()
+                run_ms = (time.perf_counter() - t0_run) * 1000
+                async_run_times.append(run_ms)
+
+            # Also run one sync measurement for comparison
             if use_rpa:
-                # Re-attach paged cache after prefill
-                c = HybridCache(
-                    delta_M=c.delta_M, delta_conv=c.delta_conv,
-                    gqa_k=c.gqa_k, gqa_v=c.gqa_v, pos=c.pos,
-                    paged_kv=cache_after.paged_kv,
-                    kv_lens=cache_after.kv_lens,
-                    page_indices=cache_after.page_indices,
-                )
+                c = cache_after
+                tok = first_token
+            else:
+                logits, c = prefill_fn(params, prompt_tokens, cache)
+                tok = jnp.argmax(logits[:, 0, :], axis=-1)
 
+            sync_times = []
+            dispatch_times = []
             for _step in range(n_decode_steps):
                 t_step = time.perf_counter()
                 tok, c = decode_step(params, tok, c)
+                t_dispatched = time.perf_counter()
+                dispatch_times.append((t_dispatched - t_step) * 1000)
                 tok.block_until_ready()
-                step_times.append((time.perf_counter() - t_step) * 1000)
-        elapsed_total = time.perf_counter() - t0_total
+                sync_times.append((time.perf_counter() - t_step) * 1000)
+            elapsed_total = sum(async_run_times) / 1000
 
-    # Separate first step (includes data transfer overhead) from steady-state
-    steps_per_run = n_decode_steps
-    first_steps = [step_times[i * steps_per_run] for i in range(n_runs)]
-    steady_steps = [t for i, t in enumerate(step_times) if i % steps_per_run != 0]
+        # Async metrics (primary)
+        avg_async_total_ms = sum(async_run_times) / len(async_run_times)
+        avg_async_step_ms = avg_async_total_ms / n_decode_steps
+        # Use first run as warmup if multiple runs
+        if len(async_run_times) > 1:
+            steady_async = async_run_times[1:]
+            avg_steady_async_ms = sum(steady_async) / len(steady_async) / n_decode_steps
+        else:
+            avg_steady_async_ms = avg_async_step_ms
 
-    avg_first_ms = sum(first_steps) / len(first_steps)
-    avg_steady_ms = sum(steady_steps) / len(steady_steps) if steady_steps else avg_first_ms
-    avg_all_ms = sum(step_times) / len(step_times)
+        # Sync metrics (comparison)
+        avg_sync_ms = sum(sync_times[1:]) / len(sync_times[1:]) if len(sync_times) > 1 else sync_times[0]
+        avg_dispatch_ms = sum(dispatch_times[1:]) / len(dispatch_times[1:]) if len(dispatch_times) > 1 else dispatch_times[0]
 
+        # Use async step time as the primary metric
+        avg_steady_ms = avg_steady_async_ms
+        avg_all_ms = avg_async_step_ms
+
+    # P2: Fix TPS/chip — divide by physical chips, not devices (TCs)
+    # v7x has 2 TCs per chip; n_devices reports TCs (64), should be chips (32).
+    n_chips = n_devices  # default: 1 TC per chip
+    try:
+        from third_party.tpu_inference.tpu_info import get_num_cores_per_chip
+        cores_per_chip = get_num_cores_per_chip()
+        n_chips = n_devices // cores_per_chip
+    except (ImportError, Exception):
+        pass
     tokens_per_sec = B / (avg_steady_ms / 1000)
-    tps_per_chip = tokens_per_sec / n_devices
+    tps_per_chip = tokens_per_sec / n_chips
 
     print(f"\n  DECODE RESULTS {'(RPA)' if use_rpa else '(contiguous)'}")
-    print(f"  {'First step:':<20s} {avg_first_ms:.2f} ms  (includes data transfer)")
-    print(f"  {'Steady-state:':<20s} {avg_steady_ms:.2f} ms/step")
-    print(f"  {'All steps avg:':<20s} {avg_all_ms:.2f} ms/step")
-    print(f"  {'Throughput:':<20s} {tokens_per_sec:,.0f} tok/s  (steady-state)")
-    print(f"  {'TPS/chip:':<20s} {tps_per_chip:,.1f} tok/s/chip")
-    print(f"  {'Decode steps:':<20s} {n_decode_steps}")
-    print(f"  {'Total wall time:':<20s} {elapsed_total*1000:.0f} ms ({n_runs} runs)")
+    print(f"  {'Async dispatch:':<25s} {avg_steady_ms:.2f} ms/step  (pipelined)")
+    print(f"  {'Throughput:':<25s} {tokens_per_sec:,.0f} tok/s")
+    print(f"  {'TPS/chip:':<25s} {tps_per_chip:,.1f} tok/s/chip  ({n_chips} chips)")
+    print(f"  {'Decode steps:':<25s} {n_decode_steps}")
+    print(f"  {'Total wall time:':<25s} {elapsed_total*1000:.0f} ms ({n_runs} runs)")
+    for i, rt in enumerate(async_run_times):
+        print(f"    Run {i}: {rt:.0f} ms ({rt/n_decode_steps:.1f} ms/step)")
+    print(f"\n  SYNC COMPARISON (1 run, per-step block_until_ready)")
+    print(f"  {'Sync step time:':<25s} {avg_sync_ms:.2f} ms/step")
+    print(f"  {'  dispatch:':<25s} {avg_dispatch_ms:.2f} ms")
+    print(f"  {'  block:':<25s} {avg_sync_ms - avg_dispatch_ms:.2f} ms")
+    print(f"  {'Async speedup:':<25s} {avg_sync_ms / avg_steady_ms:.1f}x")
     return avg_all_ms, avg_steady_ms, tokens_per_sec
 
 
@@ -481,6 +577,11 @@ def main():
                              'Tracing can be slow for large models — use --chunk-size 32 for faster analysis.')
     parser.add_argument('--use-rpa', action='store_true',
                         help='Use RPA v3 kernel for GQA decode (paged KV cache).')
+    parser.add_argument('--scan-mode', default='scan', choices=['scan', 'unrolled'],
+                        help='Group iteration strategy: scan (default) uses lax.scan; '
+                             'unrolled uses Python for-loop inside JIT to avoid XLA copy insertion OOM.')
+    parser.add_argument('--moe-backend', default='ragged_dot', choices=['ragged_dot', 'gmm'],
+                        help='MoE expert matmul backend: ragged_dot (XLA) or gmm (Pallas kernel).')
     args = parser.parse_args()
 
     if args.max_seq_len is None:
@@ -523,6 +624,7 @@ def main():
     print(f"  Runs:           {args.n_runs}")
     print(f"  Profile:        {args.profile}")
     print(f"  RPA decode:     {args.use_rpa}")
+    print(f"  Scan mode:      {args.scan_mode}")
 
     # Initialize model
     use_fp8 = args.dtype == 'fp8'
@@ -788,6 +890,8 @@ def main():
             run_prefill_benchmark(
                 params, cfg, cache, tokens, cache_sharding,
                 args.n_runs, args.profile, mesh, n_devices=n_ep_devices,
+                scan_mode=args.scan_mode,
+                moe_backend=args.moe_backend,
             )
 
         if not args.skip_decode:
@@ -799,7 +903,30 @@ def main():
                 params, cfg, cache, prompt, args.decode_steps, cache_sharding,
                 args.n_runs, args.profile, mesh, n_devices=n_ep_devices,
                 use_rpa=args.use_rpa,
+                scan_mode=args.scan_mode,
+                moe_backend=args.moe_backend,
             )
+
+    # Post-benchmark peak memory report
+    try:
+        dev = jax.local_devices()[0]
+        stats = dev.memory_stats()
+        if stats:
+            print(f"\n{'='*70}")
+            print("PEAK HBM AFTER BENCHMARKS")
+            print(f"{'='*70}")
+            print(f"    Device {dev.id}:")
+            peak = stats.get('peak_bytes_in_use', 0)
+            current = stats.get('bytes_in_use', 0)
+            limit = stats.get('bytes_limit', 0)
+            print(f"      peak_bytes_in_use:  {peak/1e9:.3f} GB")
+            print(f"      bytes_in_use:       {current/1e9:.3f} GB")
+            print(f"      bytes_limit:        {limit/1e9:.3f} GB")
+            print(f"      peak utilization:   {100*peak/limit:.1f}%" if limit else "")
+            hlo_temps = peak - current
+            print(f"      HLO temps (peak - current): {hlo_temps/1e9:.3f} GB")
+    except Exception as e:
+        print(f"    (peak memory stats unavailable: {e})")
 
     print(f"\n{'='*70}")
     print("DONE")

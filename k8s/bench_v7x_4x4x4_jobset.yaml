@@ -1,25 +1,26 @@
-# RPA decode debug: 4-layer (1 group) on v7x-64 — minimal flags.
+# Qwen3.5-397B decode benchmark on 4×4×4 v7x (ehorning-ironwood)
 #
-# Purpose: Test if RPA decode actually works on v7x with shard_map + scan.
-# No XLA dump flags — just the baseline sparsecore offload flags.
+# Topology:  4×4×4 v7x = 64 chips = 16 hosts × 4 chips (tpu7x-standard-4t)
+# Sharding:  TP=8, DP=16 (64 chips / 8 TP = 8 DP ... wait, 64/8=8 DP)
+#            Actually: 128 devices (2 TC/chip), TP=8, DP=16
+#
+# No Kueue on this cluster — no queue labels needed.
 #
 # Deploy:
-#   kubectl apply -f k8s/bench_v7x_rpa_debug_jobset.yaml
+#   kubectl apply -f k8s/bench_v7x_4x4x4_jobset.yaml
 #
 # Monitor:
-#   kubectl logs -l app=qwen35-rpa-debug --prefix=true -f
+#   kubectl logs -l app=qwen35-bench-4x4x4 --prefix=true -f --max-log-requests=16
 #
 # Cleanup:
-#   kubectl delete jobset qwen35-rpa-debug
+#   kubectl delete jobset qwen35-bench-4x4x4
 
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: qwen35-rpa-debug
+  name: qwen35-bench-4x4x4
   namespace: default
-  labels:
-    kueue.x-k8s.io/queue-name: multislice-queue
   annotations:
     alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
 spec:
@@ -30,42 +31,42 @@ spec:
       replicas: 1
       template:
         spec:
-          completions: 8
-          parallelism: 8
+          completions: 16
+          parallelism: 16
           completionMode: Indexed
           backoffLimit: 0
           template:
             metadata:
               labels:
-                app: qwen35-rpa-debug
+                app: qwen35-bench-4x4x4
             spec:
               restartPolicy: Never
               nodeSelector:
                 cloud.google.com/gke-tpu-accelerator: tpu7x
-                cloud.google.com/gke-tpu-topology: 2x4x4
+                cloud.google.com/gke-tpu-topology: 4x4x4
               containers:
                 - name: bench
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v59
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v66
                   imagePullPolicy: Always
                   command: ["python", "scripts/qwen35_benchmark.py"]
                   args:
                     - "--config=full"
                     - "--dtype=fp8"
                     - "--sharding=B"
-                    - "--batch-size=128"
+                    - "--batch-size=256"
                     - "--prompt-len=1024"
                     - "--decode-steps=32"
-                    - "--dp=8"
-                    - "--n-layers=4"
-                    - "--n-runs=1"
+                    - "--dp=16"
+                    - "--n-runs=3"
                     - "--use-rpa"
                     - "--skip-prefill"
+                    - "--scan-mode=unrolled"
                     - "--profile"
                   env:
                     - name: PYTHONUNBUFFERED
                       value: "1"
                     - name: PROFILE_DIR
-                      value: "gs://max-experiments/profiles/qwen35-rpa-debug-v59"
+                      value: "gs://sivaibhav-exp/qwen-profiles/v66-4x4x4-bs256"
                     - name: LIBTPU_INIT_ARGS
                       value: "--xla_tpu_offload_gather_to_sparsecore=true --xla_tpu_enable_offloading_scatter_to_sparsecore=true --xla_tpu_enable_offloading_sort_to_sparsecore=true"
                   resources:

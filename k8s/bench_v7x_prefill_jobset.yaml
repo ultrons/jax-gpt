@@ -1,22 +1,23 @@
-# RPA decode debug: 4-layer (1 group) on v7x-64 — minimal flags.
+# v66 baseline: clean BS=256 prefill profile for headroom analysis
 #
-# Purpose: Test if RPA decode actually works on v7x with shard_map + scan.
-# No XLA dump flags — just the baseline sparsecore offload flags.
+# Prefill-only benchmark (--skip-decode). No RPA needed for prefill.
+# Uses scan mode (not unrolled) — unrolled OOMs on program size (788MB > 778MB limit).
+# Profile saved to GCS for xprof analysis.
 #
 # Deploy:
-#   kubectl apply -f k8s/bench_v7x_rpa_debug_jobset.yaml
+#   kubectl apply -f k8s/bench_v7x_prefill_jobset.yaml
 #
 # Monitor:
-#   kubectl logs -l app=qwen35-rpa-debug --prefix=true -f
+#   kubectl logs -l app=qwen35-prefill --prefix=true -f --max-log-requests=8
 #
 # Cleanup:
-#   kubectl delete jobset qwen35-rpa-debug
+#   kubectl delete jobset qwen35-prefill
 
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: qwen35-rpa-debug
+  name: qwen35-prefill
   namespace: default
   labels:
     kueue.x-k8s.io/queue-name: multislice-queue
@@ -37,7 +38,7 @@ spec:
           template:
             metadata:
               labels:
-                app: qwen35-rpa-debug
+                app: qwen35-prefill
             spec:
               restartPolicy: Never
               nodeSelector:
@@ -45,27 +46,25 @@ spec:
                 cloud.google.com/gke-tpu-topology: 2x4x4
               containers:
                 - name: bench
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v59
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v66
                   imagePullPolicy: Always
                   command: ["python", "scripts/qwen35_benchmark.py"]
                   args:
                     - "--config=full"
                     - "--dtype=fp8"
                     - "--sharding=B"
-                    - "--batch-size=128"
+                    - "--batch-size=256"
                     - "--prompt-len=1024"
-                    - "--decode-steps=32"
                     - "--dp=8"
-                    - "--n-layers=4"
-                    - "--n-runs=1"
-                    - "--use-rpa"
-                    - "--skip-prefill"
+                    - "--n-runs=3"
+                    - "--skip-decode"
+                    - "--scan-mode=scan"
                     - "--profile"
                   env:
                     - name: PYTHONUNBUFFERED
                       value: "1"
                     - name: PROFILE_DIR
-                      value: "gs://max-experiments/profiles/qwen35-rpa-debug-v59"
+                      value: "gs://sivaibhav-exp/qwen-profiles/v66-bs256-prefill"
                     - name: LIBTPU_INIT_ARGS
                       value: "--xla_tpu_offload_gather_to_sparsecore=true --xla_tpu_enable_offloading_scatter_to_sparsecore=true --xla_tpu_enable_offloading_sort_to_sparsecore=true"
                   resources:

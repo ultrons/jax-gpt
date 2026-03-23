@@ -16,17 +16,14 @@ from jax_gpt.models.qwen35.fp8 import FP8_DTYPE, FP8_MAX
 
 
 def _quantize_weight(w: jax.Array) -> dict:
-    """Quantize a weight matrix to fp8 with per-row scale.
+    """Quantize a 2D weight matrix to fp8 with per-row scale.
 
     Our weights are stored as (in, out). We transpose to (out, in) for
     fp8_matmul which does x @ w^T, then quantize per-row of (out, in).
 
-    For 3D+ expert weights (E, in, out), we transpose last two dims
-    to (E, out, in) and quantize per-row.
-
     Returns:
-        {'w': fp8 in (out, in) or (E, out, in) layout,
-         'scale_inv': per-row inverse scale}
+        {'w': fp8 in (out, in) layout,
+         'scale_inv': (out, 1) inverse scale}
     """
     # Transpose last two dims: (..., in, out) -> (..., out, in) for fp8_matmul
     # Works for any number of leading (stacked/scan) dimensions
@@ -38,6 +35,25 @@ def _quantize_weight(w: jax.Array) -> dict:
     amax = jnp.max(jnp.abs(w_t), axis=-1, keepdims=True)
     scale = jnp.maximum(amax / FP8_MAX, jnp.finfo(jnp.float32).tiny)
     w_fp8 = (w_t / scale).astype(FP8_DTYPE)
+    scale_inv = (1.0 / scale).astype(jnp.float32)
+    return {'w': w_fp8, 'scale_inv': scale_inv}
+
+
+def _quantize_expert_weight(w: jax.Array) -> dict:
+    """Quantize expert weight to fp8 in ragged_dot layout.
+
+    Expert weights are (*, E, K, N) — kept in this layout (no transpose).
+    Quantized per-output-feature: scale computed over K dim (axis=-2).
+
+    Returns:
+        {'w': fp8 in (*, E, K, N) layout,
+         'scale_inv': (*, E, 1, N) inverse scale}
+    """
+    w_f = w.astype(jnp.float32)
+    # Per-output-feature: max over K (reduction) dimension
+    amax = jnp.max(jnp.abs(w_f), axis=-2, keepdims=True)
+    scale = jnp.maximum(amax / FP8_MAX, jnp.finfo(jnp.float32).tiny)
+    w_fp8 = (w_f / scale).astype(FP8_DTYPE)
     scale_inv = (1.0 / scale).astype(jnp.float32)
     return {'w': w_fp8, 'scale_inv': scale_inv}
 
@@ -72,12 +88,24 @@ def quantize_params_fp8(params: dict) -> dict:
     - Regular: x @ params['weight']  (when weight is a plain array)
     - FP8: fp8_matmul(x, params['weight']['w'], params['weight']['scale_inv'])
     """
+    # Routed expert weight keys (NOT shared_*) — stored in ragged_dot layout
+    _expert_keys = {'gate_proj', 'up_proj', 'down_proj'}
+
+    def _is_routed_expert(path_str, shape):
+        parts = path_str.split('.')
+        last = parts[-1] if parts else ''
+        return (last in _expert_keys
+                and len(shape) >= 3
+                and not any('shared' in p for p in parts))
+
     def _maybe_quantize(path, leaf):
         path_str = '.'.join(
             str(k).strip("[]'.\"") for k in path
             if not str(k).strip("[]'.\"").isdigit()
         )
         if _should_quantize(path_str, leaf.shape):
+            if _is_routed_expert(path_str, leaf.shape):
+                return _quantize_expert_weight(leaf)
             return _quantize_weight(leaf)
         return leaf
 

@@ -12,8 +12,12 @@ Three passes = 48 MB/batch/layer. With 45 DeltaNet layers, that's 2.1 GB/batch.
 This kernel reads the state ONCE, computes all three operations in VMEM,
 and writes the updated state back — reducing HBM traffic by ~3x.
 
+Grid: (B,) — one kernel invocation per batch element.
+Each invocation processes all H heads. State tile = (H, dk, dv) = 512 KB @ f32
+for H=8, dk=dv=128, fitting comfortably in TPU VMEM (16+ MB/core).
+
 Usage:
-    output, new_state = fused_deltanet_step(
+    new_state, output = fused_deltanet_step(
         state, q, k, v, g_factor, beta,
     )
     # Replaces lines 180-193 of deltanet.py
@@ -21,58 +25,67 @@ Usage:
 
 from __future__ import annotations
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 
 def _fused_deltanet_kernel(
     # Inputs (read-only refs)
-    state_ref,      # [dk, dv] — one (batch, head) slice of state
-    q_ref,          # [dk]
-    k_ref,          # [dk]
-    v_ref,          # [dv]
-    g_factor_ref,   # [] scalar — exp(g), the decay factor
-    beta_ref,       # [] scalar — sigmoid gate
+    state_ref,      # [H, dk, dv]
+    q_ref,          # [H, dk]
+    k_ref,          # [H, dk]
+    v_ref,          # [H, dv]
+    g_factor_ref,   # [H, 1]
+    beta_ref,       # [H, 1]
     # Outputs (write refs)
-    new_state_ref,  # [dk, dv]
-    output_ref,     # [dv]
+    new_state_ref,  # [H, dk, dv]
+    output_ref,     # [H, dv]
 ):
     """Pallas kernel body: fused decay + readout + rank-1 update + query.
 
-    Processes one (batch, head) slice. Grid maps over (B, H).
-
-    For dk=128, dv=128: state tile is 128×128 = 16K f32 values = 64 KB.
-    This fits comfortably in TPU VMEM (16+ MB per core).
+    Processes one batch element, all H heads.
+    Uses matmul (1,dk) @ (dk,dv) → (1,dv) per head for TPU compatibility.
     """
-    # Load inputs into VMEM and squeeze grid dims (1, 1, ...) → (...)
-    state = state_ref[0, 0]          # [dk, dv] f32
-    q = q_ref[0, 0]                  # [dk] f32
-    k = k_ref[0, 0]                  # [dk] f32
-    v = v_ref[0, 0]                  # [dv] f32
-    g = g_factor_ref[0, 0]           # [] f32
-    beta = beta_ref[0, 0]            # [] f32
+    H = state_ref.shape[1]
 
-    # Step 1: Decay state
-    state = state * g               # [dk, dv]
+    for h in range(H):
+        state = state_ref[0, h]           # [dk, dv] f32
+        q = q_ref[0, h]                   # [dk] f32
+        k = k_ref[0, h]                   # [dk] f32
+        v = v_ref[0, h]                   # [dv] f32
+        g = g_factor_ref[0, h, 0]         # scalar f32
+        beta = beta_ref[0, h, 0]          # scalar f32
 
-    # Step 2: Readout — kv_mem = state.T @ k (contract over dk)
-    kv_mem = jnp.dot(k, state)      # [dv] = [dk] . [dk, dv]
+        # Step 1: Decay state
+        state = state * g                 # [dk, dv]
 
-    # Step 3: Gated delta
-    delta = (v - kv_mem) * beta      # [dv]
+        # Step 2: Readout — kv_mem[v] = sum_k(k[k] * state[k,v])
+        # TPU Pallas requires 2D+ operands for dot_general.
+        # (1, dk) @ (dk, dv) → (1, dv), then squeeze.
+        kv_mem = jax.lax.dot_general(
+            k[None, :], state,
+            dimension_numbers=(((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )[0]  # [dv]
 
-    # Step 4: Rank-1 update — state += outer(k, delta)
-    state = state + k[:, None] * delta[None, :]  # [dk, dv]
+        # Step 3: Gated delta
+        delta = (v - kv_mem) * beta       # [dv]
 
-    # Step 5: Query output — output = new_state.T @ q (contract over dk)
-    output = jnp.dot(q, state)       # [dv] = [dk] . [dk, dv]
+        # Step 4: Rank-1 update — state += outer(k, delta)
+        state = state + k[:, None] * delta[None, :]  # [dk, dv]
 
-    # Write outputs
-    new_state_ref[0, 0] = state
-    output_ref[0, 0] = output
+        # Step 5: Query output — output[v] = sum_k(q[k] * state[k,v])
+        output = jax.lax.dot_general(
+            q[None, :], state,
+            dimension_numbers=(((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )[0]  # [dv]
+
+        # Write outputs for this head
+        new_state_ref[0, h] = state
+        output_ref[0, h] = output
 
 
 def fused_deltanet_step(
@@ -101,36 +114,43 @@ def fused_deltanet_step(
         beta: (B, H) gate = sigmoid(b).
 
     Returns:
-        (output, new_state)
-        output: (B, H, dv) f32
+        (new_state, output)
         new_state: (B, H, dk, dv) f32
+        output: (B, H, dv) f32
     """
     B, H, dk, dv = state.shape
 
-    return pl.pallas_call(
+    # Reshape g_factor/beta to (B, H, 1) for TPU tiling alignment:
+    # block (H, 1) → last two dims (H, 1), H%8=0 ✓, 1==array_dim ✓
+    g_3d = g_factor[..., None]    # (B, H, 1)
+    beta_3d = beta[..., None]     # (B, H, 1)
+
+    new_state, output = pl.pallas_call(
         _fused_deltanet_kernel,
         out_shape=[
             jax.ShapeDtypeStruct((B, H, dk, dv), jnp.float32),  # new_state
             jax.ShapeDtypeStruct((B, H, dv), jnp.float32),      # output
         ],
-        grid=(B, H),
+        grid=(B,),
         in_specs=[
-            pl.BlockSpec((1, 1, dk, dv), lambda b, h: (b, h, 0, 0)),   # state
-            pl.BlockSpec((1, 1, dk), lambda b, h: (b, h, 0)),           # q
-            pl.BlockSpec((1, 1, dk), lambda b, h: (b, h, 0)),           # k
-            pl.BlockSpec((1, 1, dv), lambda b, h: (b, h, 0)),           # v
-            pl.BlockSpec((1, 1), lambda b, h: (b, h)),                  # g_factor
-            pl.BlockSpec((1, 1), lambda b, h: (b, h)),                  # beta
+            pl.BlockSpec((1, H, dk, dv), lambda b: (b, 0, 0, 0)),  # state
+            pl.BlockSpec((1, H, dk), lambda b: (b, 0, 0)),          # q
+            pl.BlockSpec((1, H, dk), lambda b: (b, 0, 0)),          # k
+            pl.BlockSpec((1, H, dv), lambda b: (b, 0, 0)),          # v
+            pl.BlockSpec((1, H, 1), lambda b: (b, 0, 0)),           # g_factor
+            pl.BlockSpec((1, H, 1), lambda b: (b, 0, 0)),           # beta
         ],
         out_specs=[
-            pl.BlockSpec((1, 1, dk, dv), lambda b, h: (b, h, 0, 0)),   # new_state
-            pl.BlockSpec((1, 1, dv), lambda b, h: (b, h, 0)),           # output
+            pl.BlockSpec((1, H, dk, dv), lambda b: (b, 0, 0, 0)),  # new_state
+            pl.BlockSpec((1, H, dv), lambda b: (b, 0, 0)),          # output
         ],
-        compiler_params=dict(mosaic=dict(
-            dimension_semantics=("parallel", "parallel"),
-        )),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+        ),
         name="fused_deltanet_step",
-    )(state, q, k, v, g_factor, beta)
+    )(state, q, k, v, g_3d, beta_3d)
+
+    return new_state, output
 
 
 def fused_deltanet_step_ref(

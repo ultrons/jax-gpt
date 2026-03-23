@@ -141,11 +141,9 @@ def matmul_maybe_fp8(x: jax.Array, w) -> jax.Array:
             # w_fp8 already in (out, in) layout from quantize
             return fp8_matmul(x, w_fp8, scale_inv)
         else:
-            # 3D+ expert weights (E, out, in): dequant + transpose back
-            # for ragged_dot which expects (E, in, out)
-            w_dequant = (w_fp8.astype(jnp.float32) * scale_inv)
-            if w_dequant.ndim == 3:
-                w_dequant = jnp.transpose(w_dequant, (0, 2, 1))  # (E, in, out)
+            # 3D+ expert weights stored in ragged_dot layout (E, K, N)
+            # with scale_inv (E, 1, N). Dequant: w_fp8 / scale_inv.
+            w_dequant = w_fp8.astype(jnp.float32) / scale_inv
             return (x @ w_dequant.astype(x.dtype))
     return x @ w
 

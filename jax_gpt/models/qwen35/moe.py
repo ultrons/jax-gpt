@@ -3,17 +3,25 @@
 Single-device: uses ragged_dot over all experts directly.
 Multi-device (EP): shard_map + psum following MaxText/Megablox pattern.
 Each device handles its local expert shard — no all-gather of weights.
+
+Supports two MoE backends via `moe_backend` parameter:
+- 'ragged_dot' (default): Uses jax.lax.ragged_dot (XLA-compiled).
+- 'gmm': Uses megablox gmm_v2 Pallas kernel. Bypasses XLA tiling —
+  reads HBM directly, eliminating squeeze/retiling overhead in decode.
 """
 
 from __future__ import annotations
 
 from functools import partial
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8, FP8_DTYPE, dynamic_quantize_fp8
+
+MoeBackend = Literal['ragged_dot', 'gmm']
 
 
 def _get_n_experts(gate_weight) -> int:
@@ -24,12 +32,13 @@ def _get_n_experts(gate_weight) -> int:
 
 
 def _get_expert_weight(w, dtype=None):
-    """Extract raw array from fp8 dict if quantized, for ragged_dot."""
+    """Extract raw array from fp8 dict if quantized, for ragged_dot.
+
+    Expert weights are stored in ragged_dot layout (E, K, N) with
+    scale_inv (E, 1, N). Dequant: w_real = w_fp8 / scale_inv.
+    """
     if isinstance(w, dict) and 'w' in w:
-        w_f = (w['w'].astype(jnp.float32) * w['scale_inv'])
-        axes = list(range(w_f.ndim))
-        axes[-2], axes[-1] = axes[-1], axes[-2]
-        w_f = jnp.transpose(w_f, axes)
+        w_f = w['w'].astype(jnp.float32) / w['scale_inv']
         return w_f.astype(dtype) if dtype is not None else w_f
     return w
 
@@ -40,14 +49,14 @@ def _is_fp8_weight(w) -> bool:
 
 
 def _fp8_expert_components(w):
-    """Extract fp8 weight in ragged_dot layout (E, K, N) + rescale factor.
+    """Extract fp8 weight + rescale factor for native fp8 ragged_dot.
 
-    Stored: (E, N, K) fp8 + (E, N, 1) scale_inv where scale_inv = 1/scale.
-    Dequant: w_real = w_fp8 * scale = w_fp8 / scale_inv.
-    Returns: (E, K, N) fp8, (E, N) rescale factor (= 1/scale_inv = scale).
+    Expert weights stored in ragged_dot layout (E, K, N) fp8 with
+    scale_inv (E, 1, N) where scale_inv = 1/scale.
+    Returns: (E, K, N) fp8 (no copy), (E, N) rescale factor (= scale).
     """
-    w_fp8 = jnp.transpose(w['w'], (0, 2, 1))
-    w_scale = (1.0 / w['scale_inv']).squeeze(-1)
+    w_fp8 = w['w']  # already in ragged_dot layout
+    w_scale = (1.0 / w['scale_inv']).squeeze(-2)
     return w_fp8, w_scale
 
 
@@ -62,6 +71,48 @@ def _fp8_ragged_dot_rescaled(x_fp8, x_scale, w_fp8, group_sizes, w_scale,
     w_scale_per_token = jnp.repeat(
         w_scale, group_sizes, axis=0, total_repeat_length=n_tokens)
     return out * w_scale_per_token
+
+
+def _fp8_gmm_components(w):
+    """Extract fp8 weight + rhs_scale in gmm_v2 format.
+
+    Expert weights stored as {'w': (E,K,N) fp8, 'scale_inv': (E,1,N) float32}.
+    gmm_v2 expects rhs_scale: (E, num_blocks, 1, N). Our weights use a single
+    scale block (block_size = K), so num_blocks = 1.
+    """
+    w_fp8 = w['w']  # (E, K, N) fp8
+    # scale_inv = 1/scale → scale = 1/scale_inv → rhs_scale (E, 1, 1, N)
+    rhs_scale = (1.0 / w['scale_inv']).reshape(
+        w_fp8.shape[0], 1, 1, w_fp8.shape[2])
+    return w_fp8, rhs_scale
+
+
+def _gmm_matmul(x, w, group_sizes, rhs_scale=None, group_offset=None):
+    """Single gmm_v2 matmul. Lazy-imported to avoid top-level Pallas import."""
+    from jax_gpt.models.qwen35.megablox import gmm_v2
+    return gmm_v2(
+        x, w, group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        maybe_quantize_lhs=rhs_scale is not None,
+    )
+
+
+def _expert_swiglu_gmm(x_sorted, group_sizes, gate_w, up_w, down_w,
+                         gate_scale=None, up_scale=None, down_scale=None,
+                         group_offset=None):
+    """SwiGLU expert computation via gmm_v2 Pallas kernel.
+
+    When rhs_scale is provided, gmm_v2 handles lhs quantization and
+    rescaling internally — no manual dynamic_quantize_fp8 needed.
+    """
+    gate_out = jax.nn.silu(
+        _gmm_matmul(x_sorted, gate_w, group_sizes, gate_scale, group_offset))
+    up_out = _gmm_matmul(
+        x_sorted, up_w, group_sizes, up_scale, group_offset)
+    intermediate = (gate_out * up_out).astype(x_sorted.dtype)
+    return _gmm_matmul(
+        intermediate, down_w, group_sizes, down_scale, group_offset)
 
 
 def moe_routing(
@@ -145,18 +196,25 @@ def expert_forward_single(
     expert_indices: jax.Array,
     expert_weights: jax.Array,
     gate_proj, up_proj, down_proj,
+    moe_backend: MoeBackend = 'ragged_dot',
 ) -> jax.Array:
     """Single-device expert computation. No collectives."""
     M, D = x.shape
+    swiglu_fn = _expert_swiglu_gmm if moe_backend == 'gmm' else _expert_swiglu
 
     if _is_fp8_weight(gate_proj):
-        gate_fp8, gate_s = _fp8_expert_components(gate_proj)
-        up_fp8, up_s = _fp8_expert_components(up_proj)
-        down_fp8, down_s = _fp8_expert_components(down_proj)
+        if moe_backend == 'gmm':
+            gate_fp8, gate_s = _fp8_gmm_components(gate_proj)
+            up_fp8, up_s = _fp8_gmm_components(up_proj)
+            down_fp8, down_s = _fp8_gmm_components(down_proj)
+        else:
+            gate_fp8, gate_s = _fp8_expert_components(gate_proj)
+            up_fp8, up_s = _fp8_expert_components(up_proj)
+            down_fp8, down_s = _fp8_expert_components(down_proj)
         n_experts = gate_fp8.shape[0]
         x_sorted, group_sizes, sorted_weights, sorted_token_ids = (
             _sort_and_group(x, expert_indices, expert_weights, n_experts))
-        expert_out = _expert_swiglu(
+        expert_out = swiglu_fn(
             x_sorted, group_sizes,
             gate_fp8, up_fp8, down_fp8, gate_s, up_s, down_s)
         return _scatter_back(
@@ -170,17 +228,18 @@ def expert_forward_single(
     x_sorted, group_sizes, sorted_weights, sorted_token_ids = _sort_and_group(
         x, expert_indices, expert_weights, n_experts,
     )
-    expert_out = _expert_swiglu(x_sorted, group_sizes, gate_w, up_w, down_w)
+    expert_out = swiglu_fn(x_sorted, group_sizes, gate_w, up_w, down_w)
     return _scatter_back(expert_out, sorted_weights, sorted_token_ids, M, D, x.dtype)
 
 
 def _ep_inner_body(x, indices, weights, k, axis_name,
                     gate_w, up_w, down_w,
-                    gate_s=None, up_s=None, down_s=None):
+                    gate_s=None, up_s=None, down_s=None,
+                    moe_backend: MoeBackend = 'ragged_dot'):
     """Core EP expert logic, called inside shard_map.
 
-    When scales are provided, gate_w/up_w/down_w are fp8 in (E, K, N) layout
-    and native fp8 ragged_dot is used.
+    When scales are provided, gate_w/up_w/down_w are fp8 in (E, K, N) layout.
+    moe_backend selects ragged_dot (XLA) or gmm (Pallas kernel).
     """
     my_idx = jax.lax.axis_index(axis_name)
     e_local = gate_w.shape[0]
@@ -200,9 +259,14 @@ def _ep_inner_body(x, indices, weights, k, axis_name,
     group_sizes = jnp.zeros(e_local, dtype=jnp.int32)
     group_sizes = group_sizes.at[local_idx].add(valid.astype(jnp.int32))
 
-    expert_out = _expert_swiglu(x_sorted, group_sizes,
-                                 gate_w, up_w, down_w,
-                                 gate_s, up_s, down_s)
+    if moe_backend == 'gmm':
+        expert_out = _expert_swiglu_gmm(x_sorted, group_sizes,
+                                         gate_w, up_w, down_w,
+                                         gate_s, up_s, down_s)
+    else:
+        expert_out = _expert_swiglu(x_sorted, group_sizes,
+                                     gate_w, up_w, down_w,
+                                     gate_s, up_s, down_s)
 
     sorted_valid = valid[order]
     expert_out = jnp.where(sorted_valid[:, None], expert_out, 0.0)
@@ -221,18 +285,16 @@ def expert_forward_ep(
     gate_proj, up_proj, down_proj,
     mesh,
     axis_name: str = 'tp',
+    moe_backend: MoeBackend = 'ragged_dot',
 ) -> jax.Array:
     """Expert-parallel MoE using shard_map.
 
     Memory-efficient implementation following MaxText/Megablox pattern:
     - x (M, D) is passed replicated into shard_map — only ~1 GB all-gather
       instead of the old approach which all-gathered the expanded (M*k, D)
-    - Sort, gather, and ragged_dot happen INSIDE shard_map per device
+    - Sort, gather, and ragged_dot/gmm happen INSIDE shard_map per device
     - Each device processes all tokens against its local expert shard
     - psum combines results across EP devices
-
-    When expert weights are fp8, uses native fp8 ragged_dot (2x FLOPS on v5p+)
-    instead of dequantizing before matmul.
 
     Args:
         x: (M, D) tokens.
@@ -241,6 +303,7 @@ def expert_forward_ep(
         gate_proj, up_proj, down_proj: expert weights sharded along expert dim.
         mesh: device mesh.
         axis_name: mesh axis for EP.
+        moe_backend: 'ragged_dot' or 'gmm'.
     """
     from jax.experimental.shard_map import shard_map
 
@@ -260,20 +323,29 @@ def expert_forward_ep(
     w3d = P(axis_name, None, None)
 
     if _is_fp8_weight(gate_proj):
-        gate_fp8, gate_s = _fp8_expert_components(gate_proj)
-        up_fp8, up_s = _fp8_expert_components(up_proj)
-        down_fp8, down_s = _fp8_expert_components(down_proj)
-        w2d = P(axis_name, None)
+        if moe_backend == 'gmm':
+            gate_fp8, gate_s = _fp8_gmm_components(gate_proj)
+            up_fp8, up_s = _fp8_gmm_components(up_proj)
+            down_fp8, down_s = _fp8_gmm_components(down_proj)
+            # gmm rhs_scale is 4D: (E, num_blocks, 1, N)
+            w_scale_spec = P(axis_name, None, None, None)
+        else:
+            gate_fp8, gate_s = _fp8_expert_components(gate_proj)
+            up_fp8, up_s = _fp8_expert_components(up_proj)
+            down_fp8, down_s = _fp8_expert_components(down_proj)
+            # ragged_dot scale is 2D: (E, N)
+            w_scale_spec = P(axis_name, None)
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(act_pspec, act_pspec, act_pspec,
-                           w3d, w2d, w3d, w2d, w3d, w2d),
+                           w3d, w_scale_spec, w3d, w_scale_spec, w3d, w_scale_spec),
                  out_specs=act_pspec,
                  check_rep=False)
         def _expert_fn(x, indices, weights,
                         lg, lgs, lu, lus, ld, lds):
             return _ep_inner_body(x, indices, weights, k, axis_name,
-                                  lg, lu, ld, lgs, lus, lds)
+                                  lg, lu, ld, lgs, lus, lds,
+                                  moe_backend=moe_backend)
 
         return _expert_fn(x, expert_indices, expert_weights,
                           gate_fp8, gate_s, up_fp8, up_s, down_fp8, down_s)
@@ -289,7 +361,8 @@ def expert_forward_ep(
              check_rep=False)
     def _expert_fn(x, indices, weights, local_gate, local_up, local_down):
         return _ep_inner_body(x, indices, weights, k, axis_name,
-                              local_gate, local_up, local_down)
+                              local_gate, local_up, local_down,
+                              moe_backend=moe_backend)
 
     return _expert_fn(x, expert_indices, expert_weights,
                       gate_w, up_w, down_w)
@@ -312,12 +385,16 @@ def moe_layer(
     n_devices: int = 1,
     axis_name: str = 'tp',
     mesh=None,
+    moe_backend: MoeBackend = 'ragged_dot',
 ) -> jax.Array:
     """Full MoE layer: route + routed experts + shared expert.
 
     When n_devices > 1 and mesh is provided, uses shard_map EP.
     Expert weights are never all-gathered — each device only computes on
     its local expert shard.
+
+    Args:
+        moe_backend: 'ragged_dot' (XLA) or 'gmm' (Pallas kernel).
     """
     B, T, D = x.shape
     M = B * T
@@ -334,11 +411,13 @@ def moe_layer(
                 x_flat, expert_indices, expert_weights,
                 params['gate_proj'], params['up_proj'], params['down_proj'],
                 mesh=mesh, axis_name=axis_name,
+                moe_backend=moe_backend,
             )
         else:
             routed_out = expert_forward_single(
                 x_flat, expert_indices, expert_weights,
                 params['gate_proj'], params['up_proj'], params['down_proj'],
+                moe_backend=moe_backend,
             )
 
     with jax.named_scope('moe_shared_expert'):

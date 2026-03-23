@@ -1,22 +1,26 @@
-# RPA decode debug: 4-layer (1 group) on v7x-64 — minimal flags.
+# v70: Fully rank-preserving slicing for ALL group params
 #
-# Purpose: Test if RPA decode actually works on v7x with shard_map + scan.
-# No XLA dump flags — just the baseline sparsecore offload flags.
+# Key change: ALL group params (not just MoE) are merged via
+# _merge_batch_dims before the unrolled loop:
+#   delta_layers (15,3,...) → (15*3*C0, ...) with dynamic_slice (same rank)
+#   gqa_layer    (15,...)   → (15*C0, ...)   with dynamic_slice (same rank)
+# block.py now receives complete per-layer param dicts directly — no inner
+# a[i] slicing at all. This should eliminate ALL slice_bitcast_fusion ops.
 #
 # Deploy:
-#   kubectl apply -f k8s/bench_v7x_rpa_debug_jobset.yaml
+#   kubectl apply -f k8s/bench_v70_rankpreserve_decode_jobset.yaml
 #
 # Monitor:
-#   kubectl logs -l app=qwen35-rpa-debug --prefix=true -f
+#   kubectl logs -l app=qwen35-v70-decode --prefix=true -f --max-log-requests=8
 #
 # Cleanup:
-#   kubectl delete jobset qwen35-rpa-debug
+#   kubectl delete jobset qwen35-v70-decode
 
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: qwen35-rpa-debug
+  name: qwen35-v70-decode
   namespace: default
   labels:
     kueue.x-k8s.io/queue-name: multislice-queue
@@ -37,7 +41,7 @@ spec:
           template:
             metadata:
               labels:
-                app: qwen35-rpa-debug
+                app: qwen35-v70-decode
             spec:
               restartPolicy: Never
               nodeSelector:
@@ -45,27 +49,28 @@ spec:
                 cloud.google.com/gke-tpu-topology: 2x4x4
               containers:
                 - name: bench
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v59
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v70
                   imagePullPolicy: Always
                   command: ["python", "scripts/qwen35_benchmark.py"]
                   args:
                     - "--config=full"
                     - "--dtype=fp8"
                     - "--sharding=B"
-                    - "--batch-size=128"
+                    - "--batch-size=256"
                     - "--prompt-len=1024"
                     - "--decode-steps=32"
                     - "--dp=8"
-                    - "--n-layers=4"
-                    - "--n-runs=1"
+                    - "--n-runs=3"
                     - "--use-rpa"
                     - "--skip-prefill"
+                    - "--scan-mode=unrolled"
+                    - "--moe-backend=gmm"
                     - "--profile"
                   env:
                     - name: PYTHONUNBUFFERED
                       value: "1"
                     - name: PROFILE_DIR
-                      value: "gs://max-experiments/profiles/qwen35-rpa-debug-v59"
+                      value: "gs://sivaibhav-exp/qwen-profiles/v70-rankpreserve-decode"
                     - name: LIBTPU_INIT_ARGS
                       value: "--xla_tpu_offload_gather_to_sparsecore=true --xla_tpu_enable_offloading_scatter_to_sparsecore=true --xla_tpu_enable_offloading_sort_to_sparsecore=true"
                   resources:

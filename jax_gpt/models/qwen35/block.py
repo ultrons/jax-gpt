@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from jax_gpt.models.qwen35.config import Qwen35Config
 from jax_gpt.models.qwen35.deltanet import deltanet_prefill, deltanet_recurrent_step
 from jax_gpt.models.qwen35.gqa import gqa_attention
-from jax_gpt.models.qwen35.moe import moe_layer
+from jax_gpt.models.qwen35.moe import moe_layer, MoeBackend
 from jax_gpt.models.qwen35.primitives import rms_norm
 
 try:
@@ -31,6 +31,7 @@ def deltanet_layer_forward(
     is_decode: bool,
     n_devices: int = 1, mesh=None,
     axis_name: str = 'tp',
+    moe_backend: MoeBackend = 'ragged_dot',
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Single DeltaNet layer: pre-norm -> attention -> residual -> pre-norm -> MoE -> residual."""
 
@@ -41,6 +42,7 @@ def deltanet_layer_forward(
                 normed, params['attn'], delta_M, delta_conv,
                 config.delta_n_qk_heads, config.delta_n_v_heads,
                 config.delta_qk_head_dim, config.delta_v_head_dim,
+                mesh=mesh,
             )
         else:
             attn_out, new_M, new_conv = deltanet_prefill(
@@ -59,7 +61,8 @@ def deltanet_layer_forward(
     with jax.named_scope('deltanet_moe'):
         normed = rms_norm(x, params['moe_norm'], config.rms_norm_eps)
         moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token,
-                            n_devices=n_devices, axis_name=axis_name, mesh=mesh)
+                            n_devices=n_devices, axis_name=axis_name, mesh=mesh,
+                            moe_backend=moe_backend)
 
     x = x + moe_out
     return x, new_M, new_conv
@@ -75,6 +78,7 @@ def gqa_layer_forward(
     rope_freqs: jax.Array,
     n_devices: int = 1, mesh=None,
     axis_name: str = 'tp',
+    moe_backend: MoeBackend = 'ragged_dot',
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Single GQA layer: pre-norm -> attention -> residual -> pre-norm -> MoE -> residual."""
 
@@ -92,7 +96,8 @@ def gqa_layer_forward(
     with jax.named_scope('gqa_moe'):
         normed = rms_norm(x, params['moe_norm'], config.rms_norm_eps)
         moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token,
-                            n_devices=n_devices, axis_name=axis_name, mesh=mesh)
+                            n_devices=n_devices, axis_name=axis_name, mesh=mesh,
+                            moe_backend=moe_backend)
 
     x = x + moe_out
     # Ensure cache dtypes match input for scan carry compatibility
@@ -115,6 +120,7 @@ def gqa_layer_forward_rpa(
     rope_freqs: jax.Array,
     n_devices: int = 1, mesh=None,
     axis_name: str = 'tp',
+    moe_backend: MoeBackend = 'ragged_dot',
 ) -> tuple[jax.Array, jax.Array]:
     """Single GQA layer using RPA v3 kernel for decode."""
 
@@ -139,7 +145,8 @@ def gqa_layer_forward_rpa(
     with jax.named_scope('gqa_moe'):
         normed = rms_norm(x, params['moe_norm'], config.rms_norm_eps)
         moe_out = moe_layer(normed, params['moe'], config.n_experts_per_token,
-                            n_devices=n_devices, axis_name=axis_name, mesh=mesh)
+                            n_devices=n_devices, axis_name=axis_name, mesh=mesh,
+                            moe_backend=moe_backend)
 
     x = x + moe_out
     return x, updated_cache
@@ -158,29 +165,47 @@ def group_forward(
     is_decode: bool,
     n_devices: int = 1, mesh=None,
     axis_name: str = 'tp',
+    moe_backend: MoeBackend = 'ragged_dot',
+    delta_moe_list: list[dict] | None = None,
+    gqa_moe: dict | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Forward pass through one 4-layer group (3 DeltaNet + 1 GQA)."""
+    """Forward pass through one 4-layer group (3 DeltaNet + 1 GQA).
 
-    # Scan over DeltaNet layers
-    def _delta_step(carry, layer_inputs):
-        x_carry = carry
-        layer_params, M_i, conv_i = layer_inputs
-        x_carry, new_M, new_conv = deltanet_layer_forward(
-            x_carry, layer_params, M_i, conv_i, config, is_decode,
-            n_devices=n_devices, mesh=mesh, axis_name=axis_name,
-        )
-        return x_carry, (new_M, new_conv)
+    Args:
+        delta_moe_list: Optional list of n_delta MoE param dicts, one per
+            DeltaNet layer. When provided, overrides group_params['delta_layers']['moe']
+            to avoid XLA retiling from stacked array slicing.
+        gqa_moe: Optional MoE param dict for the GQA layer. When provided,
+            overrides group_params['gqa_layer']['moe'].
+    """
 
+    # Unrolled DeltaNet layers (3 iterations) — see group_forward_rpa comment.
     delta_layer_params = group_params['delta_layers']
-    x, (new_Ms, new_convs) = jax.lax.scan(
-        _delta_step, x, (delta_layer_params, delta_Ms, delta_convs),
-    )
+    n_delta = config.full_attention_interval - 1
+    new_Ms_list, new_convs_list = [], []
+    for i in range(n_delta):
+        layer_p = jax.tree.map(lambda a: a[i], delta_layer_params)
+        if delta_moe_list is not None:
+            layer_p = {**layer_p, 'moe': delta_moe_list[i]}
+        x, new_M, new_conv = deltanet_layer_forward(
+            x, layer_p, delta_Ms[i], delta_convs[i], config, is_decode,
+            n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+            moe_backend=moe_backend,
+        )
+        new_Ms_list.append(new_M)
+        new_convs_list.append(new_conv)
+    new_Ms = jnp.stack(new_Ms_list)
+    new_convs = jnp.stack(new_convs_list)
 
+    gqa_p = group_params['gqa_layer']
+    if gqa_moe is not None:
+        gqa_p = {**gqa_p, 'moe': gqa_moe}
     x, new_gqa_k, new_gqa_v = gqa_layer_forward(
-            x, group_params['gqa_layer'],
+            x, gqa_p,
             gqa_k, gqa_v, cache_pos,
             config, rope_freqs,
             n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+            moe_backend=moe_backend,
         )
 
     return x, new_Ms, new_convs, new_gqa_k, new_gqa_v
@@ -201,33 +226,54 @@ def group_forward_rpa(
     rope_freqs: jax.Array,
     n_devices: int = 1, mesh=None,
     axis_name: str = 'tp',
+    moe_backend: MoeBackend = 'ragged_dot',
+    delta_moe_list: list[dict] | None = None,
+    gqa_moe: dict | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Forward pass through one group using RPA for GQA decode.
+
+    Args:
+        delta_moe_list: Optional list of n_delta MoE param dicts, one per
+            DeltaNet layer. When provided, overrides group_params['delta_layers']['moe']
+            to avoid XLA retiling from stacked array slicing.
+        gqa_moe: Optional MoE param dict for the GQA layer. When provided,
+            overrides group_params['gqa_layer']['moe'].
 
     Returns (x, new_Ms, new_convs, updated_kv_cache).
     """
 
-    # Scan over DeltaNet layers (same as group_forward)
-    def _delta_step(carry, layer_inputs):
-        x_carry = carry
-        layer_params, M_i, conv_i = layer_inputs
-        x_carry, new_M, new_conv = deltanet_layer_forward(
-            x_carry, layer_params, M_i, conv_i, config, is_decode=True,
-            n_devices=n_devices, mesh=mesh, axis_name=axis_name,
-        )
-        return x_carry, (new_M, new_conv)
-
+    # Unrolled DeltaNet layers (3 iterations).
+    # Python loop avoids jax.lax.scan tiling constraints on expert weights:
+    # scan forces XLA to tile stacked [3,E,K,N] as T(8,128), but ragged_dot
+    # needs T(32,128), causing a ~386ms copy per step. Unrolling lets XLA
+    # tile each layer's [E,K,N] weights independently.
     delta_layer_params = group_params['delta_layers']
-    x, (new_Ms, new_convs) = jax.lax.scan(
-        _delta_step, x, (delta_layer_params, delta_Ms, delta_convs),
-    )
+    n_delta = config.full_attention_interval - 1
+    new_Ms_list, new_convs_list = [], []
+    for i in range(n_delta):
+        layer_p = jax.tree.map(lambda a: a[i], delta_layer_params)
+        if delta_moe_list is not None:
+            layer_p = {**layer_p, 'moe': delta_moe_list[i]}
+        x, new_M, new_conv = deltanet_layer_forward(
+            x, layer_p, delta_Ms[i], delta_convs[i], config, is_decode=True,
+            n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+            moe_backend=moe_backend,
+        )
+        new_Ms_list.append(new_M)
+        new_convs_list.append(new_conv)
+    new_Ms = jnp.stack(new_Ms_list)
+    new_convs = jnp.stack(new_convs_list)
 
+    gqa_p = group_params['gqa_layer']
+    if gqa_moe is not None:
+        gqa_p = {**gqa_p, 'moe': gqa_moe}
     x, updated_cache = gqa_layer_forward_rpa(
-        x, group_params['gqa_layer'],
+        x, gqa_p,
         kv_cache, kv_lens, page_indices,
         cu_q_lens, distribution, cache_pos,
         config, rope_freqs,
         n_devices=n_devices, mesh=mesh, axis_name=axis_name,
+        moe_backend=moe_backend,
     )
 
     return x, new_Ms, new_convs, updated_cache
