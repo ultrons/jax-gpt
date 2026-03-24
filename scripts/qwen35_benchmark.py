@@ -823,9 +823,9 @@ def _export_measurements(args, cfg, mesh, params, cache, decode_results, use_fp8
     # For GCS paths: try to download an existing predictions file to merge into.
     if is_gcs:
         try:
-            import subprocess as _sp
-            _sp.run(["gsutil", "cp", out_str, str(out_path)],
-                    capture_output=True, check=True)
+            from google.cloud import storage as _gcs
+            _parts = out_str[5:].split("/", 1)
+            _gcs.Client().bucket(_parts[0]).blob(_parts[1]).download_to_filename(str(out_path))
         except Exception:
             pass  # file doesn't exist yet — will create fresh
 
@@ -904,8 +904,9 @@ def _export_measurements(args, cfg, mesh, params, cache, decode_results, use_fp8
     meas_model.to_json(str(out_path))
 
     if is_gcs:
-        import subprocess as _sp
-        _sp.run(["gsutil", "cp", str(out_path), out_str], check=True)
+        from google.cloud import storage as _gcs
+        _parts = out_str[5:].split("/", 1)
+        _gcs.Client().bucket(_parts[0]).blob(_parts[1]).upload_from_filename(str(out_path))
         out_path.unlink(missing_ok=True)
         print(f"  [export] Uploaded to {out_str}  (sources: {meas_model.summary.sources})")
     else:
