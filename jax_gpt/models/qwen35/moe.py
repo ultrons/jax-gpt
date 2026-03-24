@@ -110,15 +110,17 @@ def _expert_swiglu_gmm(x_sorted, group_sizes, gate_w, up_w, down_w,
     When rhs_scale is provided, gmm_v2 handles lhs quantization and
     rescaling internally — no manual dynamic_quantize_fp8 needed.
     """
-    gate_out = jax.nn.silu(
-        _gmm_matmul(x_sorted, gate_w, group_sizes, gate_scale, group_offset,
-                     rhs_group_offset))
-    up_out = _gmm_matmul(
-        x_sorted, up_w, group_sizes, up_scale, group_offset, rhs_group_offset)
-    intermediate = (gate_out * up_out).astype(x_sorted.dtype)
-    return _gmm_matmul(
-        intermediate, down_w, group_sizes, down_scale, group_offset,
-        rhs_group_offset)
+    with jax.named_scope('expert_gate_up'):
+        gate_out = jax.nn.silu(
+            _gmm_matmul(x_sorted, gate_w, group_sizes, gate_scale, group_offset,
+                         rhs_group_offset))
+        up_out = _gmm_matmul(
+            x_sorted, up_w, group_sizes, up_scale, group_offset, rhs_group_offset)
+        intermediate = (gate_out * up_out).astype(x_sorted.dtype)
+    with jax.named_scope('expert_down'):
+        return _gmm_matmul(
+            intermediate, down_w, group_sizes, down_scale, group_offset,
+            rhs_group_offset)
 
 
 def moe_routing(
@@ -134,7 +136,8 @@ def moe_routing(
     """
     n_experts = _get_n_experts(gate_weight)
 
-    logits = matmul_maybe_fp8(x, gate_weight)  # (M, E)
+    with jax.named_scope('moe_router'):
+        logits = matmul_maybe_fp8(x, gate_weight)  # (M, E)
     probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
     top_k_values, top_k_indices = jax.lax.top_k(probs, n_experts_per_token)
     expert_weights = top_k_values / jnp.sum(top_k_values, axis=-1, keepdims=True)
@@ -176,18 +179,22 @@ def _expert_swiglu(x_sorted, group_sizes, gate_w, up_w, down_w,
     if gate_w.dtype == FP8_DTYPE:
         n = x_sorted.shape[0]
         x_fp8, x_scale = dynamic_quantize_fp8(x_sorted)
-        gate_out = jax.nn.silu(
-            _fp8_ragged_dot_rescaled(
-                x_fp8, x_scale, gate_w, group_sizes, gate_scale, n))
-        up_out = _fp8_ragged_dot_rescaled(
-            x_fp8, x_scale, up_w, group_sizes, up_scale, n)
-        intermediate = gate_out * up_out
-        int_fp8, int_scale = dynamic_quantize_fp8(intermediate)
-        return _fp8_ragged_dot_rescaled(
-            int_fp8, int_scale, down_w, group_sizes, down_scale, n)
-    gate_out = jax.nn.silu(jax.lax.ragged_dot(x_sorted, gate_w, group_sizes))
-    up_out = jax.lax.ragged_dot(x_sorted, up_w, group_sizes)
-    return jax.lax.ragged_dot(gate_out * up_out, down_w, group_sizes)
+        with jax.named_scope('expert_gate_up'):
+            gate_out = jax.nn.silu(
+                _fp8_ragged_dot_rescaled(
+                    x_fp8, x_scale, gate_w, group_sizes, gate_scale, n))
+            up_out = _fp8_ragged_dot_rescaled(
+                x_fp8, x_scale, up_w, group_sizes, up_scale, n)
+            intermediate = gate_out * up_out
+            int_fp8, int_scale = dynamic_quantize_fp8(intermediate)
+        with jax.named_scope('expert_down'):
+            return _fp8_ragged_dot_rescaled(
+                int_fp8, int_scale, down_w, group_sizes, down_scale, n)
+    with jax.named_scope('expert_gate_up'):
+        gate_out = jax.nn.silu(jax.lax.ragged_dot(x_sorted, gate_w, group_sizes))
+        up_out = jax.lax.ragged_dot(x_sorted, up_w, group_sizes)
+    with jax.named_scope('expert_down'):
+        return jax.lax.ragged_dot(gate_out * up_out, down_w, group_sizes)
 
 
 def _scatter_back(expert_out, sorted_weights, sorted_token_ids, M, D, dtype):
@@ -356,9 +363,13 @@ def expert_forward_ep(
     M, D = x.shape
     k = expert_indices.shape[1]
 
-    # Detect data-parallel axes: all non-trivial mesh axes except the EP axis.
+    # Detect data-parallel axes: all non-trivial mesh axes except the EP axis,
+    # but only include axes that evenly divide M (the batch/token count).
+    # With eval mesh dp=2 and B=1 decode step, M=1 is not divisible by 2 →
+    # skip dp partitioning to avoid shard_map divisibility error.
     dp_axes = tuple(name for name in mesh.axis_names
-                    if name != axis_name and mesh.shape[name] > 1)
+                    if name != axis_name and mesh.shape[name] > 1
+                    and M % mesh.shape[name] == 0)
     if len(dp_axes) == 0:
         act_pspec = P(None, None)
     elif len(dp_axes) == 1:

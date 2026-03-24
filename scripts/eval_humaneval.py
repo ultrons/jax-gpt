@@ -520,17 +520,27 @@ def main():
     # Build device mesh
     # ------------------------------------------------------------------
     tp = args.tp or jax.local_device_count()
-    dp = args.dp
-    total_devices = tp * dp
+    # Derive mesh DP from process layout so ALL chips join the mesh.
+    # With TP=32 on a 64-chip slice: 16 procs / (32/4 procs-per-replica) = 2.
+    # All processes must be in the mesh so JIT outputs are on local devices
+    # and int(scalar) works on every rank without "non-addressable" errors.
+    _procs_per_replica = tp // jax.local_device_count()
+    mesh_dp = jax.process_count() // _procs_per_replica
+    # Work-split dp stays 1: all ranks run all problems (redundant across dp
+    # groups). Only rank 0 writes results. No cross-pod file barrier needed.
+    dp = 1
+    total_devices = tp * mesh_dp
 
     assert jax.device_count() >= total_devices, (
         f"Need {total_devices} devices, have {jax.device_count()}"
     )
 
     devices = np.array(jax.devices()[:total_devices])
-    if dp > 1:
-        # 2D mesh: rows = dp replicas, cols = tp shards
-        mesh = jax.sharding.Mesh(devices.reshape(dp, tp), ('dp', 'tp'))
+    if mesh_dp > 1:
+        # 2D mesh: rows = dp replicas, cols = tp shards.
+        # All 64 devices in mesh → every process has local devices → no
+        # "non-addressable devices" error when calling int(scalar).
+        mesh = jax.sharding.Mesh(devices.reshape(mesh_dp, tp), ('dp', 'tp'))
     else:
         mesh = make_mesh(n_devices=tp)
 
@@ -559,20 +569,19 @@ def main():
         params = load_model_from_checkpoint(args.model_dir, cfg, mesh, axis_rules)
 
     # ------------------------------------------------------------------
-    # Load problems and split across DP ranks (before warmup so we can
-    # compute fixed_max_len for the cache shape)
+    # Load problems. All processes run all problems (no dp_rank split).
+    # With TP=32/DP=1 on a 64-chip slice, processes 8-15 have no mesh devices
+    # but must dispatch the same JAX ops as processes 0-7 in lockstep to avoid
+    # XLA collective deadlock. Running identical ops on all ranks keeps the
+    # dispatch protocol consistent. Only rank 0 writes results.
     # ------------------------------------------------------------------
     all_problems = load_humaneval_problems()
     all_problems = all_problems[:args.n_problems]
     n_total = len(all_problems)
+    my_problems = all_problems
+    start = 0
 
-    problems_per_rank = math.ceil(n_total / dp)
-    start = dp_rank * problems_per_rank
-    end = min(start + problems_per_rank, n_total)
-    my_problems = all_problems[start:end]
-
-    print(f"[rank {rank}] dp_rank={dp_rank} Evaluating problems {start}..{end - 1} "
-          f"({len(my_problems)} problems)")
+    print(f"[rank {rank}] Evaluating {n_total} problems (all ranks run all problems)")
 
     # Pre-tokenize with chat template to find max formatted prompt length.
     # fixed_max_len keeps cache shape identical across problems so decode
@@ -715,14 +724,12 @@ def main():
         sys.stdout.flush()
 
     # ------------------------------------------------------------------
-    # Write per-dp-rank results (only one process per DP replica writes)
+    # Write results — only rank 0 writes (all ranks computed same problems).
     # ------------------------------------------------------------------
-    # Use process rank 0 within each TP group as the writer for that dp_rank.
-    is_dp_leader = (rank % processes_per_dp_replica == 0)
-    if is_dp_leader:
-        rank_file = output_dir / f'results_rank{dp_rank:02d}.json'
+    if rank == 0:
+        rank_file = output_dir / f'results_rank{0:02d}.json'
         with open(rank_file, 'w') as f:
-            json.dump({'dp_rank': dp_rank, 'results': results,
+            json.dump({'dp_rank': 0, 'results': results,
                        'n_pass': n_pass, 'n_total': len(my_problems)}, f, indent=2)
         print(f"[rank {rank}] Wrote {rank_file}")
 

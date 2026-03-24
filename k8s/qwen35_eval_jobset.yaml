@@ -1,8 +1,13 @@
 # JobSet for Qwen3.5-397B HumanEval on mlperf-rl-v5p-128 (cloud-tpu-multipod-dev).
 #
 # Topology:  4×4×4 v5p = 64 chips = 16 hosts × 4 chips (ct5p-hightpu-4t)
-# Sharding:  TP=32, DP=2
-# Memory:    64 chips × 96 GB = 6,144 GB >> 794 GB model (fits with ~7.7× headroom)
+# Sharding:  TP=32, DP=1
+# Memory:    32 chips × 96 GB = 3,072 GB >> 794 GB model (~3.9× headroom at stack time)
+# Note: dp=1, all 16 processes run all problems redundantly (no dp_rank split).
+# Processes 8-15 have no mesh devices but must dispatch JAX ops in lockstep.
+# v78 fix: removed dp_rank problem split → all ranks call fwd_fn same # of times.
+# v79 fix: use mesh_dp (not dp=1) for mesh creation → all 64 devices in mesh →
+#          no "non-addressable devices" error on processes 8-15.
 #
 # JobSet creates one child Job with 16 indexed pods (one per TPU host).
 # All pods restart together if any fails — required for JAX collective ops.
@@ -84,7 +89,7 @@ metadata:
 spec:
   # If any pod fails the whole JobSet restarts — required for JAX collectives.
   failurePolicy:
-    maxRestarts: 2
+    maxRestarts: 3
 
   replicatedJobs:
     - name: slice
@@ -122,16 +127,16 @@ spec:
               containers:
                 - name: eval
                   # EDIT: replace with your image
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v67-eval
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v80
                   imagePullPolicy: Always
 
                   command: ["python", "scripts/eval_humaneval.py"]
                   args:
                     - "--model-dir=/mnt/model/qwen3.5-397b"
                     - "--output-dir=/tmp/output"
-                    - "--n-problems=164"
+                    - "--n-problems=20"
                     - "--tp=32"
-                    - "--dp=2"
+                    - "--dp=1"
                     - "--max-new-tokens=32768"
                     - "--temperature=0.6"
                     - "--top-k=20"

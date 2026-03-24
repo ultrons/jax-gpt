@@ -55,13 +55,16 @@ def gqa_attention(
     groups = n_q_heads // n_kv_heads
 
     with jax.named_scope('qkv_proj'):
-        q_gate = matmul_maybe_fp8(x, params['q_proj']).reshape(B, T, n_q_heads, head_dim * 2)
+        with jax.named_scope('q_proj'):
+            q_gate = matmul_maybe_fp8(x, params['q_proj']).reshape(B, T, n_q_heads, head_dim * 2)
     q = q_gate[..., :head_dim]      # (B, T, n_q_heads, head_dim)
     gate = q_gate[..., head_dim:]    # (B, T, n_q_heads, head_dim)
     gate = gate.reshape(B, T, -1)   # (B, T, n_q_heads * head_dim)
 
-    k = matmul_maybe_fp8(x, params['k_proj']).reshape(B, T, n_kv_heads, head_dim)
-    v = matmul_maybe_fp8(x, params['v_proj']).reshape(B, T, n_kv_heads, head_dim)
+    with jax.named_scope('k_proj'):
+        k = matmul_maybe_fp8(x, params['k_proj']).reshape(B, T, n_kv_heads, head_dim)
+    with jax.named_scope('v_proj'):
+        v = matmul_maybe_fp8(x, params['v_proj']).reshape(B, T, n_kv_heads, head_dim)
 
     # QK normalization (per-head RMSNorm)
     if 'q_norm' in params:
@@ -144,6 +147,7 @@ def gqa_attention(
     out = out * jax.nn.sigmoid(gate).astype(out.dtype)
 
     # Output projection
-    out = matmul_maybe_fp8(out, params['o_proj'])
+    with jax.named_scope('o_proj'):
+        out = matmul_maybe_fp8(out, params['o_proj'])
 
     return out.astype(x.dtype), cache_k, cache_v

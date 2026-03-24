@@ -136,10 +136,14 @@ def deltanet_recurrent_step(
 
     # Project QKV and gate/decay
     with jax.named_scope('qkv_proj'):
-        mixed_qkv = matmul_maybe_fp8(x, params['in_proj_qkv'])  # (B, 1, key_dim*2 + value_dim)
-    z = matmul_maybe_fp8(x, params['in_proj_z'])             # (B, 1, value_dim)
-    b = matmul_maybe_fp8(x, params['in_proj_b'])             # (B, 1, n_v_heads)
-    a = matmul_maybe_fp8(x, params['in_proj_a'])             # (B, 1, n_v_heads)
+        with jax.named_scope('in_proj_qkv'):
+            mixed_qkv = matmul_maybe_fp8(x, params['in_proj_qkv'])  # (B, 1, key_dim*2 + value_dim)
+    with jax.named_scope('in_proj_z'):
+        z = matmul_maybe_fp8(x, params['in_proj_z'])             # (B, 1, value_dim)
+    with jax.named_scope('in_proj_b'):
+        b = matmul_maybe_fp8(x, params['in_proj_b'])             # (B, 1, n_v_heads)
+    with jax.named_scope('in_proj_a'):
+        a = matmul_maybe_fp8(x, params['in_proj_a'])             # (B, 1, n_v_heads)
 
     # Causal conv1d update (channels-first)
     mixed_qkv_cf = jnp.transpose(mixed_qkv, (0, 2, 1))  # (B, conv_dim, 1)
@@ -190,34 +194,38 @@ def deltanet_recurrent_step(
     v_f32 = v.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32)
 
-    if mesh is not None:
-        # Pallas kernels can't be auto-partitioned — wrap in shard_map.
-        # State is P('dp', 'tp', None, None); q/k/v/g/beta follow same pattern.
-        from jax.experimental.shard_map import shard_map
-        from jax.sharding import PartitionSpec as P
-        dp = 'dp' if 'dp' in mesh.axis_names else None
-        tp = 'tp' if 'tp' in mesh.axis_names else None
-        new_state, output = shard_map(
-            fused_deltanet_step,
-            mesh=mesh,
-            in_specs=(
-                P(dp, tp, None, None),  # state: (B, H, dk, dv)
-                P(dp, tp, None),        # q: (B, H, dk)
-                P(dp, tp, None),        # k: (B, H, dk)
-                P(dp, tp, None),        # v: (B, H, dv)
-                P(dp, tp),              # g_factor: (B, H)
-                P(dp, tp),              # beta: (B, H)
-            ),
-            out_specs=(
-                P(dp, tp, None, None),  # new_state: (B, H, dk, dv)
-                P(dp, tp, None),        # output: (B, H, dv)
-            ),
-            check_rep=False,
-        )(state_f32, q_f32, k_f32, v_f32, g_factor, beta_f32)
-    else:
-        new_state, output = fused_deltanet_step(
-            state_f32, q_f32, k_f32, v_f32, g_factor, beta_f32,
-        )
+    with jax.named_scope('fused_deltanet_step'):
+        if mesh is not None:
+            # Pallas kernels can't be auto-partitioned — wrap in shard_map.
+            # State is P('dp', 'tp', None, None); q/k/v/g/beta follow same pattern.
+            from jax.experimental.shard_map import shard_map
+            from jax.sharding import PartitionSpec as P
+            # Don't partition batch across dp if B < dp_size — avoids
+            # shard_map divisibility error when B=1 (eval) and dp=2.
+            _dp_size = mesh.shape.get('dp', 1) if 'dp' in mesh.axis_names else 1
+            dp = 'dp' if ('dp' in mesh.axis_names and state_f32.shape[0] >= _dp_size) else None
+            tp = 'tp' if 'tp' in mesh.axis_names else None
+            new_state, output = shard_map(
+                fused_deltanet_step,
+                mesh=mesh,
+                in_specs=(
+                    P(dp, tp, None, None),  # state: (B, H, dk, dv)
+                    P(dp, tp, None),        # q: (B, H, dk)
+                    P(dp, tp, None),        # k: (B, H, dk)
+                    P(dp, tp, None),        # v: (B, H, dv)
+                    P(dp, tp),              # g_factor: (B, H)
+                    P(dp, tp),              # beta: (B, H)
+                ),
+                out_specs=(
+                    P(dp, tp, None, None),  # new_state: (B, H, dk, dv)
+                    P(dp, tp, None),        # output: (B, H, dv)
+                ),
+                check_rep=False,
+            )(state_f32, q_f32, k_f32, v_f32, g_factor, beta_f32)
+        else:
+            new_state, output = fused_deltanet_step(
+                state_f32, q_f32, k_f32, v_f32, g_factor, beta_f32,
+            )
     new_state = new_state.astype(state_dtype)
 
     # Gated RMSNorm (applied per-head, weight is per v_head_dim)
@@ -226,7 +234,8 @@ def deltanet_recurrent_step(
     z_reshaped = z_reshaped.reshape(B * config_n_v_heads, config_v_head_dim)
     output = _gated_rms_norm(output, z_reshaped, params['norm_weight'], eps=1e-6)
     output = output.reshape(B, value_dim)
-    output = (matmul_maybe_fp8(output, params['out_proj']))[:, None, :]  # (B, 1, D)
+    with jax.named_scope('out_proj'):
+        output = (matmul_maybe_fp8(output, params['out_proj']))[:, None, :]  # (B, 1, D)
 
     return output.astype(x.dtype), new_state, new_conv_state
 
@@ -264,10 +273,14 @@ def deltanet_prefill(
     groups = config_n_v_heads // config_n_qk_heads
 
     # Project
-    mixed_qkv = matmul_maybe_fp8(x, params['in_proj_qkv'])  # (B, T, conv_dim)
-    z = matmul_maybe_fp8(x, params['in_proj_z'])             # (B, T, value_dim)
-    b = matmul_maybe_fp8(x, params['in_proj_b'])             # (B, T, n_v_heads)
-    a = matmul_maybe_fp8(x, params['in_proj_a'])             # (B, T, n_v_heads)
+    with jax.named_scope('in_proj_qkv'):
+        mixed_qkv = matmul_maybe_fp8(x, params['in_proj_qkv'])  # (B, T, conv_dim)
+    with jax.named_scope('in_proj_z'):
+        z = matmul_maybe_fp8(x, params['in_proj_z'])             # (B, T, value_dim)
+    with jax.named_scope('in_proj_b'):
+        b = matmul_maybe_fp8(x, params['in_proj_b'])             # (B, T, n_v_heads)
+    with jax.named_scope('in_proj_a'):
+        a = matmul_maybe_fp8(x, params['in_proj_a'])             # (B, T, n_v_heads)
 
     # Causal conv1d (full sequence)
     mixed_qkv_cf = jnp.transpose(mixed_qkv, (0, 2, 1))  # (B, conv_dim, T)
@@ -439,7 +452,8 @@ def deltanet_prefill(
     z_flat = z_flat.reshape(B * T * config_n_v_heads, config_v_head_dim)
     core_attn_out = _gated_rms_norm(core_attn_out, z_flat, params['norm_weight'], eps=1e-6)
     core_attn_out = core_attn_out.reshape(B, T, value_dim)
-    output = matmul_maybe_fp8(core_attn_out, params['out_proj'])  # (B, T, D)
+    with jax.named_scope('out_proj'):
+        output = matmul_maybe_fp8(core_attn_out, params['out_proj'])  # (B, T, D)
 
     return output.astype(x.dtype), final_state, final_conv_state
 

@@ -709,6 +709,184 @@ def run_decode_benchmark(
     return avg_all_ms, avg_steady_ms, tokens_per_sec
 
 
+def _export_measurements(args, cfg, mesh, params, cache, decode_results, use_fp8):
+    """Write roofline measurement JSON after a decode benchmark run.
+
+    Captures:
+      - decode step time and TPS/chip from the benchmark
+      - JAX roofline per-module flops/bytes (bf16 only)
+      - XLA profile extraction via xla_shell (if PROFILE_DIR env var is set)
+
+    If args.export_measurements already points to a predictions.json (from
+    roofline_bridge.exporter), measurements are merged into it. Otherwise a
+    measurement-only file is written.
+    """
+    import json
+    from pathlib import Path
+    from datetime import datetime, timezone
+
+    bridge_path = Path(__file__).parent.parent / "ml-experiments" / "inference" / "roofline_bridge"
+    if not bridge_path.exists():
+        # Try relative to repo root
+        for candidate in [
+            Path(__file__).parent.parent / "ml-experiments" / "inference",
+            Path("/home/sivaibhav_google_com/ml-experiments/inference"),
+        ]:
+            if (candidate / "roofline_bridge").exists():
+                bridge_path = candidate / "roofline_bridge"
+                break
+    sys.path.insert(0, str(bridge_path.parent))
+
+    try:
+        from roofline_bridge.schema import (
+            RooflineDataModel, RunConfig, HardwareConstants, SummaryStats,
+            OpRecord, OpPrediction, HARDWARE_PRESETS
+        )
+        from roofline_bridge.op_mapper import aggregate_fusions, validate_profile
+    except ImportError as e:
+        print(f"  [export] Cannot import roofline_bridge: {e} — skipping export")
+        return
+
+    out_path = Path(args.export_measurements)
+    avg_all_ms, avg_steady_ms, tokens_per_sec = decode_results
+
+    # Determine TPS/chip (benchmark already computed this internally; re-derive here)
+    try:
+        from third_party.tpu_inference.tpu_info import get_num_cores_per_chip
+        cores_per_chip = get_num_cores_per_chip()
+        n_chips = (args.devices or jax.device_count()) // cores_per_chip
+    except Exception:
+        n_chips = args.devices or jax.device_count()
+    tps_per_chip = tokens_per_sec / n_chips
+
+    print(f"\n  [export] Writing measurements to {out_path}")
+
+    # --- JAX roofline (bf16 only) ---
+    jax_modules: dict[str, object] = {}
+    if not use_fp8:
+        try:
+            from jax.experimental.roofline import roofline
+            B = args.batch_size
+            param_shapes = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), params)
+            cache_shapes = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), cache)
+            tok_dec = jax.ShapeDtypeStruct((B, 1), jnp.int32)
+            from jax_gpt.models.qwen35.model import forward
+            def _fwd_dec(p, t, c):
+                return forward(p, t, cfg, cache=c, is_decode=True)
+            _, r = roofline(_fwd_dec)(param_shapes, tok_dec, cache_shapes)
+            jax_modules["full_decode"] = r
+            print(f"  [export] JAX roofline: decode FLOPs={r.flops:.3e}  HBM={r.hbm_bytes:.3e}")
+        except Exception as e:
+            print(f"  [export] JAX roofline failed: {e}")
+    else:
+        print("  [export] JAX roofline skipped (fp8 params)")
+
+    # --- XLA profile extraction via xla_shell ---
+    xla_measurements: dict = {}
+    profile_dir = os.environ.get("PROFILE_DIR", "")
+    if profile_dir and args.profile:
+        try:
+            import subprocess
+            result = subprocess.run(
+                [sys.executable, "-m", "xla_shell", "-c",
+                 f"read_xplane {profile_dir}; list_fusions --json"],
+                capture_output=True, text=True,
+                cwd=str(Path(__file__).parent.parent / "ml-experiments" / "timing"),
+                timeout=120,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                fusions = json.loads(result.stdout)
+                validate_profile(fusions)
+                xla_measurements = aggregate_fusions(fusions)
+                print(f"  [export] xla_shell: {len(xla_measurements)} ops mapped "
+                      f"from {len(fusions)} fusions")
+            else:
+                print(f"  [export] xla_shell failed: {result.stderr[:200]}")
+        except Exception as e:
+            print(f"  [export] xla_shell extraction failed: {e}")
+
+    # --- Build measurement-only model or merge into existing predictions ---
+    hw_name = "v7x" if "v7x" in str(getattr(args, 'config', '')).lower() else "v5p"
+    hw = HARDWARE_PRESETS.get(hw_name, HARDWARE_PRESETS["v7x"])
+
+    if out_path.exists():
+        try:
+            meas_model = RooflineDataModel.from_json(str(out_path))
+            print(f"  [export] Merging into existing {out_path}")
+        except Exception:
+            meas_model = None
+    else:
+        meas_model = None
+
+    if meas_model is None:
+        # Build measurement-only model
+        from roofline_bridge.schema import OpPrediction
+        n_devices = args.devices or jax.device_count()
+        tp = args.tp or jax.local_device_count()
+        dp = args.dp
+        run_config = RunConfig(
+            model="qwen35-397b",
+            hardware=hw_name,
+            n_chips=n_chips,
+            mesh=f"({dp},{tp})",
+            dtype="W8A16" if use_fp8 else "bfloat16",
+            batch_size=args.batch_size,
+            prompt_len=args.prompt_len,
+            decode_len=args.decode_steps,
+            n_layers=None,
+            tp=tp,
+            dp=dp,
+            ep=1,
+            profile_gcs_path=profile_dir or None,
+            image_tag=None,
+        )
+        meas_model = RooflineDataModel.new(run_config, hw, phase="decode")
+
+    # Overlay measured step time and TPS/chip
+    meas_model.summary.measured_step_ms = avg_steady_ms
+    meas_model.summary.measured_tps_per_chip = tps_per_chip
+    if "first_principles" not in meas_model.summary.sources:
+        pass  # predictions file already has it
+    if "benchmark" not in meas_model.summary.sources:
+        meas_model.summary.sources.append("benchmark")
+
+    # Overlay JAX roofline on full_decode op (store on summary)
+    if "full_decode" in jax_modules:
+        r = jax_modules["full_decode"]
+        meas_model.summary.jax_roofline_flops = r.flops
+        meas_model.summary.jax_roofline_hbm_bytes = r.hbm_bytes
+        if "jax_roofline" not in meas_model.summary.sources:
+            meas_model.summary.sources.append("jax_roofline")
+
+    # Overlay xla_shell measurements on matching op records
+    if xla_measurements:
+        from roofline_bridge.schema import OpMeasurement
+        op_map = {op.op_name: op for op in meas_model.ops}
+        for op_name, agg in xla_measurements.items():
+            if op_name in op_map:
+                ai = agg["flops"] / agg["bytes_accessed"] if agg["bytes_accessed"] > 0 else 0.0
+                ridge = hw.peak_flops_bf16_tflops * 1e12 / (hw.hbm_bw_tbps * 1e12)
+                op_map[op_name].measurement = OpMeasurement(
+                    source="xla_shell",
+                    self_time_us=agg["self_time_us"],
+                    flops=agg["flops"],
+                    bytes_accessed=agg["bytes_accessed"],
+                    arithmetic_intensity=ai,
+                    bound_by="compute" if ai > ridge else "memory",
+                    n_fusions_matched=agg["n_fusions_matched"],
+                    tf_op_names=agg["tf_op_names"],
+                    fusion_names=agg["fusion_names"],
+                )
+        if "xla_shell" not in meas_model.summary.sources:
+            meas_model.summary.sources.append("xla_shell")
+
+    meas_model.generated_at = datetime.now(timezone.utc).isoformat()
+    meas_model.to_json(str(out_path))
+    print(f"  [export] Wrote {out_path}  (sources: {meas_model.summary.sources})")
+    print(f"  [export] Measured step: {avg_steady_ms:.2f} ms  "
+          f"TPS/chip: {tps_per_chip:.1f}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Qwen3.5 inference benchmark")
     parser.add_argument('--config', default='mini', choices=['mini', 'mid', 'mid_large', 'full'])
@@ -747,6 +925,12 @@ def main():
                              'compilation HBM footprint. Use 2 for BS=2048 if '
                              'RuntimeProgramAllocationFailure occurs. '
                              'Requires --use-rpa --scan-mode=unrolled.')
+    parser.add_argument('--export-measurements', metavar='PATH', default=None,
+                        help='Write roofline measurement JSON to PATH after decode benchmark. '
+                             'If PATH already contains a predictions.json from exporter.py, '
+                             'measurements are merged into it. Captures: decode step time, '
+                             'TPS/chip, and JAX roofline (bf16 only). '
+                             'XLA profile extraction requires --profile + PROFILE_DIR.')
     args = parser.parse_args()
 
     if args.max_seq_len is None:
@@ -1059,12 +1243,13 @@ def main():
                 moe_backend=args.moe_backend,
             )
 
+        _decode_results = None
         if not args.skip_decode:
             print(f"\n{'─'*70}")
             print(f"DECODE BENCHMARK {'(RPA)' if args.use_rpa else ''}")
             print(f"{'─'*70}")
             prompt = jnp.ones((args.batch_size, args.prompt_len), dtype=jnp.int32)
-            run_decode_benchmark(
+            _decode_results = run_decode_benchmark(
                 params, cfg, cache, prompt, args.decode_steps, cache_sharding,
                 args.n_runs, args.profile, mesh, n_devices=n_ep_devices,
                 use_rpa=args.use_rpa,
@@ -1093,6 +1278,12 @@ def main():
             print(f"      HLO temps (peak - current): {hlo_temps/1e9:.3f} GB")
     except Exception as e:
         print(f"    (peak memory stats unavailable: {e})")
+
+    # ------------------------------------------------------------------
+    # Export measurements (--export-measurements PATH)
+    # ------------------------------------------------------------------
+    if args.export_measurements and _decode_results is not None:
+        _export_measurements(args, cfg, mesh, params, cache, _decode_results, use_fp8)
 
     print(f"\n{'='*70}")
     print("DONE")

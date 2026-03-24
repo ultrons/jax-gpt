@@ -191,7 +191,7 @@ def load_from_hf_state_dict(
             def _cb(index):
                 return np_leaf_f32[index].astype(dtype)
 
-            return jax.make_array_from_callback(np_leaf.shape, sharding, _cb)
+            return jax.make_array_from_callback(np_leaf.shape, sharding, _cb, dtype=dtype)
 
         return jax.tree_util.tree_map_with_path(_place_leaf, np_params)
 
