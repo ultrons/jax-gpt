@@ -747,7 +747,18 @@ def _export_measurements(args, cfg, mesh, params, cache, decode_results, use_fp8
         print(f"  [export] Cannot import roofline_bridge: {e} — skipping export")
         return
 
-    out_path = Path(args.export_measurements)
+    # Only rank 0 writes — all hosts have identical measurements.
+    if jax.process_index() != 0:
+        return
+
+    out_str = args.export_measurements
+    is_gcs = out_str.startswith("gs://")
+    if is_gcs:
+        import tempfile
+        _local_tmp = Path(tempfile.mktemp(suffix="_roofline_meas.json"))
+        out_path = _local_tmp
+    else:
+        out_path = Path(out_str)
     avg_all_ms, avg_steady_ms, tokens_per_sec = decode_results
 
     # Determine TPS/chip (benchmark already computed this internally; re-derive here)
@@ -809,10 +820,19 @@ def _export_measurements(args, cfg, mesh, params, cache, decode_results, use_fp8
     hw_name = "v7x" if "v7x" in str(getattr(args, 'config', '')).lower() else "v5p"
     hw = HARDWARE_PRESETS.get(hw_name, HARDWARE_PRESETS["v7x"])
 
+    # For GCS paths: try to download an existing predictions file to merge into.
+    if is_gcs:
+        try:
+            import subprocess as _sp
+            _sp.run(["gsutil", "cp", out_str, str(out_path)],
+                    capture_output=True, check=True)
+        except Exception:
+            pass  # file doesn't exist yet — will create fresh
+
     if out_path.exists():
         try:
             meas_model = RooflineDataModel.from_json(str(out_path))
-            print(f"  [export] Merging into existing {out_path}")
+            print(f"  [export] Merging into existing {out_str if is_gcs else out_path}")
         except Exception:
             meas_model = None
     else:
@@ -882,7 +902,14 @@ def _export_measurements(args, cfg, mesh, params, cache, decode_results, use_fp8
 
     meas_model.generated_at = datetime.now(timezone.utc).isoformat()
     meas_model.to_json(str(out_path))
-    print(f"  [export] Wrote {out_path}  (sources: {meas_model.summary.sources})")
+
+    if is_gcs:
+        import subprocess as _sp
+        _sp.run(["gsutil", "cp", str(out_path), out_str], check=True)
+        out_path.unlink(missing_ok=True)
+        print(f"  [export] Uploaded to {out_str}  (sources: {meas_model.summary.sources})")
+    else:
+        print(f"  [export] Wrote {out_path}  (sources: {meas_model.summary.sources})")
     print(f"  [export] Measured step: {avg_steady_ms:.2f} ms  "
           f"TPS/chip: {tps_per_chip:.1f}")
 
