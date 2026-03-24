@@ -184,48 +184,33 @@ def deltanet_recurrent_step(
     v = v[:, 0]  # (B, n_v_heads, v_head_dim)
     beta = beta[:, 0]  # (B, n_v_heads)
 
-    # Fused recurrent step — single Pallas kernel reads state once from HBM
-    # instead of 3 separate einsums (decay, readout+update, query).
+    # Recurrent state update via plain JAX einsums.
+    # Replacing the previous Pallas-kernel+shard_map approach: profiling showed
+    # the shard_map dispatch overhead (~780 us × 16 GDN layers = 12.5 ms/step)
+    # completely dominated over actual compute, and the cost was CONSTANT w.r.t.
+    # batch size (BS=256 and BS=2048 both took ~13 ms). XLA can auto-partition
+    # these einsums without shard_map, eliminating the dispatch overhead entirely.
+    # Expected: ~0.2 ms (bandwidth-bound, 3x HBM reads of 16.8 MB state per rank).
     state_dtype = state.dtype
     state_f32 = state.astype(jnp.float32)
-    g_factor = jnp.exp(g.astype(jnp.float32))  # (B, H) — kernel handles broadcasting
+    g_factor = jnp.exp(g.astype(jnp.float32))  # (B, H)
     q_f32 = q.astype(jnp.float32)
     k_f32 = k.astype(jnp.float32)
     v_f32 = v.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32)
 
     with jax.named_scope('fused_deltanet_step'):
-        if mesh is not None:
-            # Pallas kernels can't be auto-partitioned — wrap in shard_map.
-            # State is P('dp', 'tp', None, None); q/k/v/g/beta follow same pattern.
-            from jax.experimental.shard_map import shard_map
-            from jax.sharding import PartitionSpec as P
-            # Don't partition batch across dp if B < dp_size — avoids
-            # shard_map divisibility error when B=1 (eval) and dp=2.
-            _dp_size = mesh.shape.get('dp', 1) if 'dp' in mesh.axis_names else 1
-            dp = 'dp' if ('dp' in mesh.axis_names and state_f32.shape[0] >= _dp_size) else None
-            tp = 'tp' if 'tp' in mesh.axis_names else None
-            new_state, output = shard_map(
-                fused_deltanet_step,
-                mesh=mesh,
-                in_specs=(
-                    P(dp, tp, None, None),  # state: (B, H, dk, dv)
-                    P(dp, tp, None),        # q: (B, H, dk)
-                    P(dp, tp, None),        # k: (B, H, dk)
-                    P(dp, tp, None),        # v: (B, H, dv)
-                    P(dp, tp),              # g_factor: (B, H)
-                    P(dp, tp),              # beta: (B, H)
-                ),
-                out_specs=(
-                    P(dp, tp, None, None),  # new_state: (B, H, dk, dv)
-                    P(dp, tp, None),        # output: (B, H, dv)
-                ),
-                check_rep=False,
-            )(state_f32, q_f32, k_f32, v_f32, g_factor, beta_f32)
-        else:
-            new_state, output = fused_deltanet_step(
-                state_f32, q_f32, k_f32, v_f32, g_factor, beta_f32,
-            )
+        # Step 1: decay
+        state_f32 = state_f32 * g_factor[..., None, None]      # (B, H, dk, dv)
+        # Step 2: readout — kv_mem[b,h,v] = sum_k state[b,h,k,v] * k[b,h,k]
+        kv_mem = jnp.einsum('bhkv,bhk->bhv', state_f32, k_f32) # (B, H, dv)
+        # Step 3: gated delta
+        delta = (v_f32 - kv_mem) * beta_f32[..., None]         # (B, H, dv)
+        # Step 4: rank-1 state update
+        state_f32 = state_f32 + jnp.einsum('bhk,bhv->bhkv', k_f32, delta)
+        # Step 5: query output
+        output = jnp.einsum('bhkv,bhk->bhv', state_f32, q_f32) # (B, H, dv)
+        new_state = state_f32
     new_state = new_state.astype(state_dtype)
 
     # Gated RMSNorm (applied per-head, weight is per v_head_dim)
