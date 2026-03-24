@@ -1,0 +1,107 @@
+# v91: einsum deltanet + 4 micro-batches (BS=512/page) — DELTANET FIX MEASUREMENT
+#
+# OOM analysis:
+#   - Single JIT BS=2048 unrolled einsum: 11.79 GB HLO temps > 5.37 GB free
+#   - Scan mode BS=2048: ~17 GB compile-time carry (paged KV in while_loop) > 94.75 GB total
+#   - Paged BS=1024 (2 micro-batches): ~5.9 GB HLO temps > 5.37 GB free (barely over)
+#   - Paged BS=512 (4 micro-batches): ~2.95 GB HLO temps → fits in 5.37 GB free ✓
+#
+# HLO temps scale linearly with batch per micro-batch: 11.79 × (512/2048) = 2.95 GB.
+# Total KV cache per device unchanged: 4 × 1.05 GB = 4.2 GB (same as 2 × 2.1 GB).
+#
+# Image: v89 = v84 + einsum deltanet + benchmark fix (scan+RPA single JIT)
+# Baseline: v92 (Pallas deltanet + 4 micro-batches).
+# Expected: v91 step ≈ v92 step - 12.5ms (shard_map overhead eliminated).
+#
+# NOTE: 4 micro-batches adds ~2× Python dispatch overhead vs v84 (2 micro-batches).
+# Actual comparison: v91 TPS/chip should be > v84 (138ms, 463 TPS/chip) because
+# deltanet fix (−12.5ms) more than offsets extra serialization overhead (+~5ms).
+#
+# Deploy:
+#   kubectl apply -f k8s/bench_v91_4page_einsum_jobset.yaml \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-v91-4page --prefix=true -f --max-log-requests=8 \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     2>&1 | tee -a /tmp/qwen35-v91-4page.log
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-v91-4page
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-v91-4page
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v89
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/qwen35_benchmark.py"]
+                  args:
+                    - "--config=full"
+                    - "--dtype=fp8"
+                    - "--sharding=B"
+                    - "--batch-size=2048"
+                    - "--prompt-len=1024"
+                    - "--decode-steps=32"
+                    - "--dp=8"
+                    - "--n-runs=3"
+                    - "--use-rpa"
+                    - "--scan-mode=unrolled"
+                    - "--moe-backend=gmm"
+                    - "--skip-prefill"
+                    - "--decode-micro-batches=4"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_offload_gather_to_sparsecore=true
+                        --xla_tpu_enable_offloading_scatter_to_sparsecore=true
+                        --xla_tpu_enable_offloading_sort_to_sparsecore=true
+                        --xla_tpu_enable_latency_hiding_layer_scheduler=true
+                        --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true
+                        --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true
+                        --xla_tpu_scheduler_percent_shared_memory_limit=150
+                        --xla_tpu_prefer_async_allgather_to_allreduce=true
+                        --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true
+                        --xla_tpu_quantized_all_reduce_level=3
+                        --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true
+                        --xla_tpu_enable_sparse_core_reduce_scatter_v2=true
+                        --xla_tpu_sparse_core_reduce_scatter_latency_multiplier=3
+                        --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+                        --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true
+                        --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true
+                        --xla_enable_async_all_gather=true
+                        --xla_tpu_enable_concurrent_sparse_core_offloading=true
+                        --xla_tpu_pcie_bandwidth_multiplier=0.03
+                        --xla_tpu_aggressive_opt_barrier_removal=true
+                        --xla_tpu_enable_sparse_core_collective_aggregator=true
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
