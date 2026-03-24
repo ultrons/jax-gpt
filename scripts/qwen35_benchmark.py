@@ -349,16 +349,20 @@ def run_decode_benchmark(
             return next_token, new_c
 
     elif use_rpa and HAS_RPA:
-        # Legacy per-group JIT path (scan_mode='scan' + use_rpa).
-        # Each group call is separately JITted inside forward_rpa_decode,
-        # so this function must NOT be wrapped in @jax.jit.
+        # Single-JIT scan path (scan_mode='scan' + use_rpa).
+        # Uses XLA while_loop over layers → only 1 layer's buffers live at once.
+        # Replaces the legacy per-group JIT which had high Python dispatch overhead.
+        # With einsum-based deltanet this is the only path that fits in HBM:
+        # unrolled at BS=2048 needs ~11.8 GB HLO temps, scan needs ~537 MB.
+        @jax.jit
         def decode_step(p, tok, c):
-            logits, new_c = forward_rpa_decode(
-                p, tok[:, None], cfg, cache=c,
+            logits, new_c = forward(
+                p, tok[:, None], cfg, cache=c, is_decode=True,
                 cache_sharding=cache_sharding, n_devices=n_devices,
-                mesh=mesh, moe_backend=moe_backend,
+                mesh=mesh, use_rpa=True, scan_mode=scan_mode,
+                moe_backend=moe_backend,
             )
-            next_token = jnp.argmax(logits[:, 0, :], axis=-1).block_until_ready()
+            next_token = jnp.argmax(logits[:, 0, :], axis=-1)
             return next_token, new_c
 
     else:

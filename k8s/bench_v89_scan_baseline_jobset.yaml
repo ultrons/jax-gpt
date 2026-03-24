@@ -1,0 +1,101 @@
+# v89: scan_mode=scan BASELINE — v84 image (old Pallas deltanet) + v89 benchmark fix
+# Same config as v88 (scan+RPA, BS=2048, single JIT) but with v84 Pallas deltanet.
+# Purpose: isolate the deltanet fix effect by comparing v88 vs v89-baseline.
+#
+# v88 = einsum deltanet + scan_mode=scan
+# v89-baseline = Pallas deltanet + scan_mode=scan
+# Difference (v88 - v89-baseline) = deltanet fix effect
+#
+# v84 image has old Pallas deltanet (12.5ms shard_map overhead).
+# But we need the fixed benchmark (scan+RPA single JIT) → use a v89 image
+# built FROM v84 + benchmark fix only (no deltanet change).
+#
+# Actually: v84 image + old benchmark uses legacy per-group path = invalid.
+# Need: v84 image + new benchmark = new image "v90" with only benchmark fix.
+# Or: just reuse the v84 image and accept the legacy per-group path slowness.
+#
+# NOTE: Since v84 image doesn't have the benchmark fix, this job uses image v84.
+# The legacy scan+RPA path (forward_rpa_decode) will be VERY slow (per-group JIT).
+# DO NOT USE this for comparison — build v90 instead.
+#
+# This file is a placeholder. See bench_v90_scan_baseline_jobset.yaml.
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-v89-scan-baseline
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-v89-scan-baseline
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v84
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/qwen35_benchmark.py"]
+                  args:
+                    - "--config=full"
+                    - "--dtype=fp8"
+                    - "--sharding=B"
+                    - "--batch-size=2048"
+                    - "--prompt-len=1024"
+                    - "--decode-steps=32"
+                    - "--dp=8"
+                    - "--n-runs=3"
+                    - "--use-rpa"
+                    - "--scan-mode=scan"
+                    - "--moe-backend=gmm"
+                    - "--skip-prefill"
+                    - "--decode-micro-batches=2"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_offload_gather_to_sparsecore=true
+                        --xla_tpu_enable_offloading_scatter_to_sparsecore=true
+                        --xla_tpu_enable_offloading_sort_to_sparsecore=true
+                        --xla_tpu_enable_latency_hiding_layer_scheduler=true
+                        --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true
+                        --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true
+                        --xla_tpu_scheduler_percent_shared_memory_limit=150
+                        --xla_tpu_prefer_async_allgather_to_allreduce=true
+                        --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true
+                        --xla_tpu_quantized_all_reduce_level=3
+                        --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true
+                        --xla_tpu_enable_sparse_core_reduce_scatter_v2=true
+                        --xla_tpu_sparse_core_reduce_scatter_latency_multiplier=3
+                        --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+                        --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true
+                        --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true
+                        --xla_enable_async_all_gather=true
+                        --xla_tpu_enable_concurrent_sparse_core_offloading=true
+                        --xla_tpu_pcie_bandwidth_multiplier=0.03
+                        --xla_tpu_aggressive_opt_barrier_removal=true
+                        --xla_tpu_enable_sparse_core_collective_aggregator=true
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
