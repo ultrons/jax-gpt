@@ -842,7 +842,7 @@ def _export_measurements(args, cfg, mesh, params, cache, decode_results, use_fp8
         # Build measurement-only model
         from roofline_bridge.schema import OpPrediction
         n_devices = args.devices or jax.device_count()
-        tp = args.tp or jax.local_device_count()
+        tp = n_devices // max(args.dp, 1)
         dp = args.dp
         run_config = RunConfig(
             model="qwen35-397b",
