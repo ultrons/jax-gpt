@@ -302,6 +302,7 @@ def run_decode_benchmark(
     scan_mode: str = 'scan',
     moe_backend: str = 'ragged_dot',
     micro_batches: int = 1,
+    max_seq_len: int | None = None,
 ):
     """Benchmark decode latency.
 
@@ -388,7 +389,9 @@ def run_decode_benchmark(
 
         page_size = 64
         prefill_len = prompt_tokens.shape[1]  # pretend we prefilled this many tokens
-        max_len = cache.gqa_k.shape[3]
+        # When use_rpa=True, gqa_k is a tiny stub (shape[3]=1). Use max_seq_len
+        # if provided; otherwise fall back to gqa_k shape (non-rpa path).
+        max_len = max_seq_len if (use_rpa and max_seq_len is not None) else cache.gqa_k.shape[3]
         pages_per_seq = cdiv(max_len, page_size)
         n_groups = cache.delta_M.shape[0]
         total_pages = B * pages_per_seq
@@ -401,16 +404,6 @@ def run_decode_benchmark(
         kv_packed = 2  # K and V packed together
         n_kv_heads = cfg.gqa_n_kv_heads
         head_dim = cfg.gqa_head_dim
-
-        # Free the large contiguous GQA cache before allocating paged KV.
-        # At BS>=4096, gqa_k/v take ~17 GB per TC and fragment HBM banks.
-        # Paged decode never uses contiguous GQA; replace with tiny dummies now
-        # so the old buffers are freed before we try to allocate paged_kv.
-        import dataclasses as _dc
-        _tiny_gqa = jnp.zeros((n_groups, 1, 1, 1, 1), dtype=cache_dtype)
-        cache = _dc.replace(cache, gqa_k=_tiny_gqa, gqa_v=_tiny_gqa)
-        del _tiny_gqa
-        jax.effects_barrier()
 
         if mesh is not None:
             from jax.sharding import NamedSharding, PartitionSpec as P
@@ -1167,15 +1160,18 @@ def main():
         B = args.batch_size
         max_len = args.max_seq_len
         conv_dim = cfg.delta_n_qk_heads * cfg.delta_qk_head_dim * 2 + cfg.delta_n_v_heads * cfg.delta_v_head_dim
+        # When using RPA paged decode, the contiguous gqa_k/v are never used.
+        # Allocate them as size-1 stubs to avoid wasting ~17 GB per TC at BS>=4096.
+        gqa_len = 1 if args.use_rpa else max_len
 
         cache_fields = {
             'delta_M': ((n_groups, n_delta, B, cfg.delta_n_v_heads, cfg.delta_qk_head_dim, cfg.delta_v_head_dim),
                         P(None, None, dp_axis, tp_axis, None, None)),
             'delta_conv': ((n_groups, n_delta, B, conv_dim, cfg.delta_conv_kernel),
                            P(None, None, dp_axis, tp_axis, None)),
-            'gqa_k': ((n_groups, B, cfg.gqa_n_kv_heads, max_len, cfg.gqa_head_dim),
+            'gqa_k': ((n_groups, B, cfg.gqa_n_kv_heads, gqa_len, cfg.gqa_head_dim),
                        P(None, dp_axis, gqa_kv_axis, None, None)),
-            'gqa_v': ((n_groups, B, cfg.gqa_n_kv_heads, max_len, cfg.gqa_head_dim),
+            'gqa_v': ((n_groups, B, cfg.gqa_n_kv_heads, gqa_len, cfg.gqa_head_dim),
                        P(None, dp_axis, gqa_kv_axis, None, None)),
         }
 
@@ -1301,6 +1297,7 @@ def main():
                 scan_mode=args.scan_mode,
                 moe_backend=args.moe_backend,
                 micro_batches=args.decode_micro_batches,
+                max_seq_len=args.max_seq_len,
             )
 
     # Post-benchmark peak memory report
