@@ -161,8 +161,8 @@ def _sort_and_group(
     sorted_token_ids = flat_token_ids[sort_order]
     sorted_weights = flat_weights[sort_order]
 
-    # one_hot+sum is more TPU-friendly than scatter-add (matrix op vs atomic scatter)
-    group_sizes = jax.nn.one_hot(flat_expert_ids, n_experts, dtype=jnp.int32).sum(axis=0)
+    group_sizes = jnp.zeros(n_experts, dtype=jnp.int32)
+    group_sizes = group_sizes.at[flat_expert_ids].add(1)
 
     x_sorted = x[sorted_token_ids]
     return x_sorted, group_sizes, sorted_weights, sorted_token_ids
@@ -301,9 +301,8 @@ def _ep_inner_body(x, indices, weights, k, axis_name,
     x_sorted = x[order // k]
 
     local_idx = jnp.where(valid, flat_idx - local_start, 0)
-    # one_hot+sum: more TPU-friendly than scatter-add (matrix op vs atomic scatter)
-    group_sizes = (jax.nn.one_hot(local_idx, e_local, dtype=jnp.int32)
-                   * valid[:, None]).sum(axis=0)
+    group_sizes = jnp.zeros(e_local, dtype=jnp.int32)
+    group_sizes = group_sizes.at[local_idx].add(valid.astype(jnp.int32))
 
     if moe_backend == 'gmm':
         expert_out = _expert_swiglu_gmm(x_sorted, group_sizes,
@@ -315,14 +314,13 @@ def _ep_inner_body(x, indices, weights, k, axis_name,
                                      gate_w, up_w, down_w,
                                      gate_s, up_s, down_s)
 
-    # Gather-based combine: inverse permutation maps sorted→original (token, expert)
-    # order, then reshape+sum collapses k expert slots per token.
-    # Avoids scatter-add (conflicts when k>1 tokens share output slot).
     sorted_valid = valid[order]
     expert_out = jnp.where(sorted_valid[:, None], expert_out, 0.0)
-    inv_order = jnp.argsort(order)
-    output = (expert_out[inv_order] * flat_w[:, None]).reshape(m_local, k, d)
-    return jax.lax.psum(output.astype(x.dtype).sum(axis=1), axis_name)
+    expert_out = expert_out * flat_w[order][:, None]
+    output = jnp.zeros((m_local, d), dtype=x.dtype)
+    output = output.at[order // k].add(expert_out.astype(x.dtype))
+    output = jax.lax.psum(output, axis_name)
+    return output
 
 
 def expert_forward_ep(
