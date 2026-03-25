@@ -104,28 +104,17 @@ def _gmm_matmul(x, w, group_sizes, rhs_scale=None, group_offset=None,
 
 def _expert_swiglu_gmm(x_sorted, group_sizes, gate_w, up_w, down_w,
                          gate_scale=None, up_scale=None, down_scale=None,
-                         group_offset=None, rhs_group_offset=None,
-                         gate_up_w=None, gate_up_scale=None):
+                         group_offset=None, rhs_group_offset=None):
     """SwiGLU expert computation via gmm_v2 Pallas kernel.
 
-    When gate_up_w is provided (gate+up concatenated on last axis), a single
-    GMM call replaces two separate gate/up calls — 2 launches instead of 3.
     When rhs_scale is provided, gmm_v2 handles lhs quantization internally.
     """
     with jax.named_scope('expert_gate_up'):
-        if gate_up_w is not None:
-            # Fused: one GMM for gate+up, split output
-            gate_up_out = _gmm_matmul(x_sorted, gate_up_w, group_sizes,
-                                       gate_up_scale, group_offset, rhs_group_offset)
-            n_half = gate_up_out.shape[-1] // 2
-            gate_out = jax.nn.silu(gate_up_out[..., :n_half])
-            up_out = gate_up_out[..., n_half:]
-        else:
-            gate_out = jax.nn.silu(
-                _gmm_matmul(x_sorted, gate_w, group_sizes, gate_scale,
-                             group_offset, rhs_group_offset))
-            up_out = _gmm_matmul(x_sorted, up_w, group_sizes, up_scale,
-                                  group_offset, rhs_group_offset)
+        gate_out = jax.nn.silu(
+            _gmm_matmul(x_sorted, gate_w, group_sizes, gate_scale,
+                         group_offset, rhs_group_offset))
+        up_out = _gmm_matmul(x_sorted, up_w, group_sizes, up_scale,
+                              group_offset, rhs_group_offset)
         intermediate = (gate_out * up_out).astype(x_sorted.dtype)
     with jax.named_scope('expert_down'):
         return _gmm_matmul(intermediate, down_w, group_sizes, down_scale,
@@ -286,8 +275,7 @@ def _ep_inner_body(x, indices, weights, k, axis_name,
                     gate_w, up_w, down_w,
                     gate_s=None, up_s=None, down_s=None,
                     moe_backend: MoeBackend = 'ragged_dot',
-                    rhs_group_offset=None, n_local_experts=None,
-                    gate_up_w=None, gate_up_s=None):
+                    rhs_group_offset=None, n_local_experts=None):
     """Core EP expert logic, called inside shard_map.
 
     When scales are provided, gate_w/up_w/down_w are fp8 in (E, K, N) layout.
@@ -297,9 +285,6 @@ def _ep_inner_body(x, indices, weights, k, axis_name,
         rhs_group_offset: Optional int32[1] offset for stacked weight indexing.
         n_local_experts: When weights are stacked (rhs dim-0 > E_local), pass
             the actual local expert count here. Otherwise derived from gate_w.shape[0].
-        gate_up_w: Optional pre-concatenated gate+up weight (E, K, 2N). When
-            provided, uses a single fused GMM instead of two separate calls.
-        gate_up_s: Scale for gate_up_w in gmm_v2 format (E, 1, 1, 2N).
     """
     my_idx = jax.lax.axis_index(axis_name)
     e_local = n_local_experts if n_local_experts is not None else gate_w.shape[0]
@@ -324,9 +309,7 @@ def _ep_inner_body(x, indices, weights, k, axis_name,
         expert_out = _expert_swiglu_gmm(x_sorted, group_sizes,
                                          gate_w, up_w, down_w,
                                          gate_s, up_s, down_s,
-                                         rhs_group_offset=rhs_group_offset,
-                                         gate_up_w=gate_up_w,
-                                         gate_up_scale=gate_up_s)
+                                         rhs_group_offset=rhs_group_offset)
     else:
         expert_out = _expert_swiglu(x_sorted, group_sizes,
                                      gate_w, up_w, down_w,
@@ -425,7 +408,6 @@ def expert_forward_ep(
                  check_rep=False)
         def _expert_fn(x, indices, weights,
                         lg, lgs, lu, lus, ld, lds):
-            gate_up_local = gate_up_s_local = None
             if is_stacked:
                 # Reshape 4D→3D: (N_L, E_local, ...) → (N_L*E_local, ...)
                 e_local = lg.shape[1]
@@ -436,9 +418,6 @@ def expert_forward_ep(
                 lus = lus.reshape(-1, *lus.shape[2:])
                 lds = lds.reshape(-1, *lds.shape[2:])
                 rhs_offset = jnp.array([layer_idx * e_local], dtype=jnp.int32)
-                # Fuse gate+up: concat on last axis → single GMM instead of two
-                gate_up_local = jnp.concatenate([lg, lu], axis=-1)
-                gate_up_s_local = jnp.concatenate([lgs, lus], axis=-1)
             else:
                 e_local = None
                 rhs_offset = None
@@ -446,9 +425,7 @@ def expert_forward_ep(
                                   lg, lu, ld, lgs, lus, lds,
                                   moe_backend=moe_backend,
                                   rhs_group_offset=rhs_offset,
-                                  n_local_experts=e_local,
-                                  gate_up_w=gate_up_local,
-                                  gate_up_s=gate_up_s_local)
+                                  n_local_experts=e_local)
 
         return _expert_fn(x, expert_indices, expert_weights,
                           gate_fp8, gate_s, up_fp8, up_s, down_fp8, down_s)
