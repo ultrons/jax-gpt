@@ -462,7 +462,7 @@ def run_decode_benchmark(
         # micro_batches>1 splits the batch into smaller JIT calls to reduce
         # per-call HLO temps if needed.
         if micro_batches >= 1 and scan_mode == 'unrolled':
-            import functools
+            import functools, gc
             _paged = True
             assert B % micro_batches == 0, (
                 f"decode_micro_batches ({micro_batches}) must divide "
@@ -472,13 +472,31 @@ def run_decode_benchmark(
             page_total_pages = page_B * pages_per_seq
             print(f"  Paged decode: {micro_batches} micro-batches × BS={page_B}")
 
+            # Free the full-batch paged_kv (cache_after) and the original init_cache
+            # arrays before creating per-micro-batch page_caches.
+            #
+            # cache_after.paged_kv is ~17 GB (full BS=4096) but is never used in the
+            # micro-batch path — each micro-batch creates its own page_cache instead.
+            # cache.delta_M/delta_conv are 6 GB at BS=4096 and not passed to any JIT.
+            # Holding all three simultaneously leaves only ~2 GB free for the 15 GB
+            # program binary, causing RuntimeProgramAllocationFailure at v100.
+            #
+            # Extract the shape/sharding metadata we need, then delete.
+            dm_tail = cache.delta_M.shape[3:]
+            dc_tail = cache.delta_conv.shape[3:]
+            dm_sharding = cache.delta_M.sharding
+            dc_sharding = cache.delta_conv.sharding
+            del cache_after, paged_kv, kv_lens, page_indices, dummy_gqa_k, dummy_gqa_v
+            del cache
+            gc.collect()
+
             # Build sharded zero arrays directly via make_array_from_callback
             # to avoid init_cache + shard_cache which would try to replicate
             # large gqa_k/v tensors on device (90 GB OOM with params already loaded).
-            # Reuse sharding specs from the existing input cache.
+            # Reuse sharding specs from the existing input cache (extracted above).
             cpu = jax.devices('cpu')[0]
-            dm_global = (n_groups, 3, page_B) + cache.delta_M.shape[3:]
-            dc_global = (n_groups, 3, page_B) + cache.delta_conv.shape[3:]
+            dm_global = (n_groups, 3, page_B) + dm_tail
+            dc_global = (n_groups, 3, page_B) + dc_tail
 
             def _sharded_zeros(global_shape, sharding, dtype):
                 def cb(idx):
@@ -492,8 +510,8 @@ def run_decode_benchmark(
 
             page_caches = []
             for _mi in range(micro_batches):
-                page_delta_M = _sharded_zeros(dm_global, cache.delta_M.sharding, cache_dtype)
-                page_delta_conv = _sharded_zeros(dc_global, cache.delta_conv.sharding, cache_dtype)
+                page_delta_M = _sharded_zeros(dm_global, dm_sharding, cache_dtype)
+                page_delta_conv = _sharded_zeros(dc_global, dc_sharding, cache_dtype)
 
                 if mesh is not None:
                     pkv_shape = (n_groups, page_total_pages, page_size,
