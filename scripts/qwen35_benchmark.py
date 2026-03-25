@@ -450,12 +450,15 @@ def run_decode_benchmark(
             first_token = jax.device_put(first_token, NamedSharding(mesh, P(dp_axis)))
         print(f"  Paged KV shape: {paged_kv.shape}")
 
-        # ── Paged decode path (micro_batches > 1) ─────────────────────────
-        # Compile a smaller JIT for page_B sequences to avoid
-        # RuntimeProgramAllocationFailure at large batch sizes.  Each
-        # micro-batch has its own cache; donate_argnums=(2,) aliases the
-        # input/output buffer so the update is in-place (no extra copy).
-        if micro_batches > 1 and scan_mode == 'unrolled':
+        # ── Paged decode path (micro_batches >= 1) ────────────────────────
+        # Use this path whenever use_rpa=True and scan_mode=unrolled.
+        # donate_argnums=(2,) aliases the input/output cache buffer so the
+        # update is in-place — avoids doubling peak memory for the cache.
+        # micro_batches=1 means one JIT call for the full batch (useful for
+        # large BS like 4096 where HLO temps are constant but cache is big).
+        # micro_batches>1 splits the batch into smaller JIT calls to reduce
+        # per-call HLO temps if needed.
+        if micro_batches >= 1 and scan_mode == 'unrolled':
             import functools
             _paged = True
             assert B % micro_batches == 0, (
