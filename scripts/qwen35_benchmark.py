@@ -402,6 +402,16 @@ def run_decode_benchmark(
         n_kv_heads = cfg.gqa_n_kv_heads
         head_dim = cfg.gqa_head_dim
 
+        # Free the large contiguous GQA cache before allocating paged KV.
+        # At BS>=4096, gqa_k/v take ~17 GB per TC and fragment HBM banks.
+        # Paged decode never uses contiguous GQA; replace with tiny dummies now
+        # so the old buffers are freed before we try to allocate paged_kv.
+        import dataclasses as _dc
+        _tiny_gqa = jnp.zeros((n_groups, 1, 1, 1, 1), dtype=cache_dtype)
+        cache = _dc.replace(cache, gqa_k=_tiny_gqa, gqa_v=_tiny_gqa)
+        del _tiny_gqa
+        jax.effects_barrier()
+
         if mesh is not None:
             from jax.sharding import NamedSharding, PartitionSpec as P
             dp_axis = 'dp' if 'dp' in mesh.axis_names else None
