@@ -1,30 +1,34 @@
-# v81: BS=2048 W8A16 decode with --export-measurements → GCS
-# Captures measured step time + TPS/chip into roofline bridge JSON.
-# Merge locally with predictions:
-#   gsutil cp gs://max-experiments/roofline/measurements_v7x_bs2048.json /tmp/
-#   # In explorer.ipynb: set PATH_A = "/tmp/measurements_v7x_bs2048.json"
+# v100: BS=4096, micro_batches=2 (page_B=2048), einsum deltanet
+#
+# Goal: fix compile-time OOM from v99.
+#
+# v99 result: static=56.8 GB (gqa fix worked!), but compile failed:
+#   CompileTimeHbmOom: Used 99.00G of 94.75G hbm. Exceeded by 4.26G.
+#
+# Root cause: micro_batches=1 → page_B=4096, scatter HLO temps scale with
+# page_B. Scatter buffers: bf16[3,512,8,128,128]=384MB each vs 96MB at v93
+# (page_B=1024). Total HLO temps ~42 GB vs ~21.5 GB at v93.
+#
+# Fix: micro_batches=2 → page_B=2048. Scatter buffers halve to 192 MB.
+# Expected HLO temps: ~21 GB. Expected peak: 56.8 + 21 = ~78 GB < 94.75 GB.
+#
+# Expected TPS/chip: similar to or slightly better than v93 (573 TPS/chip)
+# since BS is 2× larger, amortizing fixed costs.
 #
 # Deploy:
-#   kubectl apply -f k8s/bench_v81_roofline_meas_jobset.yaml \
+#   kubectl apply -f k8s/bench_v100_bs4096_jobset.yaml \
 #     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
 #
 # Monitor:
-#   kubectl logs -l app=qwen35-v81-roofline-meas --prefix=true -f \
-#     --max-log-requests=8 \
-#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
-#
-# Fetch result:
-#   gsutil cp gs://max-experiments/roofline/measurements_v7x_bs2048.json /tmp/
-#
-# Cleanup:
-#   kubectl delete jobset qwen35-v81-roofline-meas \
-#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
+#   kubectl logs -l app=qwen35-v100-bs4096 --prefix=true -f --max-log-requests=8 \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     2>&1 | tee -a /tmp/qwen35-v100-bs4096.log
 
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: qwen35-v81-roofline-meas
+  name: qwen35-v100-bs4096
   namespace: default
   labels:
     kueue.x-k8s.io/queue-name: multislice-queue
@@ -45,7 +49,7 @@ spec:
           template:
             metadata:
               labels:
-                app: qwen35-v81-roofline-meas
+                app: qwen35-v100-bs4096
             spec:
               restartPolicy: Never
               nodeSelector:
@@ -53,24 +57,23 @@ spec:
                 cloud.google.com/gke-tpu-topology: 2x4x4
               containers:
                 - name: bench
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v84
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v99
                   imagePullPolicy: Always
                   command: ["python", "scripts/qwen35_benchmark.py"]
                   args:
                     - "--config=full"
                     - "--dtype=fp8"
                     - "--sharding=B"
-                    - "--batch-size=2048"
+                    - "--batch-size=4096"
                     - "--prompt-len=1024"
                     - "--decode-steps=32"
                     - "--dp=8"
-                    - "--n-runs=5"
+                    - "--n-runs=3"
                     - "--use-rpa"
                     - "--scan-mode=unrolled"
                     - "--moe-backend=gmm"
                     - "--skip-prefill"
                     - "--decode-micro-batches=2"
-                    - "--export-measurements=gs://max-experiments/roofline/measurements_v7x_bs2048.json"
                   env:
                     - name: PYTHONUNBUFFERED
                       value: "1"

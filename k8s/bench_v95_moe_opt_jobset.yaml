@@ -1,30 +1,41 @@
-# v81: BS=2048 W8A16 decode with --export-measurements → GCS
-# Captures measured step time + TPS/chip into roofline bridge JSON.
-# Merge locally with predictions:
-#   gsutil cp gs://max-experiments/roofline/measurements_v7x_bs2048.json /tmp/
-#   # In explorer.ipynb: set PATH_A = "/tmp/measurements_v7x_bs2048.json"
+# v95: one_hot routing + gather combine + fused gate+up GMM
+#
+# Changes vs v93 (einsum deltanet, 2-page, 573.3 TPS/chip):
+#   - one_hot+sum for group_sizes (both sort paths)
+#   - gather-based combine: inv_perm+reshape+sum vs scatter-add
+#   - fused gate+up: 2 GMM calls per MoE layer instead of 3
+#
+# Baseline: v94 (Pallas deltanet, 2-page, 463.9 TPS/chip)
+# Compare:  v93 (einsum deltanet, 2-page, 573.3 TPS/chip)
+#
+#
+# Key insight from v91/v92: paged path uses donate_argnums=(2,) which updates
+# cache in-place → near-zero HLO temps (v91 peak = current = 62.46 GB).
+# The previous 11.79 GB OOM (v87) was from the non-paged path (no donation).
+# With the fixed benchmark (v95 image), the paged path is correctly entered.
+#
+# With 2 micro-batches (same as v84 baseline), static ≈ 62.5 GB, fits easily.
+# Expected: ~125ms step (138ms v84 baseline - 12.5ms deltanet fix = 125.5ms)
+# → ~510 TPS/chip vs 463 TPS/chip baseline (10% improvement)
+#
+# Image: v95 = v84 + einsum deltanet + benchmark fix
+# Compare against: v94 (Pallas + 2 micro-batches) to isolate deltanet effect.
+# Also compare against: v84 baseline (138ms) to verify expected improvement.
 #
 # Deploy:
-#   kubectl apply -f k8s/bench_v81_roofline_meas_jobset.yaml \
+#   kubectl apply -f k8s/bench_v93_2page_einsum_jobset.yaml \
 #     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
 #
 # Monitor:
-#   kubectl logs -l app=qwen35-v81-roofline-meas --prefix=true -f \
-#     --max-log-requests=8 \
-#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
-#
-# Fetch result:
-#   gsutil cp gs://max-experiments/roofline/measurements_v7x_bs2048.json /tmp/
-#
-# Cleanup:
-#   kubectl delete jobset qwen35-v81-roofline-meas \
-#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
+#   kubectl logs -l app=qwen35-v95-moe-opt --prefix=true -f --max-log-requests=8 \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     2>&1 | tee -a /tmp/qwen35-v95-moe-opt.log
 
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: qwen35-v81-roofline-meas
+  name: qwen35-v95-moe-opt
   namespace: default
   labels:
     kueue.x-k8s.io/queue-name: multislice-queue
@@ -45,7 +56,7 @@ spec:
           template:
             metadata:
               labels:
-                app: qwen35-v81-roofline-meas
+                app: qwen35-v95-moe-opt
             spec:
               restartPolicy: Never
               nodeSelector:
@@ -53,7 +64,7 @@ spec:
                 cloud.google.com/gke-tpu-topology: 2x4x4
               containers:
                 - name: bench
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v84
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v95
                   imagePullPolicy: Always
                   command: ["python", "scripts/qwen35_benchmark.py"]
                   args:
@@ -64,13 +75,12 @@ spec:
                     - "--prompt-len=1024"
                     - "--decode-steps=32"
                     - "--dp=8"
-                    - "--n-runs=5"
+                    - "--n-runs=3"
                     - "--use-rpa"
                     - "--scan-mode=unrolled"
                     - "--moe-backend=gmm"
                     - "--skip-prefill"
                     - "--decode-micro-batches=2"
-                    - "--export-measurements=gs://max-experiments/roofline/measurements_v7x_bs2048.json"
                   env:
                     - name: PYTHONUNBUFFERED
                       value: "1"

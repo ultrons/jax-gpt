@@ -1,30 +1,27 @@
-# v81: BS=2048 W8A16 decode with --export-measurements → GCS
-# Captures measured step time + TPS/chip into roofline bridge JSON.
-# Merge locally with predictions:
-#   gsutil cp gs://max-experiments/roofline/measurements_v7x_bs2048.json /tmp/
-#   # In explorer.ipynb: set PATH_A = "/tmp/measurements_v7x_bs2048.json"
+# v85: BS=2048 W8A16 decode with XLA profile capture → GCS
+# Same perf config as v84, adds --profile + PROFILE_DIR for per-op measurement.
+#
+# After job completes, run:
+#   python -m roofline_bridge.extract_profile \
+#     --profile-gcs gs://max-experiments/profiles/v84_bs2048_tp8dp8 \
+#     --predictions /tmp/predictions_v7x_bs2048.json \
+#     --out /tmp/predictions_v7x_bs2048.json
 #
 # Deploy:
-#   kubectl apply -f k8s/bench_v81_roofline_meas_jobset.yaml \
+#   kubectl apply -f k8s/bench_v85_profile_jobset.yaml \
 #     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
 #
 # Monitor:
-#   kubectl logs -l app=qwen35-v81-roofline-meas --prefix=true -f \
+#   kubectl logs -l app=qwen35-v85-profile --prefix=true -f \
 #     --max-log-requests=8 \
-#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
-#
-# Fetch result:
-#   gsutil cp gs://max-experiments/roofline/measurements_v7x_bs2048.json /tmp/
-#
-# Cleanup:
-#   kubectl delete jobset qwen35-v81-roofline-meas \
-#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     2>&1 | tee -a /tmp/qwen35-v85-profile.log
 
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: qwen35-v81-roofline-meas
+  name: qwen35-v85-profile
   namespace: default
   labels:
     kueue.x-k8s.io/queue-name: multislice-queue
@@ -45,7 +42,7 @@ spec:
           template:
             metadata:
               labels:
-                app: qwen35-v81-roofline-meas
+                app: qwen35-v85-profile
             spec:
               restartPolicy: Never
               nodeSelector:
@@ -64,16 +61,18 @@ spec:
                     - "--prompt-len=1024"
                     - "--decode-steps=32"
                     - "--dp=8"
-                    - "--n-runs=5"
+                    - "--n-runs=3"
                     - "--use-rpa"
                     - "--scan-mode=unrolled"
                     - "--moe-backend=gmm"
                     - "--skip-prefill"
                     - "--decode-micro-batches=2"
-                    - "--export-measurements=gs://max-experiments/roofline/measurements_v7x_bs2048.json"
+                    - "--profile"
                   env:
                     - name: PYTHONUNBUFFERED
                       value: "1"
+                    - name: PROFILE_DIR
+                      value: "gs://max-experiments/profiles/v84_bs2048_tp8dp8"
                     - name: LIBTPU_INIT_ARGS
                       value: >-
                         --xla_tpu_offload_gather_to_sparsecore=true

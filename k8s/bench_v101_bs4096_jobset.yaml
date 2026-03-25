@@ -1,30 +1,39 @@
-# v81: BS=2048 W8A16 decode with --export-measurements → GCS
-# Captures measured step time + TPS/chip into roofline bridge JSON.
-# Merge locally with predictions:
-#   gsutil cp gs://max-experiments/roofline/measurements_v7x_bs2048.json /tmp/
-#   # In explorer.ipynb: set PATH_A = "/tmp/measurements_v7x_bs2048.json"
+# v101: BS=4096, micro_batches=2 (page_B=2048), free wasted cache_after.paged_kv
+#
+# Goal: fix RuntimeProgramAllocationFailure from v100.
+#
+# v100 result: compilation succeeded, but runtime failed:
+#   RuntimeProgramAllocationFailure: Attempting to reserve 15.03G at the bottom
+#   of memory. There are 2.16G free.
+#
+# Root cause: 3× paged_kv allocated simultaneously at BS=4096:
+#   cache_after.paged_kv (full BS, ~17 GB) — never used in micro-batch path!
+#   page_caches[0].paged_kv (~8.4 GB)
+#   page_caches[1].paged_kv (~8.4 GB)
+#   + cache.delta_M/delta_conv (~6 GB, also unreachable by JIT)
+#   Total: ~40 GB wasted → only 2.16 GB free for 15 GB program binary.
+#
+# Fix: before creating page_caches, extract shape/sharding from cache, then:
+#   del cache_after, paged_kv, kv_lens, page_indices, dummy_gqa_k, dummy_gqa_v
+#   del cache; gc.collect()
+# Frees ~22.7 GB. Expected static after fix: ~74 GB, leaving ~28 GB for binary.
+#
+# Expected peak: ~74 + 15 (program binary) + ~10-21 (HLO temps) ≈ 99-110 GB.
 #
 # Deploy:
-#   kubectl apply -f k8s/bench_v81_roofline_meas_jobset.yaml \
+#   kubectl apply -f k8s/bench_v101_bs4096_jobset.yaml \
 #     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
 #
 # Monitor:
-#   kubectl logs -l app=qwen35-v81-roofline-meas --prefix=true -f \
-#     --max-log-requests=8 \
-#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
-#
-# Fetch result:
-#   gsutil cp gs://max-experiments/roofline/measurements_v7x_bs2048.json /tmp/
-#
-# Cleanup:
-#   kubectl delete jobset qwen35-v81-roofline-meas \
-#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
+#   kubectl logs -l app=qwen35-v101-bs4096 --prefix=true -f --max-log-requests=8 \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     2>&1 | tee -a /tmp/qwen35-v101-bs4096.log
 
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: qwen35-v81-roofline-meas
+  name: qwen35-v101-bs4096
   namespace: default
   labels:
     kueue.x-k8s.io/queue-name: multislice-queue
@@ -45,7 +54,7 @@ spec:
           template:
             metadata:
               labels:
-                app: qwen35-v81-roofline-meas
+                app: qwen35-v101-bs4096
             spec:
               restartPolicy: Never
               nodeSelector:
@@ -53,24 +62,23 @@ spec:
                 cloud.google.com/gke-tpu-topology: 2x4x4
               containers:
                 - name: bench
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v84
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v101
                   imagePullPolicy: Always
                   command: ["python", "scripts/qwen35_benchmark.py"]
                   args:
                     - "--config=full"
                     - "--dtype=fp8"
                     - "--sharding=B"
-                    - "--batch-size=2048"
+                    - "--batch-size=4096"
                     - "--prompt-len=1024"
                     - "--decode-steps=32"
                     - "--dp=8"
-                    - "--n-runs=5"
+                    - "--n-runs=3"
                     - "--use-rpa"
                     - "--scan-mode=unrolled"
                     - "--moe-backend=gmm"
                     - "--skip-prefill"
                     - "--decode-micro-batches=2"
-                    - "--export-measurements=gs://max-experiments/roofline/measurements_v7x_bs2048.json"
                   env:
                     - name: PYTHONUNBUFFERED
                       value: "1"

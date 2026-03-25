@@ -1,30 +1,28 @@
-# v81: BS=2048 W8A16 decode with --export-measurements → GCS
-# Captures measured step time + TPS/chip into roofline bridge JSON.
-# Merge locally with predictions:
-#   gsutil cp gs://max-experiments/roofline/measurements_v7x_bs2048.json /tmp/
-#   # In explorer.ipynb: set PATH_A = "/tmp/measurements_v7x_bs2048.json"
+# v94: Pallas deltanet BASELINE + 2 micro-batches — comparison for v93
+#
+# Same config as v93 but uses v90 image (v84 Pallas deltanet + benchmark fix).
+# Comparison: v93 (einsum) vs v94 (Pallas), both unrolled + 2 micro-batches.
+# Difference = deltanet fix effect at 2-page config (should be ~12.5ms/step).
+#
+# Also compare v94 vs v84 baseline (138ms, 2 micro-batches, no benchmark fix).
+# If v94 ≈ 138ms → benchmark fix is neutral; confirms v84 baseline is valid.
+#
+# Image: v90 = v84 (Pallas deltanet) + benchmark fix only
 #
 # Deploy:
-#   kubectl apply -f k8s/bench_v81_roofline_meas_jobset.yaml \
+#   kubectl apply -f k8s/bench_v94_2page_pallas_baseline_jobset.yaml \
 #     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
 #
 # Monitor:
-#   kubectl logs -l app=qwen35-v81-roofline-meas --prefix=true -f \
-#     --max-log-requests=8 \
-#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
-#
-# Fetch result:
-#   gsutil cp gs://max-experiments/roofline/measurements_v7x_bs2048.json /tmp/
-#
-# Cleanup:
-#   kubectl delete jobset qwen35-v81-roofline-meas \
-#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
+#   kubectl logs -l app=qwen35-v94-2page-pallas --prefix=true -f --max-log-requests=8 \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     2>&1 | tee -a /tmp/qwen35-v94-2page-pallas.log
 
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: qwen35-v81-roofline-meas
+  name: qwen35-v94-2page-pallas
   namespace: default
   labels:
     kueue.x-k8s.io/queue-name: multislice-queue
@@ -45,7 +43,7 @@ spec:
           template:
             metadata:
               labels:
-                app: qwen35-v81-roofline-meas
+                app: qwen35-v94-2page-pallas
             spec:
               restartPolicy: Never
               nodeSelector:
@@ -53,7 +51,7 @@ spec:
                 cloud.google.com/gke-tpu-topology: 2x4x4
               containers:
                 - name: bench
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v84
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v90
                   imagePullPolicy: Always
                   command: ["python", "scripts/qwen35_benchmark.py"]
                   args:
@@ -64,13 +62,12 @@ spec:
                     - "--prompt-len=1024"
                     - "--decode-steps=32"
                     - "--dp=8"
-                    - "--n-runs=5"
+                    - "--n-runs=3"
                     - "--use-rpa"
                     - "--scan-mode=unrolled"
                     - "--moe-backend=gmm"
                     - "--skip-prefill"
                     - "--decode-micro-batches=2"
-                    - "--export-measurements=gs://max-experiments/roofline/measurements_v7x_bs2048.json"
                   env:
                     - name: PYTHONUNBUFFERED
                       value: "1"

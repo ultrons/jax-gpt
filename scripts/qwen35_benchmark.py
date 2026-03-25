@@ -303,6 +303,7 @@ def run_decode_benchmark(
     moe_backend: str = 'ragged_dot',
     micro_batches: int = 1,
     max_seq_len: int | None = None,
+    prefill_micro_batches: int = 0,
 ):
     """Benchmark decode latency.
 
@@ -438,9 +439,131 @@ def run_decode_benchmark(
         dummy_gqa_k = jnp.zeros((n_groups, 1, 1, 1, 1), dtype=cache_dtype)
         dummy_gqa_v = jnp.zeros_like(dummy_gqa_k)
 
+        if prefill_micro_batches > 0:
+            # ── Chunked prefill into paged KV cache ──────────────────────────
+            # Run real prefill in micro-batches of BS/N sequences each.
+            # Each chunk: full causal forward pass → correct delta_M/delta_conv
+            # and gqa_k/v → convert to paged format → scatter into paged_kv.
+            # After all chunks: concatenate delta states along batch axis (axis=2)
+            # and start decode with a properly populated KV cache.
+            import gc
+            from jax_gpt.models.qwen35.paged_cache import contiguous_to_paged
+            from jax_gpt.models.qwen35.sharding import _safe_spec
+
+            assert B % prefill_micro_batches == 0, (
+                f"--prefill-micro-batches ({prefill_micro_batches}) must divide "
+                f"batch_size ({B})"
+            )
+            pfill_bs = B // prefill_micro_batches
+            chunk_pages = pfill_bs * pages_per_seq
+
+            n_delta = cache.delta_M.shape[1]
+            conv_dim_size = cache.delta_conv.shape[3]
+
+            @jax.jit
+            def prefill_chunk_fn(p, t, c):
+                return forward(p, t, cfg, cache=c, is_decode=False,
+                               cache_sharding=cache_sharding, n_devices=n_devices,
+                               mesh=mesh, last_logit_only=True, scan_mode=scan_mode,
+                               moe_backend=moe_backend)
+
+            def _make_chunk_cache(bs_local):
+                """Zero-initialized HybridCache for bs_local seqs with real gqa_len=prefill_len."""
+                if mesh is not None:
+                    # Reuse sharding specs from the existing cache (same axes, smaller batch)
+                    chunk_fields = {
+                        'delta_M': (
+                            (n_groups, n_delta, bs_local, cfg.delta_n_v_heads,
+                             cfg.delta_qk_head_dim, cfg.delta_v_head_dim),
+                            cache.delta_M.sharding.spec,
+                        ),
+                        'delta_conv': (
+                            (n_groups, n_delta, bs_local, conv_dim_size, cfg.delta_conv_kernel),
+                            cache.delta_conv.sharding.spec,
+                        ),
+                        'gqa_k': (
+                            (n_groups, bs_local, cfg.gqa_n_kv_heads, prefill_len, cfg.gqa_head_dim),
+                            P(None, dp_axis, cache.gqa_k.sharding.spec[2], None, None),
+                        ),
+                        'gqa_v': (
+                            (n_groups, bs_local, cfg.gqa_n_kv_heads, prefill_len, cfg.gqa_head_dim),
+                            P(None, dp_axis, cache.gqa_k.sharding.spec[2], None, None),
+                        ),
+                    }
+                    chunk_arrays = {}
+                    with mesh:
+                        for name, (shape, spec) in chunk_fields.items():
+                            safe = _safe_spec(spec, shape, mesh)
+                            sharding = NamedSharding(mesh, safe)
+                            def _cb(idx, sh=shape, dt=cache_dtype):
+                                shard_shape = tuple(
+                                    (s.stop - s.start) if s.start is not None else dim
+                                    for s, dim in zip(idx, sh)
+                                )
+                                with jax.default_device(cpu):
+                                    return jnp.zeros(shard_shape, dtype=dt)
+                            chunk_arrays[name] = jax.make_array_from_callback(
+                                shape, sharding, _cb)
+                        chunk_arrays['pos'] = jax.make_array_from_callback(
+                            (), NamedSharding(mesh, P()),
+                            lambda idx: np.array(0, dtype=np.int32))
+                    return HybridCache(**chunk_arrays)
+                else:
+                    from jax_gpt.models.qwen35.cache import init_cache
+                    return init_cache(cfg, bs_local, prefill_len, dtype=cache_dtype)
+
+            print(f"  Chunked prefill: {prefill_micro_batches} micro-batches × BS={pfill_bs}")
+
+            # Compile once on the first chunk
+            print("  Compiling prefill chunk...")
+            t_pfill_compile = time.perf_counter()
+            _cc = _make_chunk_cache(pfill_bs)
+            _ = prefill_chunk_fn(params, prompt_tokens[:pfill_bs], _cc)
+            del _cc
+            gc.collect()
+            print(f"  Prefill chunk compilation: {(time.perf_counter()-t_pfill_compile)*1000:.0f} ms")
+
+            # Run N chunks, populate paged_kv and collect delta states
+            all_delta_M, all_delta_conv, all_first_tokens = [], [], []
+
+            for c in range(prefill_micro_batches):
+                start, end = c * pfill_bs, (c + 1) * pfill_bs
+                print(f"  Prefill chunk {c+1}/{prefill_micro_batches} (seqs {start}–{end-1})...")
+                chunk_cache = _make_chunk_cache(pfill_bs)
+                logits, c_out = prefill_chunk_fn(params, prompt_tokens[start:end], chunk_cache)
+                logits.block_until_ready()
+
+                # Convert contiguous gqa_k/v → paged format, scatter into full paged_kv.
+                # contiguous_to_paged: list of n_groups arrays (chunk_pages, page_size, ...)
+                chunk_paged = contiguous_to_paged(
+                    c_out.gqa_k, c_out.gqa_v, prefill_len, page_size, cache_dtype)
+                chunk_paged_stacked = jnp.stack(chunk_paged, axis=0)  # (n_groups, chunk_pages, ...)
+                page_start = c * chunk_pages
+                paged_kv = paged_kv.at[:, page_start:page_start + chunk_pages].set(
+                    chunk_paged_stacked)
+
+                # delta_M/delta_conv batch axis is 2
+                all_delta_M.append(c_out.delta_M)
+                all_delta_conv.append(c_out.delta_conv)
+                all_first_tokens.append(jnp.argmax(logits[:, 0, :], axis=-1))
+                del c_out, chunk_cache, chunk_paged, chunk_paged_stacked, logits
+                gc.collect()
+
+            prefill_delta_M = jnp.concatenate(all_delta_M, axis=2)
+            prefill_delta_conv = jnp.concatenate(all_delta_conv, axis=2)
+            first_token = jnp.concatenate(all_first_tokens, axis=0)
+            print(f"  Chunked prefill complete. KV cache populated.")
+        else:
+            # Skip prefill: zero KV cache, zero delta states (decode-only benchmark).
+            prefill_delta_M = cache.delta_M
+            prefill_delta_conv = cache.delta_conv
+            first_token = jnp.ones((B,), dtype=jnp.int32)
+            if mesh is not None and 'dp' in mesh.axis_names:
+                first_token = jax.device_put(first_token, NamedSharding(mesh, P(dp_axis)))
+
         cache_after = HybridCache(
-            delta_M=cache.delta_M,
-            delta_conv=cache.delta_conv,
+            delta_M=prefill_delta_M,
+            delta_conv=prefill_delta_conv,
             gqa_k=dummy_gqa_k,
             gqa_v=dummy_gqa_v,
             pos=jnp.array(prefill_len, dtype=jnp.int32),
@@ -448,9 +571,6 @@ def run_decode_benchmark(
             kv_lens=kv_lens,
             page_indices=page_indices,
         )
-        first_token = jnp.ones((B,), dtype=jnp.int32)
-        if mesh is not None and 'dp' in mesh.axis_names:
-            first_token = jax.device_put(first_token, NamedSharding(mesh, P(dp_axis)))
         print(f"  Paged KV shape: {paged_kv.shape}")
 
         # ── Paged decode path (micro_batches >= 1) ────────────────────────
@@ -981,6 +1101,11 @@ def main():
                              'compilation HBM footprint. Use 2 for BS=2048 if '
                              'RuntimeProgramAllocationFailure occurs. '
                              'Requires --use-rpa --scan-mode=unrolled.')
+    parser.add_argument('--prefill-micro-batches', type=int, default=0,
+                        help='Run real chunked prefill into paged KV cache using N micro-batches '
+                             '(each BS/N sequences). 0 = skip prefill (decode-only benchmark). '
+                             'Enables correctness testing at full decode BS. '
+                             'Requires --use-rpa --scan-mode=unrolled.')
     parser.add_argument('--export-measurements', metavar='PATH', default=None,
                         help='Write roofline measurement JSON to PATH after decode benchmark. '
                              'If PATH already contains a predictions.json from exporter.py, '
@@ -1316,6 +1441,7 @@ def main():
                 moe_backend=args.moe_backend,
                 micro_batches=args.decode_micro_batches,
                 max_seq_len=args.max_seq_len,
+                prefill_micro_batches=args.prefill_micro_batches,
             )
 
     # Post-benchmark peak memory report
