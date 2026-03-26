@@ -402,16 +402,21 @@ def run_decode_benchmark(
               f"pages_per_seq={pages_per_seq})...")
 
         cache_dtype = cache.delta_M.dtype
-        kv_packed = 2  # K and V packed together
-        n_kv_heads = cfg.gqa_n_kv_heads
-        head_dim = cfg.gqa_head_dim
+        from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
+            get_kv_cache_shape as _gkcs,
+        )
+        # Correct paged KV shape using the same kernel helper used by contiguous_to_paged.
+        # Shape: (n_groups, total_pages, page_size, kv_packed_dim, packing, aligned_head_dim)
+        # e.g. fp8 (n_kv_heads=2, head_dim=256): (n_groups, pages, 64, 1, 4, 256)
+        paged_kv_shape = (n_groups,) + _gkcs(
+            total_pages, page_size, cfg.gqa_n_kv_heads, cfg.gqa_head_dim, cache_dtype
+        )
 
         if mesh is not None:
             from jax.sharding import NamedSharding, PartitionSpec as P
             dp_axis = 'dp' if 'dp' in mesh.axis_names else None
             cpu = jax.devices('cpu')[0]
 
-            paged_kv_shape = (n_groups, total_pages, page_size, kv_packed, n_kv_heads, head_dim)
             paged_kv_sharding = NamedSharding(mesh, P(None, dp_axis, None, None, None, None))
             def _paged_cb(idx):
                 shard_shape = tuple(
@@ -431,8 +436,7 @@ def run_decode_benchmark(
                 (total_pages,), page_indices_sharding,
                 lambda idx: np.arange(idx[0].start, idx[0].stop, dtype=np.int32))
         else:
-            paged_kv = jnp.zeros((n_groups, total_pages, page_size, kv_packed, n_kv_heads, head_dim),
-                                  dtype=cache_dtype)
+            paged_kv = jnp.zeros(paged_kv_shape, dtype=cache_dtype)
             kv_lens = jnp.full((B,), prefill_len, dtype=jnp.int32)
             page_indices = jnp.arange(total_pages, dtype=jnp.int32)
 
@@ -440,11 +444,11 @@ def run_decode_benchmark(
         dummy_gqa_v = jnp.zeros_like(dummy_gqa_k)
 
         if prefill_micro_batches > 0:
-            # ── Chunked prefill → paged KV cache (no scatter) ────────────────
-            # Run prefill in N micro-batches. Collect raw gqa_k/v from each chunk,
-            # concatenate along the batch axis after the loop, then convert to paged
-            # format once via contiguous_to_paged. This avoids a 50+ GB jit_scatter
-            # program that cannot fit in HBM alongside model weights.
+            # ── Chunked prefill → paged KV cache (write-into, v107) ──────────
+            # Run prefill in N micro-batches. Each chunk's gqa_k/v is immediately
+            # converted to paged format and written into the pre-allocated paged_kv
+            # buffer via dynamic_update_slice + donate_argnums (in-place, no 2× spike).
+            # HBM stays constant: only one chunk's temp data is live at a time.
             import gc
             from jax_gpt.models.qwen35.paged_cache import contiguous_to_paged
             from jax_gpt.models.qwen35.sharding import _safe_spec
@@ -525,10 +529,23 @@ def run_decode_benchmark(
             gc.collect()
             print(f"  Prefill chunk compilation: {(time.perf_counter()-t_pfill_compile)*1000:.0f} ms")
 
-            # Run N chunks. Convert each chunk's gqa_k/v to paged format immediately
-            # so we never hold all contiguous gqa_k/v tensors simultaneously.
-            # Avoids: (1) accumulating B-wide contiguous tensors, (2) 50+ GB jit_scatter.
-            all_paged_chunks = []  # each entry: list of n_groups paged tensors for that chunk
+            # v107: write-into pre-allocated paged_kv (constant HBM).
+            # Each chunk writes directly into paged_kv[:, c*chunk_pages:(c+1)*chunk_pages, ...]
+            # via dynamic_update_slice + donate_argnums=(0,), so the buffer is updated in-place
+            # and never grows between chunks.  This eliminates the accumulation that caused
+            # v106 to OOM at chunk 6 (13.07 GB free < 13.22 GB binary after 5×1.1 GB chunks).
+            chunk_pages = pfill_bs * pages_per_seq
+
+            import functools
+
+            @functools.partial(jax.jit, donate_argnums=(0,))
+            def _write_chunk_to_paged_kv(paged_kv_buf, chunk_stacked, page_start):
+                z = jnp.int32(0)
+                return jax.lax.dynamic_update_slice(
+                    paged_kv_buf, chunk_stacked,
+                    (z, page_start, z, z, z, z),
+                )
+
             all_delta_M, all_delta_conv, all_first_tokens = [], [], []
 
             for c in range(prefill_micro_batches):
@@ -538,30 +555,23 @@ def run_decode_benchmark(
                 logits, c_out = prefill_chunk_fn(params, prompt_tokens[start:end], chunk_cache)
                 logits.block_until_ready()
 
-                # Immediately convert to paged (reshape+transpose — tiny XLA program).
-                # Free contiguous gqa_k/v before moving to the next chunk.
-                chunk_paged = contiguous_to_paged(c_out.gqa_k, c_out.gqa_v, prefill_len, page_size, cache_dtype)
-                chunk_paged[0].block_until_ready()
-                all_paged_chunks.append(chunk_paged)
+                # Write chunk KV directly into pre-allocated paged_kv (no accumulation).
+                chunk_paged_list = contiguous_to_paged(
+                    c_out.gqa_k, c_out.gqa_v, prefill_len, page_size, cache_dtype
+                )
+                chunk_paged_stacked = jnp.stack(chunk_paged_list, axis=0)
+                paged_kv = _write_chunk_to_paged_kv(
+                    paged_kv, chunk_paged_stacked, jnp.int32(c * chunk_pages)
+                )
+                paged_kv.block_until_ready()
 
                 all_delta_M.append(c_out.delta_M)
                 all_delta_conv.append(c_out.delta_conv)
                 all_first_tokens.append(jnp.argmax(logits[:, 0, :], axis=-1))
-                del c_out, chunk_cache, logits, chunk_paged
+                del c_out, chunk_cache, logits, chunk_paged_list, chunk_paged_stacked
                 gc.collect()
 
-            # Concatenate paged chunks per group (axis=0 = pages axis), then stack groups.
-            # Each chunk: (chunk_pages, page_size, kv_packed, packing, head_dim) per group.
-            print("  Assembling paged KV cache...")
-            n_groups_paged = len(all_paged_chunks[0])
-            merged = [
-                jnp.concatenate([all_paged_chunks[c][g] for c in range(prefill_micro_batches)], axis=0)
-                for g in range(n_groups_paged)
-            ]
-            paged_kv = jnp.stack(merged, axis=0)  # (n_groups, total_pages, page_size, ...)
-            del all_paged_chunks, merged
-            gc.collect()
-
+            # paged_kv is fully populated — no assembly step needed.
             prefill_delta_M = jnp.concatenate(all_delta_M, axis=2)
             prefill_delta_conv = jnp.concatenate(all_delta_conv, axis=2)
             first_token = jnp.concatenate(all_first_tokens, axis=0)
