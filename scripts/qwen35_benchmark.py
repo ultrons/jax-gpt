@@ -577,9 +577,17 @@ def run_decode_benchmark(
                 gc.collect()
 
             # paged_kv is fully populated — no assembly step needed.
+            # Free per-chunk lists immediately after concat to avoid holding
+            # 16 × delta_M + 16 × delta_conv in HBM during decode compilation.
             prefill_delta_M = jnp.concatenate(all_delta_M, axis=2)
+            prefill_delta_M.block_until_ready()
+            del all_delta_M
             prefill_delta_conv = jnp.concatenate(all_delta_conv, axis=2)
+            prefill_delta_conv.block_until_ready()
+            del all_delta_conv
             first_token = jnp.concatenate(all_first_tokens, axis=0)
+            del all_first_tokens
+            gc.collect()
             print(f"  Chunked prefill complete. KV cache populated.")
         else:
             # Skip prefill: zero KV cache, zero delta states (decode-only benchmark).
