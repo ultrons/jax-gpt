@@ -644,6 +644,7 @@ def run_decode_benchmark(
             dc_sharding = cache.delta_conv.sharding
             del cache_after, paged_kv, kv_lens, page_indices, dummy_gqa_k, dummy_gqa_v
             del cache
+            del prefill_delta_M, prefill_delta_conv  # v111: free chunked-prefill delta states
             gc.collect()
 
             # Build sharded zero arrays directly via make_array_from_callback
