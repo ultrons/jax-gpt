@@ -538,12 +538,17 @@ def run_decode_benchmark(
 
             import functools
 
-            @functools.partial(jax.jit, donate_argnums=(0,))
+            # static_argnums=(2,): page_start is a Python int baked into each trace.
+            # GSPMD can then determine statically which dp shard the update targets,
+            # avoiding an all-gather of the full paged_kv (which would exceed XLA's
+            # 32-bit allocation-word limit at ~135 GB/device).
+            # 16 unique page_start values → 16 retraces, each a trivial DUS.
+            @functools.partial(jax.jit, donate_argnums=(0,), static_argnums=(2,))
             def _write_chunk_to_paged_kv(paged_kv_buf, chunk_stacked, page_start):
                 z = jnp.int32(0)
                 return jax.lax.dynamic_update_slice(
                     paged_kv_buf, chunk_stacked,
-                    (z, page_start, z, z, z, z),
+                    (z, jnp.int32(page_start), z, z, z, z),
                 )
 
             all_delta_M, all_delta_conv, all_first_tokens = [], [], []
@@ -561,7 +566,7 @@ def run_decode_benchmark(
                 )
                 chunk_paged_stacked = jnp.stack(chunk_paged_list, axis=0)
                 paged_kv = _write_chunk_to_paged_kv(
-                    paged_kv, chunk_paged_stacked, jnp.int32(c * chunk_pages)
+                    paged_kv, chunk_paged_stacked, c * chunk_pages  # Python int → static
                 )
                 paged_kv.block_until_ready()
 
