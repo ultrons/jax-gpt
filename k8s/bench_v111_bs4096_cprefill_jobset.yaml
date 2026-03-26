@@ -1,0 +1,102 @@
+# v111: BS=4096, chunked prefill — free prefill_delta_M/conv before decode compilation
+#
+# Changes vs v110 (which freed all_delta_M/conv lists after concat):
+#   After concat, prefill_delta_M and prefill_delta_conv are ~1.67 GB NEW allocations
+#   that survive del cache_after / del cache. They are never used in the micro-batch
+#   decode path (which uses zero page_delta_M/conv). Freed immediately after the
+#   existing deletion block before gc.collect().
+#
+# v110 failure: RuntimeProgramAllocationFailure — 15.03 GB binary, 11.51 GB free.
+#   After v110 freed the 16-chunk lists, only ~1.67 GB extra remained alive.
+#   Expected free: ~13 GB (below 15.03 GB needed). v111 adds ~1.67 GB → ~13.2 GB.
+#   (Margin is thin; if still OOM, next target is the ~10 GB unaccounted gap.)
+#
+# Deploy:
+#   kubectl apply -f k8s/bench_v111_bs4096_cprefill_jobset.yaml \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-v111-bs4096-cprefill --prefix=true -f --max-log-requests=8 \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     2>&1 | tee -a /tmp/qwen35-v111-bs4096-cprefill.log
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-v111-bs4096-cprefill
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-v111-bs4096-cprefill
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v111
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/qwen35_benchmark.py"]
+                  args:
+                    - "--config=full"
+                    - "--dtype=fp8"
+                    - "--sharding=B"
+                    - "--batch-size=4096"
+                    - "--prompt-len=1024"
+                    - "--decode-steps=32"
+                    - "--dp=8"
+                    - "--n-runs=3"
+                    - "--use-rpa"
+                    - "--scan-mode=unrolled"
+                    - "--moe-backend=gmm"
+                    - "--skip-prefill"
+                    - "--decode-micro-batches=2"
+                    - "--prefill-micro-batches=16"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_offload_gather_to_sparsecore=true
+                        --xla_tpu_enable_offloading_scatter_to_sparsecore=true
+                        --xla_tpu_enable_offloading_sort_to_sparsecore=true
+                        --xla_tpu_enable_latency_hiding_layer_scheduler=true
+                        --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true
+                        --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true
+                        --xla_tpu_scheduler_percent_shared_memory_limit=150
+                        --xla_tpu_prefer_async_allgather_to_allreduce=true
+                        --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true
+                        --xla_tpu_quantized_all_reduce_level=3
+                        --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true
+                        --xla_tpu_enable_sparse_core_reduce_scatter_v2=true
+                        --xla_tpu_sparse_core_reduce_scatter_latency_multiplier=3
+                        --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+                        --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true
+                        --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true
+                        --xla_enable_async_all_gather=true
+                        --xla_tpu_enable_concurrent_sparse_core_offloading=true
+                        --xla_tpu_pcie_bandwidth_multiplier=0.03
+                        --xla_tpu_aggressive_opt_barrier_removal=true
+                        --xla_tpu_enable_sparse_core_collective_aggregator=true
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
