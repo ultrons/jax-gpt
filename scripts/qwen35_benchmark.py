@@ -662,8 +662,9 @@ def run_decode_benchmark(
                 page_delta_conv = _sharded_zeros(dc_global, dc_sharding, cache_dtype)
 
                 if mesh is not None:
-                    pkv_shape = (n_groups, page_total_pages, page_size,
-                                 kv_packed, n_kv_heads, head_dim)
+                    pkv_shape = (n_groups,) + _gkcs(
+                        page_total_pages, page_size, cfg.gqa_n_kv_heads, cfg.gqa_head_dim, cache_dtype
+                    )
                     pkv_sharding = NamedSharding(mesh, P(None, dp_axis, None, None, None, None))
                     def _pkv_cb(idx, _sh=pkv_shape):
                         shard_shape = tuple(
@@ -682,8 +683,9 @@ def run_decode_benchmark(
                         lambda idx: np.arange(idx[0].start, idx[0].stop, dtype=np.int32))
                 else:
                     page_pkv = jnp.zeros(
-                        (n_groups, page_total_pages, page_size,
-                         kv_packed, n_kv_heads, head_dim),
+                        (n_groups,) + _gkcs(
+                            page_total_pages, page_size, cfg.gqa_n_kv_heads, cfg.gqa_head_dim, cache_dtype
+                        ),
                         dtype=cache_dtype)
                     page_kv_lens = jnp.full((page_B,), prefill_len, dtype=jnp.int32)
                     page_pi = jnp.arange(page_total_pages, dtype=jnp.int32)
