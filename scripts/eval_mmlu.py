@@ -127,7 +127,8 @@ def _load_safetensors_sharded(model_dir, index_path):
 # JIT-compiled loglikelihood scorer
 # ---------------------------------------------------------------------------
 
-def make_score_fn(params, config, mesh, tp, axis_rules, answer_ids: tuple[int, ...]):
+def make_score_fn(params, config, mesh, tp, axis_rules, answer_ids: tuple[int, ...],
+                  prefill_micro_batches: int = 1):
     """Return a JIT-compiled loglikelihood scoring function.
 
     The returned function scores log-probability of each answer token
@@ -175,8 +176,23 @@ def make_score_fn(params, config, mesh, tp, axis_rules, answer_ids: tuple[int, .
         # Extract scores for A/B/C/D — static indexing, no runtime overhead.
         return jnp.stack([log_probs[:, i] for i in _aid], axis=-1)  # (B, 4)
 
-    def _call(tokens, real_lens):
-        return _score(params, tokens, real_lens)
+    if prefill_micro_batches <= 1:
+        def _call(tokens, real_lens):
+            return _score(params, tokens, real_lens)
+    else:
+        def _call(tokens, real_lens):
+            B = tokens.shape[0]
+            assert B % prefill_micro_batches == 0, (
+                f"batch_size ({B}) must be divisible by "
+                f"prefill_micro_batches ({prefill_micro_batches})"
+            )
+            chunk_bs = B // prefill_micro_batches
+            chunks = []
+            for mb in range(prefill_micro_batches):
+                s = mb * chunk_bs
+                chunks.append(_score(params, tokens[s:s + chunk_bs],
+                                     real_lens[s:s + chunk_bs]))
+            return jnp.concatenate(chunks, axis=0)
 
     return _call
 
@@ -461,6 +477,9 @@ def main():
                         help='Questions per forward pass per DP rank')
     parser.add_argument('--n-questions', type=int, default=None,
                         help='Limit total questions (default: all ~14K)')
+    parser.add_argument('--prefill-micro-batches', type=int, default=1,
+                        help='Split each forward pass into N sub-batches (batch-size must be divisible). '
+                             'Tests that chunked execution gives identical predictions. Default: 1 (no chunking).')
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -528,7 +547,8 @@ def main():
     # ------------------------------------------------------------------
     # Build score function
     # ------------------------------------------------------------------
-    score_fn = make_score_fn(params, cfg, mesh, tp, axis_rules, tuple(answer_ids))
+    score_fn = make_score_fn(params, cfg, mesh, tp, axis_rules, tuple(answer_ids),
+                             prefill_micro_batches=args.prefill_micro_batches)
 
     # ------------------------------------------------------------------
     # Sanity check: verify " A"/" B"/" C"/" D" logit ordering on a dummy

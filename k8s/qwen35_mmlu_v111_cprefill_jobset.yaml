@@ -1,0 +1,126 @@
+# MMLU 5-shot — v111 image, prefill-micro-batches=4 (chunked prefill correctness check)
+#
+# Purpose: verify that chunked prefill doesn't regress MMLU accuracy vs v76 baseline (92.19%).
+# v111 = einsum deltanet + chunked prefill KV-cache fixes (v107–v111 chain resolved).
+#
+# Config: TP=32, DP=2, BS=16, prefill-micro-batches=4 → chunk_bs=4 per forward pass.
+# BS=16 is divisible by 4 ✓. TP=32 keeps weights at ~25 GB/chip with headroom for BS=4 activations.
+#
+# Expected result: accuracy matches v76 baseline (92.19% ± 0.1%)
+#
+# Deploy:
+#   kubectl apply -f k8s/qwen35_mmlu_v111_cprefill_jobset.yaml \
+#     --context gke_cloud-tpu-multipod-dev_europe-west4_mlperf-rl-v5p-128
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-mmlu-v111-cprefill --prefix=true -f --max-log-requests=16 \
+#     --context gke_cloud-tpu-multipod-dev_europe-west4_mlperf-rl-v5p-128 \
+#     2>&1 | tee -a /tmp/qwen35-mmlu-v111-cprefill.log
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: oss-model-dev-pv
+spec:
+  capacity:
+    storage: 1000Gi
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: pd.csi.storage.gke.io
+    volumeHandle: projects/cloud-tpu-multipod-dev/zones/europe-west4-b/disks/oss-model-dev-mlperf
+    readOnly: true
+    fsType: ext4
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values:
+                - europe-west4-b
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oss-model-dev-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 1000Gi
+  volumeName: oss-model-dev-pv
+  storageClassName: ""
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-mmlu-v111-cprefill
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+
+          template:
+            metadata:
+              labels:
+                app: qwen35-mmlu-v111-cprefill
+            spec:
+              restartPolicy: Never
+
+              volumes:
+                - name: model-weights
+                  persistentVolumeClaim:
+                    claimName: oss-model-dev-pvc
+                    readOnly: true
+
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+                cloud.google.com/gke-tpu-topology: 4x4x4
+
+              containers:
+                - name: eval
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v111
+                  imagePullPolicy: Always
+
+                  command: ["python", "scripts/eval_mmlu.py"]
+                  args:
+                    - "--model-dir=/mnt/model/qwen3.5-397b"
+                    - "--output-dir=/tmp/output"
+                    - "--tp=32"
+                    - "--dp=2"
+                    - "--batch-size=16"
+                    - "--prefill-micro-batches=4"
+
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+
+                  volumeMounts:
+                    - name: model-weights
+                      mountPath: /mnt/model
+                      readOnly: true
