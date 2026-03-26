@@ -467,8 +467,12 @@ def run_decode_benchmark(
                                mesh=mesh, last_logit_only=True, scan_mode=scan_mode,
                                moe_backend=moe_backend)
 
+            # gqa_len must match pages_per_seq*page_size so contiguous_to_paged
+            # produces exactly pages_per_seq pages/seq (matching the full paged_kv allocation).
+            chunk_gqa_len = pages_per_seq * page_size
+
             def _make_chunk_cache(bs_local):
-                """Zero-initialized HybridCache for bs_local seqs with real gqa_len=prefill_len."""
+                """Zero-initialized HybridCache for bs_local seqs with gqa_len=chunk_gqa_len."""
                 if mesh is not None:
                     # Reuse sharding specs from the existing cache (same axes, smaller batch)
                     chunk_fields = {
@@ -482,11 +486,11 @@ def run_decode_benchmark(
                             cache.delta_conv.sharding.spec,
                         ),
                         'gqa_k': (
-                            (n_groups, bs_local, cfg.gqa_n_kv_heads, prefill_len, cfg.gqa_head_dim),
+                            (n_groups, bs_local, cfg.gqa_n_kv_heads, chunk_gqa_len, cfg.gqa_head_dim),
                             P(None, dp_axis, cache.gqa_k.sharding.spec[2], None, None),
                         ),
                         'gqa_v': (
-                            (n_groups, bs_local, cfg.gqa_n_kv_heads, prefill_len, cfg.gqa_head_dim),
+                            (n_groups, bs_local, cfg.gqa_n_kv_heads, chunk_gqa_len, cfg.gqa_head_dim),
                             P(None, dp_axis, cache.gqa_k.sharding.spec[2], None, None),
                         ),
                     }
@@ -510,7 +514,7 @@ def run_decode_benchmark(
                     return HybridCache(**chunk_arrays)
                 else:
                     from jax_gpt.models.qwen35.cache import init_cache
-                    return init_cache(cfg, bs_local, prefill_len, dtype=cache_dtype)
+                    return init_cache(cfg, bs_local, chunk_gqa_len, dtype=cache_dtype)
 
             print(f"  Chunked prefill: {prefill_micro_batches} micro-batches × BS={pfill_bs}")
 
