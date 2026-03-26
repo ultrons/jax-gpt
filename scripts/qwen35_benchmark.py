@@ -525,8 +525,10 @@ def run_decode_benchmark(
             gc.collect()
             print(f"  Prefill chunk compilation: {(time.perf_counter()-t_pfill_compile)*1000:.0f} ms")
 
-            # Run N chunks, collecting gqa_k/v and delta states
-            all_gqa_k, all_gqa_v = [], []
+            # Run N chunks. Convert each chunk's gqa_k/v to paged format immediately
+            # so we never hold all contiguous gqa_k/v tensors simultaneously.
+            # Avoids: (1) accumulating B-wide contiguous tensors, (2) 50+ GB jit_scatter.
+            all_paged_chunks = []  # each entry: list of n_groups paged tensors for that chunk
             all_delta_M, all_delta_conv, all_first_tokens = [], [], []
 
             for c in range(prefill_micro_batches):
@@ -536,27 +538,28 @@ def run_decode_benchmark(
                 logits, c_out = prefill_chunk_fn(params, prompt_tokens[start:end], chunk_cache)
                 logits.block_until_ready()
 
-                # Keep raw gqa_k/v; will concatenate and convert after all chunks.
-                # Avoids a 50+ GB jit_scatter program binary.
-                all_gqa_k.append(c_out.gqa_k)
-                all_gqa_v.append(c_out.gqa_v)
+                # Immediately convert to paged (reshape+transpose — tiny XLA program).
+                # Free contiguous gqa_k/v before moving to the next chunk.
+                chunk_paged = contiguous_to_paged(c_out.gqa_k, c_out.gqa_v, prefill_len, page_size, cache_dtype)
+                chunk_paged[0].block_until_ready()
+                all_paged_chunks.append(chunk_paged)
+
                 all_delta_M.append(c_out.delta_M)
                 all_delta_conv.append(c_out.delta_conv)
                 all_first_tokens.append(jnp.argmax(logits[:, 0, :], axis=-1))
-                del c_out, chunk_cache, logits
+                del c_out, chunk_cache, logits, chunk_paged
                 gc.collect()
 
-            # Concatenate gqa_k/v along batch axis (axis=1) and convert once.
-            # contiguous_to_paged uses reshape+transpose (tiny program, not scatter).
-            print("  Converting gqa_k/v to paged format...")
-            full_gqa_k = jnp.concatenate(all_gqa_k, axis=1)  # (n_groups, B, n_kv_heads, chunk_gqa_len, head_dim)
-            full_gqa_v = jnp.concatenate(all_gqa_v, axis=1)
-            del all_gqa_k, all_gqa_v
-            gc.collect()
-
-            paged_list = contiguous_to_paged(full_gqa_k, full_gqa_v, prefill_len, page_size, cache_dtype)
-            paged_kv = jnp.stack(paged_list, axis=0)  # (n_groups, total_pages, page_size, ...)
-            del full_gqa_k, full_gqa_v, paged_list
+            # Concatenate paged chunks per group (axis=0 = pages axis), then stack groups.
+            # Each chunk: (chunk_pages, page_size, kv_packed, packing, head_dim) per group.
+            print("  Assembling paged KV cache...")
+            n_groups_paged = len(all_paged_chunks[0])
+            merged = [
+                jnp.concatenate([all_paged_chunks[c][g] for c in range(prefill_micro_batches)], axis=0)
+                for g in range(n_groups_paged)
+            ]
+            paged_kv = jnp.stack(merged, axis=0)  # (n_groups, total_pages, page_size, ...)
+            del all_paged_chunks, merged
             gc.collect()
 
             prefill_delta_M = jnp.concatenate(all_delta_M, axis=2)
