@@ -1,0 +1,94 @@
+# TP=4/EP=2 topology experiment — mid config (16 routed experts).
+#
+# Uses a 3D mesh (dp=8, tp=4, ep=2) = 64 TCs = 32 chips.
+# Expert weights shard on 'ep' (2-way); DeltaNet/GQA shard on 'tp' (4-way).
+#
+# Why mid config? Full model (512 experts, fp8) at EP=2 needs 256 experts/device
+# = ~193 GB expert weights alone — far exceeds 101 GB HBM.
+# Mid config (16 experts) at EP=2: 8 experts/device = ~0.5 GB — fits easily.
+#
+# This benchmark measures the TOPOLOGY EFFECT: does using the fast within-chip
+# ep axis for MoE psum (2 devices) vs the torus tp axis (8 devices) change
+# latency? The expert count is reduced but the communication pattern is real.
+#
+# Mesh: dp=8, tp=4, ep=2 → 64 TCs. 8*4*2=64 ✓
+# Model: mid (d_model=4096, 32 layers, 16 experts top-4)
+# BS: 4096, dp=8, decode-micro-batches=2
+#
+# Deploy:
+#   kubectl apply -f k8s/bench_v113_tp4ep2_mid_jobset.yaml \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-v113-tp4ep2-mid --prefix=true -f --max-log-requests=8 \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     2>&1 | tee -a /tmp/qwen35-v113-tp4ep2-mid.log
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-v113-tp4ep2-mid
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-v113-tp4ep2-mid
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v113
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/qwen35_benchmark.py"]
+                  args:
+                    - "--config=mid"
+                    - "--dtype=bfloat16"
+                    - "--sharding=EP"
+                    - "--batch-size=4096"
+                    - "--prompt-len=1024"
+                    - "--decode-steps=32"
+                    - "--dp=8"
+                    - "--ep=2"
+                    - "--n-runs=3"
+                    - "--use-rpa"
+                    - "--scan-mode=unrolled"
+                    - "--moe-backend=gmm"
+                    - "--skip-prefill"
+                    - "--decode-micro-batches=2"
+                    - "--profile"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: PROFILE_DIR
+                      value: "gs://sivaibhav-exp/qwen-profiles/v113-tp4ep2-mid"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_latency_hiding_layer_scheduler=true
+                        --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true
+                        --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true
+                        --xla_tpu_prefer_async_allgather_to_allreduce=true
+                        --xla_enable_async_all_gather=true
+                        --xla_tpu_aggressive_opt_barrier_removal=true
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

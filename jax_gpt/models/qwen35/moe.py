@@ -360,12 +360,13 @@ def expert_forward_ep(
     M, D = x.shape
     k = expert_indices.shape[1]
 
-    # Detect data-parallel axes: all non-trivial mesh axes except the EP axis,
-    # but only include axes that evenly divide M (the batch/token count).
-    # With eval mesh dp=2 and B=1 decode step, M=1 is not divisible by 2 →
-    # skip dp partitioning to avoid shard_map divisibility error.
+    # Data-parallel axes: only the 'dp' axis partitions the batch.
+    # Explicitly exclude 'tp' (tensor-parallel weight axis) and the EP axis —
+    # on a 3D mesh (dp, tp, ep), 'tp' does not split activations even though
+    # M may happen to be divisible by mesh.shape['tp'].
     dp_axes = tuple(name for name in mesh.axis_names
-                    if name != axis_name and mesh.shape[name] > 1
+                    if name not in (axis_name, 'tp')
+                    and mesh.shape[name] > 1
                     and M % mesh.shape[name] == 0)
     if len(dp_axes) == 0:
         act_pspec = P(None, None)
@@ -518,12 +519,22 @@ def moe_layer(
         layer_idx = None
         n_experts = None
 
+    # When mesh has a separate 'ep' axis (3D mesh), use it for expert routing
+    # instead of axis_name (which is the TP axis). Expert weights are sharded
+    # on 'ep' (per AXIS_RULES_EP), so the shard_map must use 'ep' as its axis.
+    if mesh is not None and 'ep' in mesh.axis_names:
+        ep_axis = 'ep'
+        ep_n = mesh.shape['ep']
+    else:
+        ep_axis = axis_name
+        ep_n = n_devices
+
     with jax.named_scope('moe_experts'):
-        if n_devices > 1 and mesh is not None:
+        if ep_n > 1 and mesh is not None:
             routed_out = expert_forward_ep(
                 x_flat, expert_indices, expert_weights,
                 gate_proj, up_proj, down_proj,
-                mesh=mesh, axis_name=axis_name,
+                mesh=mesh, axis_name=ep_axis,
                 moe_backend=moe_backend,
                 layer_idx=layer_idx,
             )

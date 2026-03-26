@@ -122,26 +122,59 @@ AXIS_RULES_B = {
     'experts':         'tp',
 }
 
+# Config EP: separate EP axis for experts, TP=4 for attention weights.
+# Use with a 3D mesh (dp, tp, ep) created via make_mesh(dp=..., ep=...).
+# Experts shard on 'ep'; DeltaNet/GQA shard on 'tp'.
+# Memory constraint: n_routed_experts / ep must fit per device.
+# Full model (512 experts, d_model=4096, 60 layers, fp8):
+#   EP=2 → 256 experts/device → ~193 GB — INFEASIBLE on v7x (101 GB HBM)
+#   EP=8 → 64 experts/device → ~48 GB — feasible (requires dp=2 on 64-TC cluster)
+# For EP=2 use with a reduced-expert config (--n-experts ≤16 for mid config).
+AXIS_RULES_EP = {
+    'vocab':           'tp',
+    'embed':           None,
+    'delta_v_heads':   'tp',      # 64 / tp per device
+    'delta_qk_heads':  'tp',
+    'gqa_q_heads':     'tp',
+    'gqa_kv_heads':    None,
+    'experts':         'ep',      # experts sharded on ep axis, not tp
+}
+
 
 def make_mesh(n_devices: int | None = None, axis_name: str = 'tp',
-              dp: int = 1) -> Mesh:
+              dp: int = 1, ep: int = 1) -> Mesh:
     """Create a mesh over all available devices.
 
     Args:
         n_devices: number of devices (default: all available).
         axis_name: tensor-parallel axis name.
-        dp: data-parallel factor. When dp > 1, creates a 2D mesh
-            with shape (dp, n_devices // dp) and axes ('dp', axis_name).
+        dp: data-parallel factor.
+        ep: expert-parallel factor. When ep > 1, an 'ep' axis is added to the
+            mesh. Combined with dp and tp:
+              ep=1, dp=1  → 1D mesh (tp,)
+              ep=1, dp>1  → 2D mesh (dp, tp)
+              ep>1, dp=1  → 2D mesh (tp, ep)
+              ep>1, dp>1  → 3D mesh (dp, tp, ep)
+            Total devices must equal dp * tp * ep.
 
     Returns:
-        Mesh with shape (n_devices,) if dp=1, or (dp, tp) if dp>1.
+        Mesh with axes as described above.
     """
     devices = jax.devices()
     if n_devices is not None:
         devices = devices[:n_devices]
-    if dp > 1:
-        assert len(devices) % dp == 0, f"dp={dp} must divide n_devices={len(devices)}"
-        tp = len(devices) // dp
+    n = len(devices)
+    if dp > 1 and ep > 1:
+        tp = n // (dp * ep)
+        assert dp * tp * ep == n, f"dp={dp} * tp={tp} * ep={ep} must equal n_devices={n}"
+        return Mesh(np.array(devices).reshape(dp, tp, ep), ('dp', axis_name, 'ep'))
+    elif ep > 1:
+        tp = n // ep
+        assert tp * ep == n, f"tp={tp} * ep={ep} must equal n_devices={n}"
+        return Mesh(np.array(devices).reshape(tp, ep), (axis_name, 'ep'))
+    elif dp > 1:
+        assert n % dp == 0, f"dp={dp} must divide n_devices={n}"
+        tp = n // dp
         return Mesh(np.array(devices).reshape(dp, tp), ('dp', axis_name))
     return Mesh(np.array(devices), (axis_name,))
 

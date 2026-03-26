@@ -64,6 +64,7 @@ except ImportError:
 from jax_gpt.models.qwen35.sharding import (
     AXIS_RULES_A,
     AXIS_RULES_B,
+    AXIS_RULES_EP,
     make_cache_sharding,
     make_mesh,
     make_param_shardings,
@@ -237,6 +238,7 @@ def get_axis_rules(name: str) -> dict | None:
         'none': None,
         'A': AXIS_RULES_A,
         'B': AXIS_RULES_B,
+        'EP': AXIS_RULES_EP,
     }
     if name not in rules:
         raise ValueError(f"Unknown sharding config: {name}. Choose from {list(rules.keys())}")
@@ -1105,7 +1107,7 @@ def _export_measurements(args, cfg, mesh, params, cache, decode_results, use_fp8
 def main():
     parser = argparse.ArgumentParser(description="Qwen3.5 inference benchmark")
     parser.add_argument('--config', default='mini', choices=['mini', 'mid', 'mid_large', 'full'])
-    parser.add_argument('--sharding', default='none', choices=['none', 'A', 'B'])
+    parser.add_argument('--sharding', default='none', choices=['none', 'A', 'B', 'EP'])
     parser.add_argument('--devices', type=int, default=None)
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--prompt-len', type=int, default=128)
@@ -1125,6 +1127,12 @@ def main():
                         help='Override number of routed experts')
     parser.add_argument('--dp', type=int, default=1,
                         help='Data-parallel factor. Creates 2D mesh (dp, tp) when > 1.')
+    parser.add_argument('--ep', type=int, default=1,
+                        help='Expert-parallel factor. Adds an ep axis to the mesh. '
+                             'Use with --sharding EP so expert weights shard on ep. '
+                             'Memory: n_routed_experts/ep experts per device. '
+                             'Full model (512 experts, fp8): ep>=8 needed on v7x. '
+                             'For ep=2 use reduced-expert configs (--n-experts <=16).')
     parser.add_argument('--roofline', action='store_true',
                         help='Print roofline analysis (FLOPs, HBM, arithmetic intensity). '
                              'Tracing can be slow for large models — use --chunk-size 32 for faster analysis.')
@@ -1181,7 +1189,7 @@ def main():
     print("=" * 70)
     print(f"  Config:         {args.config} ({cfg.n_layers}L, {cfg.d_model}D, "
           f"{cfg.n_routed_experts}E top-{cfg.n_experts_per_token})")
-    print(f"  Sharding:       Config {args.sharding} (dp={args.dp})")
+    print(f"  Sharding:       Config {args.sharding} (dp={args.dp}, ep={args.ep})")
     print(f"  Devices:        {args.devices or jax.device_count()}x "
           f"{jax.devices()[0].platform}")
     print(f"  Batch size:     {args.batch_size}")
@@ -1207,7 +1215,7 @@ def main():
     multihost = jax.process_count() > 1
 
     if axis_rules is not None:
-        mesh = make_mesh(n_devices=n_dev, dp=args.dp)
+        mesh = make_mesh(n_devices=n_dev, dp=args.dp, ep=args.ep)
         cache_sharding = make_cache_sharding(cfg, mesh, axis_rules,
                                              batch_size=args.batch_size)
 
