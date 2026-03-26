@@ -100,7 +100,7 @@ spec:
 
               containers:
                 - name: eval
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v111
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v113
                   imagePullPolicy: Always
 
                   command: ["python", "scripts/eval_mmlu.py"]

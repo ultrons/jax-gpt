@@ -241,8 +241,8 @@ def load_mmlu(n_questions: int | None = None) -> tuple[list[dict], dict[str, lis
 
     print("Loading MMLU dataset (cais/mmlu all)...")
     t0 = time.perf_counter()
-    ds_test = load_dataset('cais/mmlu', 'all', split='test', trust_remote_code=True)
-    ds_dev  = load_dataset('cais/mmlu', 'all', split='dev',  trust_remote_code=True)
+    ds_test = load_dataset('cais/mmlu', 'all', split='test')
+    ds_dev  = load_dataset('cais/mmlu', 'all', split='dev')
     print(f"  Loaded in {time.perf_counter() - t0:.1f}s: "
           f"{len(ds_test)} test, {len(ds_dev)} dev examples")
 
