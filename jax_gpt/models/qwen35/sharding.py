@@ -77,11 +77,11 @@ def _param_logical_axes(config: Qwen35Config) -> dict[str, P]:
         # --- MoE ---
         # Router: (D, n_experts) — shard along experts
         'moe.gate_weight':         P(None, 'experts'),
-        # Expert weights: (E, D, I) — shard leading dim along experts
-        'moe.gate_proj':           P('experts', None, None),
-        'moe.up_proj':             P('experts', None, None),
-        # Expert down: (E, I, D) — shard leading dim along experts
-        'moe.down_proj':           P('experts', None, None),
+        # Expert weights: (E, D, I) — E on 'experts', I on 'expert_intermediate'
+        'moe.gate_proj':           P('experts', None, 'expert_intermediate'),
+        'moe.up_proj':             P('experts', None, 'expert_intermediate'),
+        # Expert down: (E, I, D) — E on 'experts', I on 'expert_intermediate'
+        'moe.down_proj':           P('experts', 'expert_intermediate', None),
         # Shared expert (replicated — runs on all devices)
         'moe.shared_gate_proj':    P(None, None),
         'moe.shared_up_proj':      P(None, None),
@@ -102,24 +102,26 @@ def _param_logical_axes(config: Qwen35Config) -> dict[str, P]:
 # then only the output projection is sharded.
 # Actually for config A, we use a 1D mesh but GQA heads map differently.
 AXIS_RULES_A = {
-    'vocab':           'tp',
-    'embed':           None,
-    'delta_v_heads':   'tp',      # 64 / 8 = 8 per device
-    'delta_qk_heads':  'tp',      # 16 / 8 = 2 per device
-    'gqa_q_heads':     None,      # replicate GQA Q (small — 32 heads × 64 head_dim × 2)
-    'gqa_kv_heads':    None,      # replicate KV (only 2 heads)
-    'experts':         'tp',      # 512 / 8 = 64 per device
+    'vocab':                'tp',
+    'embed':                None,
+    'delta_v_heads':        'tp',      # 64 / 8 = 8 per device
+    'delta_qk_heads':       'tp',      # 16 / 8 = 2 per device
+    'gqa_q_heads':          None,      # replicate GQA Q (small — 32 heads × 64 head_dim × 2)
+    'gqa_kv_heads':         None,      # replicate KV (only 2 heads)
+    'experts':              'tp',      # 512 / 8 = 64 per device
+    'expert_intermediate':  None,      # I-dim not separately sharded (experts absorbs TP)
 }
 
 # Config B: EP=8, TP=8 for everything (uniform)
 AXIS_RULES_B = {
-    'vocab':           'tp',
-    'embed':           None,
-    'delta_v_heads':   'tp',
-    'delta_qk_heads':  'tp',
-    'gqa_q_heads':     'tp',      # 32 / 8 = 4 per device
-    'gqa_kv_heads':    None,      # replicate (only 2 heads, can't split 8 ways)
-    'experts':         'tp',
+    'vocab':                'tp',
+    'embed':                None,
+    'delta_v_heads':        'tp',
+    'delta_qk_heads':       'tp',
+    'gqa_q_heads':          'tp',      # 32 / 8 = 4 per device
+    'gqa_kv_heads':         None,      # replicate (only 2 heads, can't split 8 ways)
+    'experts':              'tp',
+    'expert_intermediate':  None,      # I-dim not separately sharded (experts absorbs TP)
 }
 
 # Config EP: separate EP axis for experts, TP=4 for attention weights.
@@ -131,31 +133,36 @@ AXIS_RULES_B = {
 #   EP=8 → 64 experts/device → ~48 GB — feasible (requires dp=2 on 64-TC cluster)
 # For EP=2 use with a reduced-expert config (--n-experts ≤16 for mid config).
 AXIS_RULES_EP = {
-    'vocab':           'tp',
-    'embed':           None,
-    'delta_v_heads':   'tp',      # 64 / tp per device
-    'delta_qk_heads':  'tp',
-    'gqa_q_heads':     'tp',
-    'gqa_kv_heads':    None,
-    'experts':         'ep',      # experts sharded on ep axis, not tp
+    'vocab':                'tp',
+    'embed':                None,
+    'delta_v_heads':        'tp',      # 64 / tp per device
+    'delta_qk_heads':       'tp',
+    'gqa_q_heads':          'tp',
+    'gqa_kv_heads':         None,
+    'experts':              'ep',      # experts sharded on ep axis, not tp
+    'expert_intermediate':  None,      # I-dim not sharded for pure EP
 }
 
 
 # Config TP4EP2: TP=4 across torus + EP=2 across intra-chip cores.
 # Use with a 3D mesh (dp, tp=4, ep=2) via make_mesh(dp=..., ep=2).
-# Expert weights shard on combined ('ep','tp') = 8-way total → 64 experts/device.
-# MoE psum is hierarchical: ep-psum first (fast, 2 devices, within chip),
-# then tp-psum (torus, 4 devices). DeltaNet/GQA use 4-way tp allreduce.
-# Memory footprint identical to AXIS_RULES_B (same 64 experts/device).
+# Expert E-dim sharded on 'ep' (2-way, fast intra-chip link).
+# Expert I-dim (intermediate) sharded on 'tp' (4-way, torus).
+# → E/ep=256 experts/device, I/tp=256 per device → 48 GB expert weights.
+# MoE compute: column-parallel gate/up (I sharded), row-parallel down (I sharded),
+# tp allreduce after down_proj, then ep psum for routing combination.
+# DeltaNet/GQA use 4-way tp allreduce (unchanged vs TP=4 pure baseline).
+# Memory footprint identical to AXIS_RULES_B (same 64 experts-equiv/device).
 # At dp=8, ep=2, tp=4: 8*4*2=64 TCs → same cluster, BS=4096 fits fine.
 AXIS_RULES_TP4EP2 = {
-    'vocab':           'tp',
-    'embed':           None,
-    'delta_v_heads':   'tp',
-    'delta_qk_heads':  'tp',
-    'gqa_q_heads':     'tp',
-    'gqa_kv_heads':    None,
-    'experts':         ('ep', 'tp'),  # combined 8-way: ep(fast) × tp(torus)
+    'vocab':                'tp',
+    'embed':                None,
+    'delta_v_heads':        'tp',
+    'delta_qk_heads':       'tp',
+    'gqa_q_heads':          'tp',
+    'gqa_kv_heads':         None,
+    'experts':              'ep',   # E-dim on ep (2-way fast intra-chip)
+    'expert_intermediate':  'tp',   # I-dim on tp (4-way torus, column/row-parallel)
 }
 
 
@@ -246,9 +253,10 @@ def _resolve_spec(
 
     # FP8 .w params are stored in (out, in) layout while logical specs
     # assume (in, out).  Swap the last two axes so sharding targets the
-    # correct dimension.  Only applies to 2-axis specs (linear weights);
-    # expert weights have E as dim-0 which stays unchanged.
-    if is_fp8_w and len(physical) >= 2:
+    # correct dimension.  Only applies to 2-axis specs (plain linear weights);
+    # expert weights have E as dim-0 and are stored (E, K, N) matching the
+    # logical spec directly — no swap needed.
+    if is_fp8_w and len(physical) == 2:
         physical[-1], physical[-2] = physical[-2], physical[-1]
 
     return P(*physical)
