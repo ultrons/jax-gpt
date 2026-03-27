@@ -12,14 +12,15 @@ import time
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.experimental.shard_map import shard_map
 
 sys.path.insert(0, '/app')
 
 from jax_gpt.models.qwen35.sharding import make_mesh
 
 
-# Message sizes to sweep (bytes)
+# Message sizes to sweep (bytes) — total data across all devices per collective
 SIZES_BYTES = [
     4 * 1024,           # 4 KB
     64 * 1024,          # 64 KB
@@ -37,31 +38,20 @@ DTYPE = jnp.bfloat16
 BYTES_PER_EL = 2
 
 
-def bench_collective(fn, x_sharded, n_warmup=N_WARMUP, n_runs=N_RUNS):
+def bench_collective(fn, x, n_warmup=N_WARMUP, n_runs=N_RUNS):
     """Time a collective fn. Returns median latency in ms."""
-    # Warmup
     for _ in range(n_warmup):
-        y = fn(x_sharded)
+        y = fn(x)
         jax.effects_barrier()
 
     times = []
     for _ in range(n_runs):
         t0 = time.perf_counter()
-        y = fn(x_sharded)
+        y = fn(x)
         jax.effects_barrier()
         times.append((time.perf_counter() - t0) * 1e3)
 
     return float(np.median(times))
-
-
-def make_sharded(mesh, size_bytes, axis_name):
-    """Create a bf16 array sharded on axis_name."""
-    tp = mesh.shape[axis_name]
-    n_el = size_bytes // BYTES_PER_EL
-    # Local elements per device = n_el / tp; global = n_el
-    x = jnp.ones(n_el, dtype=DTYPE)
-    sharding = NamedSharding(mesh, P(axis_name))
-    return jax.device_put(x, sharding)
 
 
 def algbw(size_bytes, time_ms):
@@ -101,65 +91,81 @@ def run_collective_bench(mesh, axis_name):
     print(f"{'='*70}")
 
     # --- ALL-REDUCE ---
+    # 'size' = total message = per-device * tp. Each device contributes size/tp bytes.
+    # psum: each device starts with size/tp elements, result = sum across axis devices.
     print(f"\n{'─'*70}")
     print(f"ALL-REDUCE on '{axis_name}'  (psum)")
     print(f"{'─'*70}")
     print(f"{'Size':>10}  {'Time(ms)':>10}  {'AlgBW(GB/s)':>14}  {'BusBW(GB/s)':>14}")
     for size in SIZES_BYTES:
-        x = make_sharded(mesh, size // tp, axis_name)  # local=size/tp, global=size/tp (replicated after psum)
-        # Actually for allreduce, each device has a local shard and we reduce across axis
-        # Let's use global=size (each device has full size, psum reduces in-place)
-        x_full = jax.device_put(jnp.ones(size // BYTES_PER_EL, dtype=DTYPE),
-                                NamedSharding(mesh, P(None)))  # replicated on all
-        # Shard on tp for a more realistic test: each device has size/tp locally
-        x_sharded = jax.device_put(
-            jnp.ones(size // BYTES_PER_EL // tp, dtype=DTYPE),
-            NamedSharding(mesh, P(axis_name))
+        local_n = size // BYTES_PER_EL // tp  # elements per device
+        global_n = local_n * tp
+        x = jax.device_put(
+            jnp.ones(global_n, dtype=DTYPE),
+            NamedSharding(mesh, P(axis_name)),
         )
-        # allreduce: psum — each device sends its shard and gets the total
-        fn = jax.jit(lambda x: jax.lax.psum(x, axis_name=axis_name),
-                     in_shardings=NamedSharding(mesh, P(axis_name)),
-                     out_shardings=NamedSharding(mesh, P(axis_name)))
-        t_ms = bench_collective(fn, x_sharded)
+        ax = axis_name  # capture for closure
+        fn = jax.jit(shard_map(
+            lambda x: jax.lax.psum(x, axis_name=ax),
+            mesh=mesh,
+            in_specs=P(axis_name),
+            out_specs=P(axis_name),
+            check_rep=False,
+        ))
+        t_ms = bench_collective(fn, x)
         abw = algbw(size, t_ms)
         bbw = busbw_allreduce(size, tp, t_ms)
         print(f"{_fmt(size):>10}  {t_ms:>10.3f}  {abw:>14.2f}  {bbw:>14.2f}")
 
     # --- ALL-GATHER ---
+    # 'size' = total output = per-device-input * tp. Each device has size/tp input, size output.
     print(f"\n{'─'*70}")
     print(f"ALL-GATHER on '{axis_name}'  (all_gather)")
     print(f"{'─'*70}")
     print(f"{'Size':>10}  {'Time(ms)':>10}  {'AlgBW(GB/s)':>14}  {'BusBW(GB/s)':>14}")
     for size in SIZES_BYTES:
-        # Input: each device has size/tp, output: each device has size
-        x_sharded = jax.device_put(
-            jnp.ones(size // BYTES_PER_EL // tp, dtype=DTYPE),
-            NamedSharding(mesh, P(axis_name))
+        local_n = size // BYTES_PER_EL // tp  # input elements per device
+        global_input_n = local_n * tp
+        x = jax.device_put(
+            jnp.ones(global_input_n, dtype=DTYPE),
+            NamedSharding(mesh, P(axis_name)),
         )
-        fn = jax.jit(lambda x: jax.lax.all_gather(x, axis_name=axis_name, tiled=True),
-                     in_shardings=NamedSharding(mesh, P(axis_name)),
-                     out_shardings=NamedSharding(mesh, P(None)))
-        t_ms = bench_collective(fn, x_sharded)
+        ax = axis_name
+        fn = jax.jit(shard_map(
+            lambda x: jax.lax.all_gather(x, axis_name=ax, tiled=True),
+            mesh=mesh,
+            in_specs=P(axis_name),
+            out_specs=P(),          # each device holds the full gathered array
+            check_rep=False,
+        ))
+        t_ms = bench_collective(fn, x)
         abw = algbw(size, t_ms)
         bbw = busbw_allgather(size, tp, t_ms)
         print(f"{_fmt(size):>10}  {t_ms:>10.3f}  {abw:>14.2f}  {bbw:>14.2f}")
 
     # --- REDUCE-SCATTER ---
+    # 'size' = total input = per-device-output * tp. Each device has size input (replicated),
+    # size/tp output.
     print(f"\n{'─'*70}")
     print(f"REDUCE-SCATTER on '{axis_name}'  (psum_scatter)")
     print(f"{'─'*70}")
     print(f"{'Size':>10}  {'Time(ms)':>10}  {'AlgBW(GB/s)':>14}  {'BusBW(GB/s)':>14}")
     for size in SIZES_BYTES:
-        # Input: each device has size, output: each device has size/tp
-        x_full = jax.device_put(
-            jnp.ones(size // BYTES_PER_EL, dtype=DTYPE),
-            NamedSharding(mesh, P(None))
+        global_n = size // BYTES_PER_EL  # elements per device (input is replicated)
+        x = jax.device_put(
+            jnp.ones(global_n, dtype=DTYPE),
+            NamedSharding(mesh, P()),   # replicated on all devices
         )
-        fn = jax.jit(lambda x: jax.lax.psum_scatter(x, axis_name=axis_name,
-                                                      scatter_dimension=0, tiled=True),
-                     in_shardings=NamedSharding(mesh, P(None)),
-                     out_shardings=NamedSharding(mesh, P(axis_name)))
-        t_ms = bench_collective(fn, x_full)
+        ax = axis_name
+        fn = jax.jit(shard_map(
+            lambda x: jax.lax.psum_scatter(x, axis_name=ax,
+                                           scatter_dimension=0, tiled=True),
+            mesh=mesh,
+            in_specs=P(),               # each device has the full replicated array
+            out_specs=P(axis_name),     # output sharded
+            check_rep=False,
+        ))
+        t_ms = bench_collective(fn, x)
         abw = algbw(size, t_ms)
         bbw = busbw_reducescatter(size, tp, t_ms)
         print(f"{_fmt(size):>10}  {t_ms:>10.3f}  {abw:>14.2f}  {bbw:>14.2f}")
