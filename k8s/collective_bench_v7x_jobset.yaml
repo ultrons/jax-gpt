@@ -1,0 +1,58 @@
+# Collective bandwidth benchmark on v7x 2x4x4.
+#
+# Tests all-reduce, all-gather, reduce-scatter on tp and dp axes,
+# using the same mesh layout as the Qwen3.5 decode benchmark.
+# Purpose: verify the low bandwidth numbers seen in the v122 profile.
+#
+# Deploy:
+#   kubectl apply -f k8s/collective_bench_v7x_jobset.yaml \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
+#
+# Monitor:
+#   kubectl logs -l app=collective-bench-v7x --prefix=true -f \
+#     --max-log-requests=8 \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     2>&1 | tee -a /tmp/collective-bench-v7x.log
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: collective-bench-v7x
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: collective-bench-v7x
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v123
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/collective_bench.py"]
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
