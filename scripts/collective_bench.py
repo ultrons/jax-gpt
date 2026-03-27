@@ -42,13 +42,13 @@ def bench_collective(fn, x, n_warmup=N_WARMUP, n_runs=N_RUNS):
     """Time a collective fn. Returns median latency in ms."""
     for _ in range(n_warmup):
         y = fn(x)
-        jax.effects_barrier()
+        jax.block_until_ready(y)
 
     times = []
     for _ in range(n_runs):
         t0 = time.perf_counter()
         y = fn(x)
-        jax.effects_barrier()
+        jax.block_until_ready(y)
         times.append((time.perf_counter() - t0) * 1e3)
 
     return float(np.median(times))
