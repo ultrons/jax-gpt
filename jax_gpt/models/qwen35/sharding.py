@@ -189,6 +189,8 @@ def make_mesh(n_devices: int | None = None, axis_name: str = 'tp',
     Returns:
         Mesh with axes as described above.
     """
+    from jax.experimental import mesh_utils
+
     devices = jax.devices()
     if n_devices is not None:
         devices = devices[:n_devices]
@@ -196,11 +198,16 @@ def make_mesh(n_devices: int | None = None, axis_name: str = 'tp',
     if dp > 1 and ep > 1:
         tp = n // (dp * ep)
         assert dp * tp * ep == n, f"dp={dp} * tp={tp} * ep={ep} must equal n_devices={n}"
-        return Mesh(np.array(devices).reshape(dp, tp, ep), ('dp', axis_name, 'ep'))
+        # Use topology-aware mesh construction so ep maps to the fast intra-chip
+        # (D2D) axis. create_device_mesh places the smallest/innermost axis on
+        # the fastest physical link (w on v7x).
+        device_arr = mesh_utils.create_device_mesh((dp, tp, ep), devices=devices)
+        return Mesh(device_arr, ('dp', axis_name, 'ep'))
     elif ep > 1:
         tp = n // ep
         assert tp * ep == n, f"tp={tp} * ep={ep} must equal n_devices={n}"
-        return Mesh(np.array(devices).reshape(tp, ep), (axis_name, 'ep'))
+        device_arr = mesh_utils.create_device_mesh((tp, ep), devices=devices)
+        return Mesh(device_arr, (axis_name, 'ep'))
     elif dp > 1:
         assert n % dp == 0, f"dp={dp} must divide n_devices={n}"
         tp = n // dp
