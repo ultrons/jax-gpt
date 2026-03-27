@@ -739,11 +739,10 @@ def forward_rpa_decode(
     page_indices_local = jnp.arange(B_local * pages_per_seq, dtype=jnp.int32)
 
     # Per-group loop — each call reuses the same compiled program.
-    # Update arrays in-place with .at[g].set() to avoid accumulating
-    # 15 per-group copies (which would OOM during the final jnp.stack).
-    result_delta_M = cache.delta_M
-    result_delta_conv = cache.delta_conv
-    result_paged_kv = paged_kv
+    # Collect outputs then stack once (single XLA concatenate, no serial DUS).
+    new_delta_Ms = []
+    new_delta_convs = []
+    new_paged_kvs = []
 
     ctx = mesh if mesh is not None else __import__('contextlib').nullcontext()
 
@@ -765,11 +764,14 @@ def forward_rpa_decode(
                 moe_backend=moe_backend,
             )
 
-        # Update in-place to avoid holding 15 copies simultaneously
-        result_delta_M = result_delta_M.at[g].set(new_dM)
-        result_delta_conv = result_delta_conv.at[g].set(new_dC)
-        result_paged_kv = result_paged_kv.at[g].set(updated_kv)
-        del new_dM, new_dC, updated_kv
+        new_delta_Ms.append(new_dM)
+        new_delta_convs.append(new_dC)
+        new_paged_kvs.append(updated_kv)
+
+    # Stack once at the end — single XLA concatenate, no per-group DUS.
+    result_delta_M = jnp.stack(new_delta_Ms)
+    result_delta_conv = jnp.stack(new_delta_convs)
+    result_paged_kv = jnp.stack(new_paged_kvs)
 
     with jax.named_scope('output_head'):
         x = rms_norm(x, params['final_norm'], config.rms_norm_eps)
