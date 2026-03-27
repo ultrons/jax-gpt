@@ -331,7 +331,12 @@ def shard_params(
         safe_axes = []
         for i, axis in enumerate(spec):
             if axis is not None:
-                axis_size = mesh.shape[axis]
+                if isinstance(axis, tuple):
+                    axis_size = 1
+                    for a in axis:
+                        axis_size *= mesh.shape[a]
+                else:
+                    axis_size = mesh.shape[axis]
                 if leaf.shape[i] % axis_size != 0:
                     safe_axes.append(None)  # can't shard, replicate
                 else:
@@ -377,7 +382,12 @@ def make_param_shardings(
         safe_axes = []
         for i, axis in enumerate(spec):
             if axis is not None:
-                axis_size = mesh.shape[axis]
+                if isinstance(axis, tuple):
+                    axis_size = 1
+                    for a in axis:
+                        axis_size *= mesh.shape[a]
+                else:
+                    axis_size = mesh.shape[axis]
                 if shape[i] % axis_size != 0:
                     safe_axes.append(None)
                 else:
@@ -393,10 +403,19 @@ def _safe_spec(spec: P, shape: tuple, mesh: Mesh) -> P:
     """Replace sharding axes that don't evenly divide the dim with None."""
     safe = []
     for i, axis in enumerate(spec):
-        if axis is not None and shape[i] % mesh.shape[axis] != 0:
-            safe.append(None)
+        if axis is not None:
+            if isinstance(axis, tuple):
+                axis_size = 1
+                for a in axis:
+                    axis_size *= mesh.shape[a]
+            else:
+                axis_size = mesh.shape[axis]
+            if shape[i] % axis_size != 0:
+                safe.append(None)
+            else:
+                safe.append(axis)
         else:
-            safe.append(axis)
+            safe.append(None)
     return P(*safe)
 
 
