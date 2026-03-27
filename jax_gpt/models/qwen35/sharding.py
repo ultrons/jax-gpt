@@ -146,23 +146,25 @@ AXIS_RULES_EP = {
 
 # Config TP4EP2: TP=4 across torus + EP=2 across intra-chip cores.
 # Use with a 3D mesh (dp, tp=4, ep=2) via make_mesh(dp=..., ep=2).
-# Expert E-dim sharded on 'ep' (2-way, fast intra-chip link).
-# Expert I-dim (intermediate) sharded on 'tp' (4-way, torus).
-# → E/ep=256 experts/device, I/tp=256 per device → 48 GB expert weights.
-# MoE compute: column-parallel gate/up (I sharded), row-parallel down (I sharded),
-# tp allreduce after down_proj, then ep psum for routing combination.
-# DeltaNet/GQA use 4-way tp allreduce (unchanged vs TP=4 pure baseline).
-# Memory footprint identical to AXIS_RULES_B (same 64 experts-equiv/device).
-# At dp=8, ep=2, tp=4: 8*4*2=64 TCs → same cluster, BS=4096 fits fine.
+#
+# 'ep' axis (2-way, fast intra-chip link) is used for ALL non-expert TP:
+#   - DeltaNet, GQA, embeddings → sharded 2-way on ep → allreduce on fast link
+# 'tp' axis (4-way, torus) is used ONLY inside shard_map for expert I-dim:
+#   - Expert E-dim: ep (2-way) → 256 experts/device
+#   - Expert I-dim: tp (4-way) → 256 per device (column/row-parallel)
+#   - tp allreduce (row-parallel down) inside shard_map, then ep psum for routing
+#
+# Net: expert memory same as baseline (64 equiv/device). Non-expert TP allreduces
+# use the fast ep link (2-way intra-chip) instead of the 4-way torus.
 AXIS_RULES_TP4EP2 = {
-    'vocab':                'tp',
+    'vocab':                'ep',   # 2-way ep (fast intra-chip allreduce)
     'embed':                None,
-    'delta_v_heads':        'tp',
-    'delta_qk_heads':       'tp',
-    'gqa_q_heads':          'tp',
-    'gqa_kv_heads':         None,
+    'delta_v_heads':        'ep',   # 2-way ep (fast intra-chip allreduce)
+    'delta_qk_heads':       'ep',   # 2-way ep
+    'gqa_q_heads':          'ep',   # 2-way ep
+    'gqa_kv_heads':         None,   # replicated (only 2 heads)
     'experts':              'ep',   # E-dim on ep (2-way fast intra-chip)
-    'expert_intermediate':  'tp',   # I-dim on tp (4-way torus, column/row-parallel)
+    'expert_intermediate':  'tp',   # I-dim on tp (4-way torus, inside shard_map only)
 }
 
 
