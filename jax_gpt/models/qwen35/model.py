@@ -392,9 +392,9 @@ def forward(
                 gqa_moe_flat = gqa_moe_raw
 
         if _use_rpa:
-            result_delta_M = delta_Ms
-            result_delta_conv = delta_convs
-            result_paged_kv = paged_kv
+            new_delta_Ms = []
+            new_delta_convs = []
+            new_paged_kvs = []
 
             for g in range(n_groups):
                 if groups_list is not None:
@@ -428,9 +428,17 @@ def forward(
                     new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
                     if 'paged_kv' in cache_sharding:
                         updated_kv = jax.lax.with_sharding_constraint(updated_kv, cache_sharding['paged_kv'])
-                result_delta_M = result_delta_M.at[g].set(new_dM)
-                result_delta_conv = result_delta_conv.at[g].set(new_dC)
-                result_paged_kv = result_paged_kv.at[g].set(updated_kv)
+                new_delta_Ms.append(new_dM)
+                new_delta_convs.append(new_dC)
+                new_paged_kvs.append(updated_kv)
+
+            # Stack once at the end — single XLA concatenate, no per-group DUS.
+            # NOTE: requires all 15 group outputs alive simultaneously. At large
+            # batch sizes (BS=4096) this may add ~10 GB peak HBM; use smaller
+            # batch or decode-micro-batches if HBM is tight.
+            result_delta_M = jnp.stack(new_delta_Ms)
+            result_delta_conv = jnp.stack(new_delta_convs)
+            result_paged_kv = jnp.stack(new_paged_kvs)
 
             new_cache = HybridCache(
                 delta_M=result_delta_M,
