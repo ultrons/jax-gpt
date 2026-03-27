@@ -65,6 +65,7 @@ from jax_gpt.models.qwen35.sharding import (
     AXIS_RULES_A,
     AXIS_RULES_B,
     AXIS_RULES_EP,
+    AXIS_RULES_TP4EP2,
     make_cache_sharding,
     make_mesh,
     make_param_shardings,
@@ -239,6 +240,7 @@ def get_axis_rules(name: str) -> dict | None:
         'A': AXIS_RULES_A,
         'B': AXIS_RULES_B,
         'EP': AXIS_RULES_EP,
+        'TP4EP2': AXIS_RULES_TP4EP2,
     }
     if name not in rules:
         raise ValueError(f"Unknown sharding config: {name}. Choose from {list(rules.keys())}")
@@ -1107,7 +1109,7 @@ def _export_measurements(args, cfg, mesh, params, cache, decode_results, use_fp8
 def main():
     parser = argparse.ArgumentParser(description="Qwen3.5 inference benchmark")
     parser.add_argument('--config', default='mini', choices=['mini', 'mid', 'mid_large', 'full'])
-    parser.add_argument('--sharding', default='none', choices=['none', 'A', 'B', 'EP'])
+    parser.add_argument('--sharding', default='none', choices=['none', 'A', 'B', 'EP', 'TP4EP2'])
     parser.add_argument('--devices', type=int, default=None)
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--prompt-len', type=int, default=128)

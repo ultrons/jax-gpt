@@ -275,7 +275,8 @@ def _ep_inner_body(x, indices, weights, k, axis_name,
                     gate_w, up_w, down_w,
                     gate_s=None, up_s=None, down_s=None,
                     moe_backend: MoeBackend = 'ragged_dot',
-                    rhs_group_offset=None, n_local_experts=None):
+                    rhs_group_offset=None, n_local_experts=None,
+                    secondary_axis=None, n_secondary=1):
     """Core EP expert logic, called inside shard_map.
 
     When scales are provided, gate_w/up_w/down_w are fp8 in (E, K, N) layout.
@@ -285,8 +286,19 @@ def _ep_inner_body(x, indices, weights, k, axis_name,
         rhs_group_offset: Optional int32[1] offset for stacked weight indexing.
         n_local_experts: When weights are stacked (rhs dim-0 > E_local), pass
             the actual local expert count here. Otherwise derived from gate_w.shape[0].
+        secondary_axis: When set, enables hierarchical two-stage reduction.
+            axis_name is the fast axis (e.g. 'ep', intra-chip); secondary_axis
+            is the slow axis (e.g. 'tp', torus). Experts are indexed by
+            secondary_rank * n_ep + primary_rank. psum order: fast first, then slow.
+        n_secondary: size of secondary_axis (needed to compute combined rank).
     """
-    my_idx = jax.lax.axis_index(axis_name)
+    if secondary_axis is not None:
+        # Hierarchical: global rank = secondary_rank * n_ep + primary_rank
+        # axis_name = fast (ep=2), secondary_axis = slow (tp=4)
+        n_ep = jax.lax.psum(1, axis_name)  # size of fast axis
+        my_idx = jax.lax.axis_index(secondary_axis) * n_ep + jax.lax.axis_index(axis_name)
+    else:
+        my_idx = jax.lax.axis_index(axis_name)
     e_local = n_local_experts if n_local_experts is not None else gate_w.shape[0]
     m_local, d = x.shape
 
@@ -319,7 +331,12 @@ def _ep_inner_body(x, indices, weights, k, axis_name,
     expert_out = expert_out * flat_w[order][:, None]
     output = jnp.zeros((m_local, d), dtype=x.dtype)
     output = output.at[order // k].add(expert_out.astype(x.dtype))
-    output = jax.lax.psum(output, axis_name)
+    if secondary_axis is not None:
+        # Hierarchical reduction: fast axis (ep, intra-chip) first, then slow (tp, torus)
+        output = jax.lax.psum(output, axis_name)
+        output = jax.lax.psum(output, secondary_axis)
+    else:
+        output = jax.lax.psum(output, axis_name)
     return output
 
 
@@ -332,6 +349,7 @@ def expert_forward_ep(
     axis_name: str = 'tp',
     moe_backend: MoeBackend = 'ragged_dot',
     layer_idx: int | None = None,
+    secondary_axis: str | None = None,
 ) -> jax.Array:
     """Expert-parallel MoE using shard_map.
 
@@ -350,22 +368,24 @@ def expert_forward_ep(
             When layer_idx is set, these are 4D stacked (N_L, E, K, N) with
             sharding P(None, axis_name, None, None).
         mesh: device mesh.
-        axis_name: mesh axis for EP.
+        axis_name: primary (fast) mesh axis for EP.
         moe_backend: 'ragged_dot' or 'gmm'.
         layer_idx: When set, expert weights are stacked across layers (4D).
             gmm_v2 uses rhs_group_offset to index the right layer's portion.
+        secondary_axis: When set, enables hierarchical two-stage EP. Experts are
+            sharded across (axis_name × secondary_axis) combined. psum happens
+            over axis_name first (fast, e.g. intra-chip 'ep'), then secondary_axis
+            (slow, e.g. torus 'tp'). Weight spec becomes P((axis_name, secondary_axis), ...).
     """
     from jax.experimental.shard_map import shard_map
 
     M, D = x.shape
     k = expert_indices.shape[1]
 
-    # Data-parallel axes: only the 'dp' axis partitions the batch.
-    # Explicitly exclude 'tp' (tensor-parallel weight axis) and the EP axis —
-    # on a 3D mesh (dp, tp, ep), 'tp' does not split activations even though
-    # M may happen to be divisible by mesh.shape['tp'].
+    # Only 'dp' partitions the batch — all other axes (tp, ep) are weight/expert
+    # axes and must not appear in the activation PartitionSpec for shard_map.
     dp_axes = tuple(name for name in mesh.axis_names
-                    if name not in (axis_name, 'tp')
+                    if name == 'dp'
                     and mesh.shape[name] > 1
                     and M % mesh.shape[name] == 0)
     if len(dp_axes) == 0:
@@ -380,9 +400,13 @@ def expert_forward_ep(
     # rhs_group_offset = layer_idx * E_local.
     is_stacked = layer_idx is not None
 
-    w3d = P(axis_name, None, None)
-    w4d = P(None, axis_name, None, None)
+    # Expert dimension sharding: single axis or combined (fast, slow) for hierarchical EP.
+    ep_dim = (axis_name, secondary_axis) if secondary_axis is not None else axis_name
+    w3d = P(ep_dim, None, None)
+    w4d = P(None, ep_dim, None, None)
     w_spec = w4d if is_stacked else w3d
+
+    n_secondary = mesh.shape[secondary_axis] if secondary_axis is not None else 1
 
     if _is_fp8_weight(gate_proj):
         if moe_backend == 'gmm':
@@ -390,15 +414,15 @@ def expert_forward_ep(
             up_fp8, up_s = _fp8_gmm_components(up_proj)
             down_fp8, down_s = _fp8_gmm_components(down_proj)
             # gmm rhs_scale: (E, num_blocks, 1, N) or stacked (N_L, E, num_blocks, 1, N)
-            w_scale_spec = P(None, axis_name, None, None, None) if is_stacked \
-                else P(axis_name, None, None, None)
+            w_scale_spec = P(None, ep_dim, None, None, None) if is_stacked \
+                else P(ep_dim, None, None, None)
         else:
             gate_fp8, gate_s = _fp8_expert_components(gate_proj)
             up_fp8, up_s = _fp8_expert_components(up_proj)
             down_fp8, down_s = _fp8_expert_components(down_proj)
             # ragged_dot scale is 2D: (E, N) or stacked (N_L, E, N)
-            w_scale_spec = P(None, axis_name, None) if is_stacked \
-                else P(axis_name, None)
+            w_scale_spec = P(None, ep_dim, None) if is_stacked \
+                else P(ep_dim, None)
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(act_pspec, act_pspec, act_pspec,
@@ -424,7 +448,9 @@ def expert_forward_ep(
                                   lg, lu, ld, lgs, lus, lds,
                                   moe_backend=moe_backend,
                                   rhs_group_offset=rhs_offset,
-                                  n_local_experts=e_local)
+                                  n_local_experts=e_local,
+                                  secondary_axis=secondary_axis,
+                                  n_secondary=n_secondary)
 
         return _expert_fn(x, expert_indices, expert_weights,
                           gate_fp8, gate_s, up_fp8, up_s, down_fp8, down_s)
@@ -452,7 +478,9 @@ def expert_forward_ep(
                               local_gate, local_up, local_down,
                               moe_backend=moe_backend,
                               rhs_group_offset=rhs_offset,
-                              n_local_experts=e_local)
+                              n_local_experts=e_local,
+                              secondary_axis=secondary_axis,
+                              n_secondary=n_secondary)
 
     return _expert_fn(x, expert_indices, expert_weights,
                       gate_w, up_w, down_w)
@@ -519,15 +547,21 @@ def moe_layer(
         layer_idx = None
         n_experts = None
 
-    # When mesh has a separate 'ep' axis (3D mesh), use it for expert routing
-    # instead of axis_name (which is the TP axis). Expert weights are sharded
-    # on 'ep' (per AXIS_RULES_EP), so the shard_map must use 'ep' as its axis.
+    # Determine expert-parallel axis and communication pattern.
+    # Three cases:
+    # 1. No 'ep' axis → use axis_name (tp) for both expert sharding and psum (current default)
+    # 2. Separate 'ep' axis, no 'tp' → use 'ep' for expert sharding (AXIS_RULES_EP config)
+    # 3. Both 'ep' and 'tp' → hierarchical: experts sharded on ('ep','tp') combined,
+    #    psum over 'ep' first (fast, intra-chip), then 'tp' (torus) — TP4EP2 config
     if mesh is not None and 'ep' in mesh.axis_names:
         ep_axis = 'ep'
         ep_n = mesh.shape['ep']
+        # If TP axis also present: hierarchical EP — ep=fast, tp=slow secondary
+        secondary = axis_name if (axis_name in mesh.axis_names and axis_name != 'ep') else None
     else:
         ep_axis = axis_name
         ep_n = n_devices
+        secondary = None
 
     with jax.named_scope('moe_experts'):
         if ep_n > 1 and mesh is not None:
@@ -537,6 +571,7 @@ def moe_layer(
                 mesh=mesh, axis_name=ep_axis,
                 moe_backend=moe_backend,
                 layer_idx=layer_idx,
+                secondary_axis=secondary,
             )
         else:
             routed_out = expert_forward_single(

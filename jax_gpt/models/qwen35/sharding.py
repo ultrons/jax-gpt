@@ -141,6 +141,24 @@ AXIS_RULES_EP = {
 }
 
 
+# Config TP4EP2: TP=4 across torus + EP=2 across intra-chip cores.
+# Use with a 3D mesh (dp, tp=4, ep=2) via make_mesh(dp=..., ep=2).
+# Expert weights shard on combined ('ep','tp') = 8-way total → 64 experts/device.
+# MoE psum is hierarchical: ep-psum first (fast, 2 devices, within chip),
+# then tp-psum (torus, 4 devices). DeltaNet/GQA use 4-way tp allreduce.
+# Memory footprint identical to AXIS_RULES_B (same 64 experts/device).
+# At dp=8, ep=2, tp=4: 8*4*2=64 TCs → same cluster, BS=4096 fits fine.
+AXIS_RULES_TP4EP2 = {
+    'vocab':           'tp',
+    'embed':           None,
+    'delta_v_heads':   'tp',
+    'delta_qk_heads':  'tp',
+    'gqa_q_heads':     'tp',
+    'gqa_kv_heads':    None,
+    'experts':         ('ep', 'tp'),  # combined 8-way: ep(fast) × tp(torus)
+}
+
+
 def make_mesh(n_devices: int | None = None, axis_name: str = 'tp',
               dp: int = 1, ep: int = 1) -> Mesh:
     """Create a mesh over all available devices.
