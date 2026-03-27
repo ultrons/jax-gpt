@@ -1253,7 +1253,13 @@ def main():
                 if hasattr(spec, '__iter__'):
                     for i, axis in enumerate(spec):
                         if axis is not None and i < len(shard_shape):
-                            shard_shape[i] = shard_shape[i] // mesh.shape[axis]
+                            if isinstance(axis, tuple):
+                                axis_size = 1
+                                for a in axis:
+                                    axis_size *= mesh.shape[a]
+                            else:
+                                axis_size = mesh.shape[axis]
+                            shard_shape[i] = shard_shape[i] // axis_size
                 shard_shape = tuple(shard_shape)
                 bytes_per = 1 if 'float8' in str(aval.dtype) else (4 if aval.dtype == jnp.float32 else 2)
                 shard_bytes = 1
