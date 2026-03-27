@@ -145,26 +145,28 @@ AXIS_RULES_EP = {
 
 
 # Config TP4EP2: TP=4 across torus + EP=2 across intra-chip cores.
-# Use with a 3D mesh (dp, tp=4, ep=2) via make_mesh(dp=..., ep=2).
+# Use with a 3D mesh (dp=8, tp=4, ep=2) via make_mesh(dp=..., ep=2).
+# Physical mapping: ep=2 intra-chip TCs (fast), tp=4 torus, dp=8 data parallel.
 #
-# 'ep' axis (2-way, fast intra-chip link) is used for ALL non-expert TP:
-#   - DeltaNet, GQA, embeddings → sharded 2-way on ep → allreduce on fast link
-# 'tp' axis (4-way, torus) is used ONLY inside shard_map for expert I-dim:
-#   - Expert E-dim: ep (2-way) → 256 experts/device
-#   - Expert I-dim: tp (4-way) → 256 per device (column/row-parallel)
-#   - tp allreduce (row-parallel down) inside shard_map, then ep psum for routing
+# Non-expert weights (DeltaNet/GQA/embed): sharded on ('tp','ep') = 8-way combined.
+#   → identical per-device size as TP=8 baseline. Allreduce over full 8-way (tp×ep).
 #
-# Net: expert memory same as baseline (64 equiv/device). Non-expert TP allreduces
-# use the fast ep link (2-way intra-chip) instead of the 4-way torus.
+# Expert weights: E-dim on 'ep' (2-way fast), I-dim on 'tp' (4-way torus).
+#   gate/up: (E/ep=256, D=4096, I/tp=256) = same bytes as baseline (64, 4096, 1024)
+#   down:    (E/ep=256, I/tp=256, D=4096) = same bytes as baseline
+#   → tp allreduce (row-parallel down) inside shard_map, then ep psum for routing.
+#   Routing psum is 2-way on fast intra-chip link (vs 8-way torus in baseline).
+#
+# Net: parameter memory identical to TP=8 baseline. Routing psum is faster.
 AXIS_RULES_TP4EP2 = {
-    'vocab':                'ep',   # 2-way ep (fast intra-chip allreduce)
+    'vocab':                ('tp', 'ep'),  # 8-way (tp×ep=4×2): same memory as TP=8 baseline
     'embed':                None,
-    'delta_v_heads':        'ep',   # 2-way ep (fast intra-chip allreduce)
-    'delta_qk_heads':       'ep',   # 2-way ep
-    'gqa_q_heads':          'ep',   # 2-way ep
-    'gqa_kv_heads':         None,   # replicated (only 2 heads)
-    'experts':              'ep',   # E-dim on ep (2-way fast intra-chip)
-    'expert_intermediate':  'tp',   # I-dim on tp (4-way torus, inside shard_map only)
+    'delta_v_heads':        ('tp', 'ep'),  # 8-way: same memory as TP=8 baseline
+    'delta_qk_heads':       ('tp', 'ep'),  # 8-way
+    'gqa_q_heads':          ('tp', 'ep'),  # 8-way
+    'gqa_kv_heads':         None,          # replicated (only 2 KV heads)
+    'experts':              'ep',          # E-dim on ep (2-way fast intra-chip)
+    'expert_intermediate':  'tp',          # I-dim on tp (4-way torus, inside shard_map)
 }
 
 
