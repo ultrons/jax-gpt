@@ -20,11 +20,13 @@ kind: JobSet
 metadata:
   name: qwen35-v129-4x4x4-profile
   namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
 spec:
   failurePolicy:
     maxRestarts: 1
   replicatedJobs:
-    - name: workers
+    - name: slice
       replicas: 1
       template:
         spec:
@@ -37,7 +39,7 @@ spec:
               labels:
                 app: qwen35-v129-4x4x4-profile
             spec:
-              restartPolicy: OnFailure
+              restartPolicy: Never
               nodeSelector:
                 cloud.google.com/gke-flex-start: "true"
                 cloud.google.com/gke-tpu-accelerator: tpu7x
@@ -46,11 +48,6 @@ spec:
                 - name: bench
                   image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v129
                   imagePullPolicy: Always
-                  ports:
-                    - containerPort: 8471
-                    - containerPort: 8431
-                  securityContext:
-                    privileged: true
                   command: ["python", "scripts/qwen35_benchmark.py"]
                   args:
                     - "--config=full"
@@ -96,7 +93,5 @@ spec:
                         --xla_tpu_aggressive_opt_barrier_removal=true
                         --xla_tpu_enable_sparse_core_collective_aggregator=true
                   resources:
-                    requests:
-                      google.com/tpu: "4"
                     limits:
                       google.com/tpu: "4"
