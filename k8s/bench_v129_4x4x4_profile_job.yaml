@@ -1,0 +1,92 @@
+# v129: BS=4096 decode with XLA profile capture — 4x4x4 cluster
+#
+# Uses plain Job (not JobSet) — JobSet controller is pending on this cluster
+# due to CPU-constrained default node pool.
+#
+# 4x4x4 topology: 64 chips, 128 TCs. DP=16, TP=8 (same TP as 2x4x4 config).
+# Profile will be written to: gs://sivaibhav-exp/qwen-profiles/v129-bs4096-decode
+#
+# Deploy:
+#   kubectl apply -f k8s/bench_v129_4x4x4_profile_job.yaml \
+#     --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-v129-4x4x4-profile --prefix=true -f --max-log-requests=16 \
+#     --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     2>&1 | tee -a /tmp/qwen35-v129-4x4x4-profile.log
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen35-v129-4x4x4-profile
+  namespace: default
+spec:
+  completions: 16
+  parallelism: 16
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: qwen35-v129-4x4x4-profile
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 4x4x4
+      tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: bench
+          image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v129
+          imagePullPolicy: Always
+          command: ["python", "scripts/qwen35_benchmark.py"]
+          args:
+            - "--config=full"
+            - "--dtype=fp8"
+            - "--sharding=B"
+            - "--batch-size=4096"
+            - "--prompt-len=1024"
+            - "--decode-steps=32"
+            - "--dp=16"
+            - "--n-runs=3"
+            - "--use-rpa"
+            - "--scan-mode=unrolled"
+            - "--moe-backend=gmm"
+            - "--skip-prefill"
+            - "--decode-micro-batches=2"
+            - "--profile"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PROFILE_DIR
+              value: "gs://sivaibhav-exp/qwen-profiles/v129-bs4096-decode"
+            - name: LIBTPU_INIT_ARGS
+              value: >-
+                --xla_tpu_offload_gather_to_sparsecore=true
+                --xla_tpu_enable_offloading_scatter_to_sparsecore=true
+                --xla_tpu_enable_offloading_sort_to_sparsecore=true
+                --xla_tpu_enable_latency_hiding_layer_scheduler=true
+                --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true
+                --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true
+                --xla_tpu_scheduler_percent_shared_memory_limit=150
+                --xla_tpu_prefer_async_allgather_to_allreduce=true
+                --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true
+                --xla_tpu_quantized_all_reduce_level=3
+                --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true
+                --xla_tpu_enable_sparse_core_reduce_scatter_v2=true
+                --xla_tpu_sparse_core_reduce_scatter_latency_multiplier=3
+                --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+                --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true
+                --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true
+                --xla_enable_async_all_gather=true
+                --xla_tpu_enable_concurrent_sparse_core_offloading=true
+                --xla_tpu_pcie_bandwidth_multiplier=0.03
+                --xla_tpu_aggressive_opt_barrier_removal=true
+                --xla_tpu_enable_sparse_core_collective_aggregator=true
+          resources:
+            limits:
+              google.com/tpu: "4"
