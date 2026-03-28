@@ -718,13 +718,13 @@ def run_decode_benchmark(
 
             @functools.partial(jax.jit, donate_argnums=(2,))
             def decode_step_micro(p, tok, c):
-                logits, new_c = forward(
+                top_ids, new_c = forward(
                     p, tok[:, None], cfg, cache=c, is_decode=True,
                     cache_sharding=cache_sharding, n_devices=n_devices,
                     mesh=mesh, use_rpa=True, scan_mode='unrolled',
-                    moe_backend=moe_backend,
+                    moe_backend=moe_backend, output_top_k=1,
                 )
-                return jnp.argmax(logits[:, 0, :], axis=-1), new_c
+                return top_ids[:, 0, 0], new_c
 
             # Warmup = first real decode step on page 0 (cache donated in-place)
             tok_page0 = first_token[:page_B]

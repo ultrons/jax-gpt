@@ -210,6 +210,73 @@ def init_params(config: Qwen35Config, key: jax.Array, dtype: jnp.dtype = jnp.flo
 
 
 # ---------------------------------------------------------------------------
+# Output head helpers
+# ---------------------------------------------------------------------------
+
+def _topk_output_head(
+    logits_shard: jax.Array,
+    vocab_size: int,
+    k: int,
+    mesh,
+    axis_name: str,
+) -> jax.Array:
+    """Replace full vocab all-gather with local top-k + tiny all-gather.
+
+    Instead of gathering all vocab/tp logits to every device (1+ GB), each
+    device takes its local top-k, all-gathers only k*tp candidates, then
+    selects the global top-k.  Communication: B * k * tp * 6 bytes (bf16 val
+    + int32 idx) vs B * vocab * 2 bytes previously.
+
+    Args:
+        logits_shard: (B, T, vocab/tp) — vocab-sharded logits on this device.
+        vocab_size: total vocabulary size.
+        k: number of top tokens to return.
+        mesh: device mesh.
+        axis_name: TP axis name in the mesh.
+
+    Returns:
+        top_ids: (B, T, k) int32 global token ids, replicated across TP.
+    """
+    from jax.experimental.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+
+    tp_size = mesh.shape[axis_name]
+    vocab_shard_size = vocab_size // tp_size
+
+    # Build in/out specs: batch on dp axis (if present), vocab on tp axis.
+    dp_axis = next((n for n in mesh.axis_names if n != axis_name), None)
+    if dp_axis is not None:
+        in_spec = P(dp_axis, None, axis_name)
+        out_spec = P(dp_axis, None, None)
+    else:
+        in_spec = P(None, None, axis_name)
+        out_spec = P(None, None, None)
+
+    def _local_topk(shard):
+        # shard: (B/dp, T, vocab/tp)
+        B_local, T_local, _ = shard.shape
+        flat = shard.reshape(B_local * T_local, -1)          # (B*T, vocab/tp)
+        vals, local_idx = jax.lax.top_k(flat, k)             # (B*T, k)
+        tp_rank = jax.lax.axis_index(axis_name)
+        global_idx = local_idx + tp_rank * vocab_shard_size   # (B*T, k)
+        # All-gather k candidates from each TP device
+        all_vals = jax.lax.all_gather(vals, axis_name, tiled=True)      # (B*T, k*tp)
+        all_idx  = jax.lax.all_gather(global_idx, axis_name, tiled=True)
+        # Global top-k
+        _, positions = jax.lax.top_k(all_vals, k)                       # (B*T, k)
+        final_idx = jnp.take_along_axis(all_idx, positions, axis=-1)    # (B*T, k)
+        return final_idx.reshape(B_local, T_local, k)                   # (B/dp, T, k)
+
+    return shard_map(
+        _local_topk,
+        mesh=mesh,
+        in_specs=in_spec,
+        out_specs=out_spec,
+        check_rep=False,
+    )(logits_shard)
+
+
+# ---------------------------------------------------------------------------
 # Forward pass
 # ---------------------------------------------------------------------------
 
@@ -227,6 +294,7 @@ def forward(
     use_rpa: bool = False,
     scan_mode: str = 'scan',
     moe_backend: str = 'ragged_dot',
+    output_top_k: int = 0,
 ) -> tuple[jax.Array, HybridCache | None]:
     """Full model forward pass.
 
@@ -651,13 +719,13 @@ def forward(
         x = rms_norm(x, params['final_norm'], config.rms_norm_eps)
         if last_logit_only:
             x = x[:, -1:, :]  # (B, 1, D) — only last position
-        logits = matmul_maybe_fp8(x, params['lm_head'])  # (B, T_or_1, vocab_size)
-        # AllGather vocab-sharded logits to all TP devices so that sampling
-        # (argmax or categorical) sees the full distribution on every rank.
-        # Without this, logits are P(None, None, 'tp') and sampling in a
-        # separate JIT would operate on each device's vocab shard independently.
+        logits = matmul_maybe_fp8(x, params['lm_head'])  # (B, T_or_1, vocab_size/tp)
         if mesh is not None:
             from jax.sharding import NamedSharding, PartitionSpec as P
+            if output_top_k > 0:
+                logits = _topk_output_head(
+                    logits, config.vocab_size, output_top_k, mesh, axis_name)
+                return logits, new_cache
             logits = jax.lax.with_sharding_constraint(
                 logits, NamedSharding(mesh, P(None, None, None)))
 
@@ -685,6 +753,7 @@ def forward_rpa_decode(
     mesh=None,
     last_logit_only: bool = True,
     moe_backend: str = 'ragged_dot',
+    output_top_k: int = 0,
 ) -> tuple[jax.Array, HybridCache]:
     """Decode forward pass using RPA, with per-group JIT to avoid OOM.
 
@@ -780,8 +849,12 @@ def forward_rpa_decode(
         logits = matmul_maybe_fp8(x, params['lm_head'])
         if mesh is not None:
             from jax.sharding import NamedSharding, PartitionSpec as P
-            logits = jax.lax.with_sharding_constraint(
-                logits, NamedSharding(mesh, P(None, None, None)))
+            if output_top_k > 0:
+                logits = _topk_output_head(
+                    logits, config.vocab_size, output_top_k, mesh, axis_name)
+            else:
+                logits = jax.lax.with_sharding_constraint(
+                    logits, NamedSharding(mesh, P(None, None, None)))
 
     new_cache = HybridCache(
         delta_M=result_delta_M,
