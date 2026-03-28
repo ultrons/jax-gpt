@@ -410,9 +410,11 @@ def run_decode_benchmark(
             get_kv_cache_shape as _gkcs,
         )
         # Correct paged KV shape using the same kernel helper used by contiguous_to_paged.
-        # Shape: (n_groups, total_pages, page_size, kv_packed_dim, packing, aligned_head_dim)
-        # e.g. fp8 (n_kv_heads=2, head_dim=256): (n_groups, pages, 64, 1, 4, 256)
-        paged_kv_shape = (n_groups,) + _gkcs(
+        # Per-group shape (no leading n_groups dim): (total_pages, page_size, kv_packed_dim, packing, hd)
+        # e.g. fp8 (n_kv_heads=2, head_dim=256): (pages, 64, 1, 4, 256)
+        # paged_kv is a tuple of n_groups separate arrays — Python tuple indexing inside JIT
+        # is trace-time (zero JAX slice op), preventing XLA slice_bitcast_fusion on the cache.
+        per_group_kv_shape = _gkcs(
             total_pages, page_size, cfg.gqa_n_kv_heads, cfg.gqa_head_dim, cache_dtype
         )
 
@@ -421,15 +423,18 @@ def run_decode_benchmark(
             dp_axis = 'dp' if 'dp' in mesh.axis_names else None
             cpu = jax.devices('cpu')[0]
 
-            paged_kv_sharding = NamedSharding(mesh, P(None, dp_axis, None, None, None, None))
-            def _paged_cb(idx):
+            paged_kv_sharding = NamedSharding(mesh, P(dp_axis, None, None, None, None))
+            def _paged_cb(idx, _sh=per_group_kv_shape):
                 shard_shape = tuple(
                     (s.stop - s.start) if s.start is not None else dim
-                    for s, dim in zip(idx, paged_kv_shape)
+                    for s, dim in zip(idx, _sh)
                 )
                 with jax.default_device(cpu):
                     return jnp.zeros(shard_shape, dtype=cache_dtype)
-            paged_kv = jax.make_array_from_callback(paged_kv_shape, paged_kv_sharding, _paged_cb)
+            paged_kv = tuple(
+                jax.make_array_from_callback(per_group_kv_shape, paged_kv_sharding, _paged_cb)
+                for _ in range(n_groups)
+            )
 
             kv_lens_sharding = NamedSharding(mesh, P(dp_axis))
             kv_lens = jax.make_array_from_callback(
@@ -440,7 +445,9 @@ def run_decode_benchmark(
                 (total_pages,), page_indices_sharding,
                 lambda idx: np.arange(idx[0].start, idx[0].stop, dtype=np.int32))
         else:
-            paged_kv = jnp.zeros(paged_kv_shape, dtype=cache_dtype)
+            paged_kv = tuple(
+                jnp.zeros(per_group_kv_shape, dtype=cache_dtype) for _ in range(n_groups)
+            )
             kv_lens = jnp.full((B,), prefill_len, dtype=jnp.int32)
             page_indices = jnp.arange(total_pages, dtype=jnp.int32)
 
@@ -547,13 +554,18 @@ def run_decode_benchmark(
             # avoiding an all-gather of the full paged_kv (which would exceed XLA's
             # 32-bit allocation-word limit at ~135 GB/device).
             # 16 unique page_start values → 16 retraces, each a trivial DUS.
+            # paged_kv_tuple is a tuple of n_groups arrays, each (total_pages, ...);
+            # chunk_stacked is (n_groups, chunk_pages, ...) — sliced per-group at trace time.
             @functools.partial(jax.jit, donate_argnums=(0,), static_argnums=(2,))
-            def _write_chunk_to_paged_kv(paged_kv_buf, chunk_stacked, page_start):
+            def _write_chunk_to_paged_kv(paged_kv_tuple, chunk_stacked, page_start):
                 z = jnp.int32(0)
-                return jax.lax.dynamic_update_slice(
-                    paged_kv_buf, chunk_stacked,
-                    (z, jnp.int32(page_start), z, z, z, z),
-                )
+                new_arrays = []
+                for _g in range(n_groups):
+                    new_arrays.append(jax.lax.dynamic_update_slice(
+                        paged_kv_tuple[_g], chunk_stacked[_g],
+                        (jnp.int32(page_start), z, z, z, z),
+                    ))
+                return tuple(new_arrays)
 
             all_delta_M, all_delta_conv, all_first_tokens = [], [], []
 
@@ -611,7 +623,7 @@ def run_decode_benchmark(
             kv_lens=kv_lens,
             page_indices=page_indices,
         )
-        print(f"  Paged KV shape: {paged_kv.shape}")
+        print(f"  Paged KV shape per group: {paged_kv[0].shape} × {len(paged_kv)} groups")
 
         # ── Paged decode path (micro_batches >= 1) ────────────────────────
         # Use this path whenever use_rpa=True and scan_mode=unrolled.
@@ -675,18 +687,21 @@ def run_decode_benchmark(
                 page_delta_conv = _sharded_zeros(dc_global, dc_sharding, cache_dtype)
 
                 if mesh is not None:
-                    pkv_shape = (n_groups,) + _gkcs(
+                    per_g_pkv_shape = _gkcs(
                         page_total_pages, page_size, cfg.gqa_n_kv_heads, cfg.gqa_head_dim, cache_dtype
                     )
-                    pkv_sharding = NamedSharding(mesh, P(None, dp_axis, None, None, None, None))
-                    def _pkv_cb(idx, _sh=pkv_shape):
+                    pkv_sharding = NamedSharding(mesh, P(dp_axis, None, None, None, None))
+                    def _pkv_cb(idx, _sh=per_g_pkv_shape):
                         shard_shape = tuple(
                             (s.stop - s.start) if s.start is not None else d
                             for s, d in zip(idx, _sh)
                         )
                         with jax.default_device(cpu):
                             return jnp.zeros(shard_shape, dtype=cache_dtype)
-                    page_pkv = jax.make_array_from_callback(pkv_shape, pkv_sharding, _pkv_cb)
+                    page_pkv = tuple(
+                        jax.make_array_from_callback(per_g_pkv_shape, pkv_sharding, _pkv_cb)
+                        for _ in range(n_groups)
+                    )
                     page_kv_lens = jax.make_array_from_callback(
                         (page_B,), NamedSharding(mesh, P(dp_axis)),
                         lambda idx: np.full(
@@ -695,11 +710,12 @@ def run_decode_benchmark(
                         (page_total_pages,), NamedSharding(mesh, P(dp_axis)),
                         lambda idx: np.arange(idx[0].start, idx[0].stop, dtype=np.int32))
                 else:
-                    page_pkv = jnp.zeros(
-                        (n_groups,) + _gkcs(
-                            page_total_pages, page_size, cfg.gqa_n_kv_heads, cfg.gqa_head_dim, cache_dtype
-                        ),
-                        dtype=cache_dtype)
+                    per_g_pkv_shape = _gkcs(
+                        page_total_pages, page_size, cfg.gqa_n_kv_heads, cfg.gqa_head_dim, cache_dtype
+                    )
+                    page_pkv = tuple(
+                        jnp.zeros(per_g_pkv_shape, dtype=cache_dtype) for _ in range(n_groups)
+                    )
                     page_kv_lens = jnp.full((page_B,), prefill_len, dtype=jnp.int32)
                     page_pi = jnp.arange(page_total_pages, dtype=jnp.int32)
 
@@ -714,7 +730,7 @@ def run_decode_benchmark(
                     kv_lens=page_kv_lens,
                     page_indices=page_pi,
                 ))
-            print(f"  Paged KV shape per micro-batch: {page_caches[0].paged_kv.shape}")
+            print(f"  Paged KV shape per group per micro-batch: {page_caches[0].paged_kv[0].shape} × {len(page_caches[0].paged_kv)} groups")
 
             @functools.partial(jax.jit, donate_argnums=(2,))
             def decode_step_micro(p, tok, c):

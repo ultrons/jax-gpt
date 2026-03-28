@@ -352,10 +352,10 @@ def forward(
 
     # RPA metadata (used by both scan and unrolled RPA paths)
     if _use_rpa:
-        paged_kv = cache.paged_kv       # (n_groups, total_pages, ps, kv_dim, pk, hd)
+        paged_kv = cache.paged_kv       # tuple of n_groups arrays, each (total_pages, ps, kv_dim, pk, hd)
         kv_lens = cache.kv_lens          # (B,)
         page_indices = cache.page_indices  # (B * pages_per_seq,)
-        pages_per_seq = paged_kv.shape[1] // B
+        pages_per_seq = paged_kv[0].shape[0] // B
 
         if mesh is not None and 'dp' in mesh.axis_names:
             dp = mesh.shape['dp']
@@ -490,7 +490,7 @@ def forward(
                 x, new_dM, new_dC, updated_kv = group_forward_rpa(
                     x, g_params,
                     _dyn_idx(delta_Ms, g), _dyn_idx(delta_convs, g),
-                    _dyn_idx(paged_kv, g), kv_lens, page_indices_local,
+                    paged_kv[g], kv_lens, page_indices_local,
                     cu_q_lens, distribution,
                     cache_pos, config, rope_freqs,
                     n_devices=n_devices, mesh=mesh, axis_name=axis_name,
@@ -510,13 +510,13 @@ def forward(
                 new_delta_convs.append(new_dC)
                 new_paged_kvs.append(updated_kv)
 
-            # Stack once at the end — single XLA concatenate, no per-group DUS.
-            # NOTE: requires all 15 group outputs alive simultaneously. At large
-            # batch sizes (BS=4096) this may add ~10 GB peak HBM; use smaller
-            # batch or decode-micro-batches if HBM is tight.
+            # Stack delta states; keep paged_kv as tuple of per-group arrays.
+            # Tuple paged_kv: paged_kv[g] inside JIT is Python tuple indexing at
+            # trace time — a direct input parameter reference, zero JAX slice op,
+            # no slice_bitcast_fusion. jnp.stack would recreate the bottleneck.
             result_delta_M = jnp.stack(new_delta_Ms)
             result_delta_conv = jnp.stack(new_delta_convs)
-            result_paged_kv = jnp.stack(new_paged_kvs)
+            result_paged_kv = tuple(new_paged_kvs)
 
             new_cache = HybridCache(
                 delta_M=result_delta_M,
@@ -641,6 +641,14 @@ def forward(
 
             return x_carry, (new_dM, new_dC, updated_kv)
 
+        # Scan path requires paged_kv as a stacked array (leading axis = n_groups).
+        # Tuple paged_kv is only supported in the unrolled path (scan_mode='unrolled').
+        if isinstance(paged_kv, tuple):
+            raise ValueError(
+                "scan_mode='scan' requires paged_kv as a stacked jax.Array "
+                "(n_groups, total_pages, ...). Got a tuple. "
+                "Use scan_mode='unrolled' when paged_kv is a tuple."
+            )
         scan_inputs = (
             params['groups'], delta_Ms, delta_convs, paged_kv,
         )
@@ -799,12 +807,12 @@ def forward_rpa_decode(
     )
 
     cache_pos = cache.pos
-    paged_kv = cache.paged_kv        # (n_groups, total_pages, ps, kv_dim, pk, hd)
+    paged_kv = cache.paged_kv        # tuple of n_groups arrays, each (total_pages, ps, kv_dim, pk, hd)
     kv_lens = cache.kv_lens          # (B,)
     page_indices = cache.page_indices  # (B * pages_per_seq,)
 
     # Infer pages_per_seq
-    pages_per_seq = paged_kv.shape[1] // B
+    pages_per_seq = paged_kv[0].shape[0] // B
 
     # With dp sharding, shard_map splits batch across dp devices.
     # Compute dp-local metadata: each shard processes B_local sequences.
@@ -847,10 +855,9 @@ def forward_rpa_decode(
         new_delta_convs.append(new_dC)
         new_paged_kvs.append(updated_kv)
 
-    # Stack once at the end — single XLA concatenate, no per-group DUS.
     result_delta_M = jnp.stack(new_delta_Ms)
     result_delta_conv = jnp.stack(new_delta_convs)
-    result_paged_kv = jnp.stack(new_paged_kvs)
+    result_paged_kv = tuple(new_paged_kvs)
 
     with jax.named_scope('output_head'):
         x = rms_norm(x, params['final_norm'], config.rms_norm_eps)

@@ -32,8 +32,12 @@ class HybridCache:
         gqa_v:       (n_groups, B, n_kv_heads, max_len, head_dim)
 
     GQA cache (paged — used for RPA decode):
-        paged_kv:    (n_groups, total_pages, page_size, kv_packed_dim, packing, hd)
-            Stacked paged KV caches for all groups. None when not using RPA.
+        paged_kv:    tuple of n_groups arrays, each (total_pages, page_size, kv_packed_dim, packing, hd)
+            Per-group paged KV caches as a Python tuple of separate arrays.
+            Using a tuple (not a stacked array) means paged_kv[g] inside @jax.jit is Python
+            tuple indexing at trace time — a direct input parameter reference with zero JAX
+            slice operation, preventing XLA from fusing all 15 group reads into one
+            slice_bitcast_fusion. None when not using RPA.
         kv_lens:     i32[B] — current KV length per sequence. None when not using RPA.
         page_indices: i32[B * pages_per_seq] — page lookup table. None when not using RPA.
 
@@ -44,7 +48,7 @@ class HybridCache:
     gqa_k: jax.Array
     gqa_v: jax.Array
     pos: jax.Array  # scalar int32
-    paged_kv: jax.Array | None = None
+    paged_kv: tuple | None = None
     kv_lens: jax.Array | None = None
     page_indices: jax.Array | None = None
 
