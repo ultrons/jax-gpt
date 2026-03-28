@@ -259,9 +259,9 @@ def _topk_output_head(
         vals, local_idx = jax.lax.top_k(flat, k)             # (B*T, k)
         tp_rank = jax.lax.axis_index(axis_name)
         global_idx = local_idx + tp_rank * vocab_shard_size   # (B*T, k)
-        # All-gather k candidates from each TP device
-        all_vals = jax.lax.all_gather(vals, axis_name, tiled=True)      # (B*T, k*tp)
-        all_idx  = jax.lax.all_gather(global_idx, axis_name, tiled=True)
+        # All-gather k candidates from each TP device along k-axis (axis=1)
+        all_vals = jax.lax.all_gather(vals, axis_name, axis=1, tiled=True)      # (B*T, k*tp)
+        all_idx  = jax.lax.all_gather(global_idx, axis_name, axis=1, tiled=True)
         # Global top-k
         _, positions = jax.lax.top_k(all_vals, k)                       # (B*T, k)
         final_idx = jnp.take_along_axis(all_idx, positions, axis=-1)    # (B*T, k)
