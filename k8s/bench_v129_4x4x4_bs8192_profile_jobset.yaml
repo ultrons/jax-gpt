@@ -1,24 +1,22 @@
-# v129: BS=4096 decode with XLA profile capture — 4x4x4 cluster
+# v129: BS=8192 decode profile capture — 4x4x4 cluster
 #
-# Fresh profile after scatter fix + output-head top-k (v129, 862 TPS/chip).
-# 4x4x4: 64 chips, 128 TCs. DP=16, TP=8 (same TP as 2x4x4 config).
-#
-# Profile will be written to: gs://sivaibhav-exp/qwen-profiles/v129-bs4096-decode
+# Captures XLA profile for bottleneck analysis at BS=8192 (634.8 TPS/chip).
+# Profile written to: gs://sivaibhav-exp/qwen-profiles/v129-bs8192-decode
 #
 # Deploy:
-#   kubectl apply -f k8s/bench_v129_4x4x4_profile_jobset.yaml \
+#   kubectl apply -f k8s/bench_v129_4x4x4_bs8192_profile_jobset.yaml \
 #     --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x
 #
 # Monitor:
-#   kubectl logs -l app=qwen35-v129-4x4x4-profile --prefix=true -f --max-log-requests=16 \
+#   kubectl logs -l app=qwen35-v129-4x4x4-bs8192-profile --prefix=true -f --max-log-requests=16 \
 #     --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
-#     2>&1 | tee -a /tmp/qwen35-v129-4x4x4-profile.log
+#     2>&1 | tee -a /tmp/qwen35-v129-4x4x4-bs8192-profile.log
 
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: qwen35-v129-4x4x4-profile
+  name: qwen35-v129-4x4x4-bs8192-profile
   namespace: default
   annotations:
     alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
@@ -37,7 +35,7 @@ spec:
           template:
             metadata:
               labels:
-                app: qwen35-v129-4x4x4-profile
+                app: qwen35-v129-4x4x4-bs8192-profile
             spec:
               restartPolicy: Never
               nodeSelector:
@@ -53,22 +51,22 @@ spec:
                     - "--config=full"
                     - "--dtype=fp8"
                     - "--sharding=B"
-                    - "--batch-size=4096"
+                    - "--batch-size=8192"
                     - "--prompt-len=1024"
                     - "--decode-steps=32"
                     - "--dp=16"
-                    - "--n-runs=3"
+                    - "--n-runs=1"
                     - "--use-rpa"
                     - "--scan-mode=unrolled"
                     - "--moe-backend=gmm"
                     - "--skip-prefill"
-                    - "--decode-micro-batches=2"
+                    - "--decode-micro-batches=4"
                     - "--profile"
                   env:
                     - name: PYTHONUNBUFFERED
                       value: "1"
                     - name: PROFILE_DIR
-                      value: "gs://tpu-ml-models/qwen-profiles/v129-bs4096-decode"
+                      value: "gs://sivaibhav-exp/qwen-profiles/v129-bs8192-decode"
                     - name: LIBTPU_INIT_ARGS
                       value: >-
                         --xla_tpu_offload_gather_to_sparsecore=true

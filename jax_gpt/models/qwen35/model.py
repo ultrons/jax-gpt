@@ -375,6 +375,17 @@ def forward(
     # stacked (n_groups, ...) arrays.
     groups_list = params.get('groups_list', None)
 
+    def _dyn_idx(tensor, g):
+        """Dynamic index into axis-0 of tensor at position g.
+
+        Using dynamic_index_in_dim instead of static tensor[g] prevents XLA
+        from fusing all 15 group reads into one giant slice_bitcast_fusion.
+        Static indexing causes XLA to pre-materialize all group slices from
+        the same buffer simultaneously — each 4-6 GB tensor × 15 groups = 60+
+        GB read per step for cache tensors (paged_kv, delta_M, delta_conv).
+        """
+        return jax.lax.dynamic_index_in_dim(tensor, jnp.int32(g), axis=0, keepdims=False)
+
     def _slice_group(groups, g):
         """Slice group g from stacked params using dynamic_index_in_dim.
 
@@ -390,16 +401,15 @@ def forward(
 
     def _slice_moe_flat(moe_flat, idx):
         """Slice one layer's MoE params from the flattened (n_groups*n_delta, ...)
-        array using dynamic_slice_in_dim + squeeze.
+        array using dynamic_index_in_dim.
 
-        Preserves rank during the dynamic_slice (4D→4D for weights), then
-        squeezes the leading dim. The squeeze still triggers XLA
-        slice_bitcast_fusion, but this is better than double-slicing from the
-        original (n_groups, n_delta, ...) stacked array.
+        Uses dynamic_index_in_dim (same as _slice_group) instead of
+        dynamic_slice_in_dim + squeeze, which caused XLA to fuse all 15
+        group slices into one giant slice_bitcast_fusion consuming ~0.8ms/step.
         """
         idx_arr = jnp.int32(idx)
         return jax.tree.map(
-            lambda a: jax.lax.dynamic_slice_in_dim(a, idx_arr, 1, axis=0).squeeze(0),
+            lambda a: jax.lax.dynamic_index_in_dim(a, idx_arr, axis=0, keepdims=False),
             moe_flat)
 
     if scan_mode == 'unrolled':
@@ -479,8 +489,8 @@ def forward(
 
                 x, new_dM, new_dC, updated_kv = group_forward_rpa(
                     x, g_params,
-                    delta_Ms[g], delta_convs[g],
-                    paged_kv[g], kv_lens, page_indices_local,
+                    _dyn_idx(delta_Ms, g), _dyn_idx(delta_convs, g),
+                    _dyn_idx(paged_kv, g), kv_lens, page_indices_local,
                     cu_q_lens, distribution,
                     cache_pos, config, rope_freqs,
                     n_devices=n_devices, mesh=mesh, axis_name=axis_name,
@@ -540,8 +550,8 @@ def forward(
 
                 x, new_dM, new_dC, new_gk, new_gv = group_forward(
                     x, g_params,
-                    delta_Ms[g], delta_convs[g],
-                    gqa_ks[g], gqa_vs[g],
+                    _dyn_idx(delta_Ms, g), _dyn_idx(delta_convs, g),
+                    _dyn_idx(gqa_ks, g), _dyn_idx(gqa_vs, g),
                     cache_pos, config, rope_freqs, is_decode,
                     n_devices=n_devices, mesh=mesh, axis_name=axis_name,
                     moe_backend=moe_backend,

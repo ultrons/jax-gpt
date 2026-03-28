@@ -205,7 +205,12 @@ def group_forward(
     n_delta = config.full_attention_interval - 1
     new_Ms_list, new_convs_list = [], []
     for i in range(n_delta):
-        layer_p = jax.tree.map(lambda a: a[i], delta_layer_params)
+        i_idx = jnp.int32(i)
+        # Use dynamic_index_in_dim (not static a[i]) to prevent XLA from
+        # fusing all 3 layer slices into one slice_bitcast_fusion.
+        layer_p = jax.tree.map(
+            lambda a: jax.lax.dynamic_index_in_dim(a, i_idx, axis=0, keepdims=False),
+            delta_layer_params)
         if delta_moe_list is not None:
             layer_p = {**layer_p, 'moe': delta_moe_list[i]}
 
@@ -216,7 +221,10 @@ def group_forward(
             l_idx = group_idx * n_delta + i
 
         x, new_M, new_conv = deltanet_layer_forward(
-            x, layer_p, delta_Ms[i], delta_convs[i], config, is_decode,
+            x, layer_p,
+            jax.lax.dynamic_index_in_dim(delta_Ms, i_idx, axis=0, keepdims=False),
+            jax.lax.dynamic_index_in_dim(delta_convs, i_idx, axis=0, keepdims=False),
+            config, is_decode,
             n_devices=n_devices, mesh=mesh, axis_name=axis_name,
             moe_backend=moe_backend,
             stacked_expert_weights=stacked_ew,
@@ -297,7 +305,12 @@ def group_forward_rpa(
     n_delta = config.full_attention_interval - 1
     new_Ms_list, new_convs_list = [], []
     for i in range(n_delta):
-        layer_p = jax.tree.map(lambda a: a[i], delta_layer_params)
+        i_idx = jnp.int32(i)
+        # Use dynamic_index_in_dim (not static a[i]) to prevent XLA from
+        # fusing all 3 layer slices into one slice_bitcast_fusion.
+        layer_p = jax.tree.map(
+            lambda a: jax.lax.dynamic_index_in_dim(a, i_idx, axis=0, keepdims=False),
+            delta_layer_params)
         if delta_moe_list is not None:
             layer_p = {**layer_p, 'moe': delta_moe_list[i]}
 
@@ -308,7 +321,10 @@ def group_forward_rpa(
             l_idx = group_idx * n_delta + i
 
         x, new_M, new_conv = deltanet_layer_forward(
-            x, layer_p, delta_Ms[i], delta_convs[i], config, is_decode=True,
+            x, layer_p,
+            jax.lax.dynamic_index_in_dim(delta_Ms, i_idx, axis=0, keepdims=False),
+            jax.lax.dynamic_index_in_dim(delta_convs, i_idx, axis=0, keepdims=False),
+            config, is_decode=True,
             n_devices=n_devices, mesh=mesh, axis_name=axis_name,
             moe_backend=moe_backend,
             stacked_expert_weights=stacked_ew,
