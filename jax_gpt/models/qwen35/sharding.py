@@ -445,21 +445,23 @@ def shard_cache(
     gqa_kv_axis = axis_rules.get('gqa_kv_heads')
     dp_axis = 'dp' if 'dp' in mesh.axis_names else None
 
-    # delta_M: (n_groups, 3, B, n_v_heads, qk_head_dim, v_head_dim)
+    # delta_M per-group: (3, B, n_v_heads, qk_head_dim, v_head_dim)
     delta_M_spec = _safe_spec(
-        P(None, None, dp_axis, tp_axis, None, None), cache.delta_M.shape, mesh)
-    # delta_conv: (n_groups, 3, B, conv_dim, kernel)
+        P(None, dp_axis, tp_axis, None, None), cache.delta_M[0].shape, mesh)
+    # delta_conv per-group: (3, B, conv_dim, kernel)
     delta_conv_spec = _safe_spec(
-        P(None, None, dp_axis, tp_axis, None), cache.delta_conv.shape, mesh)
+        P(None, dp_axis, tp_axis, None), cache.delta_conv[0].shape, mesh)
     # gqa_k/v: (n_groups, B, n_kv_heads, max_len, head_dim)
     gqa_spec = _safe_spec(
         P(None, dp_axis, gqa_kv_axis, None, None), cache.gqa_k.shape, mesh)
     # pos: scalar
     pos_spec = P()
+    dm_sharding = NamedSharding(mesh, delta_M_spec)
+    dc_sharding = NamedSharding(mesh, delta_conv_spec)
 
     return HybridCache(
-        delta_M=jax.device_put(cache.delta_M, NamedSharding(mesh, delta_M_spec)),
-        delta_conv=jax.device_put(cache.delta_conv, NamedSharding(mesh, delta_conv_spec)),
+        delta_M=tuple(jax.device_put(arr, dm_sharding) for arr in cache.delta_M),
+        delta_conv=tuple(jax.device_put(arr, dc_sharding) for arr in cache.delta_conv),
         gqa_k=jax.device_put(cache.gqa_k, NamedSharding(mesh, gqa_spec)),
         gqa_v=jax.device_put(cache.gqa_v, NamedSharding(mesh, gqa_spec)),
         pos=jax.device_put(cache.pos, NamedSharding(mesh, pos_spec)),

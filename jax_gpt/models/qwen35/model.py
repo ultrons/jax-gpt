@@ -336,8 +336,8 @@ def forward(
     # Prepare cache slices for scan
     if cache is not None:
         cache_pos = cache.pos
-        delta_Ms = cache.delta_M        # (n_groups, 3, B, ...)
-        delta_convs = cache.delta_conv   # (n_groups, 3, B, ...)
+        delta_Ms = cache.delta_M        # tuple of n_groups arrays, each (3, B, ...)
+        delta_convs = cache.delta_conv   # tuple of n_groups arrays, each (3, B, ...)
         gqa_ks = cache.gqa_k             # (n_groups, B, ...)
         gqa_vs = cache.gqa_v             # (n_groups, B, ...)
     else:
@@ -489,7 +489,7 @@ def forward(
 
                 x, new_dM, new_dC, updated_kv = group_forward_rpa(
                     x, g_params,
-                    _dyn_idx(delta_Ms, g), _dyn_idx(delta_convs, g),
+                    delta_Ms[g], delta_convs[g],
                     paged_kv[g], kv_lens, page_indices_local,
                     cu_q_lens, distribution,
                     cache_pos, config, rope_freqs,
@@ -510,12 +510,11 @@ def forward(
                 new_delta_convs.append(new_dC)
                 new_paged_kvs.append(updated_kv)
 
-            # Stack delta states; keep paged_kv as tuple of per-group arrays.
-            # Tuple paged_kv: paged_kv[g] inside JIT is Python tuple indexing at
-            # trace time — a direct input parameter reference, zero JAX slice op,
-            # no slice_bitcast_fusion. jnp.stack would recreate the bottleneck.
-            result_delta_M = jnp.stack(new_delta_Ms)
-            result_delta_conv = jnp.stack(new_delta_convs)
+            # Keep all caches as tuples of per-group arrays.
+            # tuple[g] inside JIT = Python indexing at trace time → direct input
+            # parameter reference, zero JAX op, no slice_bitcast_fusion.
+            result_delta_M = tuple(new_delta_Ms)
+            result_delta_conv = tuple(new_delta_convs)
             result_paged_kv = tuple(new_paged_kvs)
 
             new_cache = HybridCache(
@@ -530,8 +529,8 @@ def forward(
             )
 
         elif cache is not None:
-            result_delta_M = delta_Ms
-            result_delta_conv = delta_convs
+            result_delta_Ms = list(delta_Ms)   # mutable list for per-group updates
+            result_delta_convs = list(delta_convs)
             result_gqa_k = gqa_ks
             result_gqa_v = gqa_vs
 
@@ -550,7 +549,7 @@ def forward(
 
                 x, new_dM, new_dC, new_gk, new_gv = group_forward(
                     x, g_params,
-                    _dyn_idx(delta_Ms, g), _dyn_idx(delta_convs, g),
+                    delta_Ms[g], delta_convs[g],
                     _dyn_idx(gqa_ks, g), _dyn_idx(gqa_vs, g),
                     cache_pos, config, rope_freqs, is_decode,
                     n_devices=n_devices, mesh=mesh, axis_name=axis_name,
@@ -566,14 +565,14 @@ def forward(
                     new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
                     new_gk = jax.lax.with_sharding_constraint(new_gk, cache_sharding['gqa_kv'])
                     new_gv = jax.lax.with_sharding_constraint(new_gv, cache_sharding['gqa_kv'])
-                result_delta_M = result_delta_M.at[g].set(new_dM)
-                result_delta_conv = result_delta_conv.at[g].set(new_dC)
+                result_delta_Ms[g] = new_dM
+                result_delta_convs[g] = new_dC
                 result_gqa_k = result_gqa_k.at[g].set(new_gk)
                 result_gqa_v = result_gqa_v.at[g].set(new_gv)
 
             new_cache = HybridCache(
-                delta_M=result_delta_M,
-                delta_conv=result_delta_conv,
+                delta_M=tuple(result_delta_Ms),
+                delta_conv=tuple(result_delta_convs),
                 gqa_k=result_gqa_k,
                 gqa_v=result_gqa_v,
                 pos=cache_pos + T,
@@ -641,13 +640,13 @@ def forward(
 
             return x_carry, (new_dM, new_dC, updated_kv)
 
-        # Scan path requires paged_kv as a stacked array (leading axis = n_groups).
-        # Tuple paged_kv is only supported in the unrolled path (scan_mode='unrolled').
-        if isinstance(paged_kv, tuple):
+        # Scan path requires all caches as stacked arrays (leading axis = n_groups).
+        # Tuple caches are only supported in the unrolled path (scan_mode='unrolled').
+        if isinstance(paged_kv, tuple) or isinstance(delta_Ms, tuple):
             raise ValueError(
-                "scan_mode='scan' requires paged_kv as a stacked jax.Array "
-                "(n_groups, total_pages, ...). Got a tuple. "
-                "Use scan_mode='unrolled' when paged_kv is a tuple."
+                "scan_mode='scan' requires paged_kv, delta_Ms, delta_convs as stacked "
+                "jax.Array (n_groups, ...). Got tuples. "
+                "Use scan_mode='unrolled' when using tuple caches."
             )
         scan_inputs = (
             params['groups'], delta_Ms, delta_convs, paged_kv,
@@ -855,8 +854,8 @@ def forward_rpa_decode(
         new_delta_convs.append(new_dC)
         new_paged_kvs.append(updated_kv)
 
-    result_delta_M = jnp.stack(new_delta_Ms)
-    result_delta_conv = jnp.stack(new_delta_convs)
+    result_delta_M = tuple(new_delta_Ms)
+    result_delta_conv = tuple(new_delta_convs)
     result_paged_kv = tuple(new_paged_kvs)
 
     with jax.named_scope('output_head'):

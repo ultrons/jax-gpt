@@ -123,7 +123,8 @@ def test_shard_cache_runs(mini_config):
     cache = init_cache(mini_config, batch_size=1, max_len=32)
     mesh = make_mesh()
     sharded = shard_cache(cache, mesh, mini_config, AXIS_RULES_B)
-    assert sharded.delta_M.shape == cache.delta_M.shape
+    assert len(sharded.delta_M) == len(cache.delta_M)
+    assert sharded.delta_M[0].shape == cache.delta_M[0].shape
     assert sharded.gqa_k.shape == cache.gqa_k.shape
 
 

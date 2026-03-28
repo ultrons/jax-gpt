@@ -315,19 +315,22 @@ def forward_offload(
 
     if cache is not None:
         cache_pos    = cache.pos
-        all_delta_Ms   = cache.delta_M    # (n_groups, n_delta, B, n_v_heads, qk_dim, v_dim)
-        all_delta_convs = cache.delta_conv  # (n_groups, n_delta, B, conv_dim, kernel)
+        all_delta_Ms   = cache.delta_M    # tuple of n_groups arrays, each (n_delta, B, n_v_heads, qk_dim, v_dim)
+        all_delta_convs = cache.delta_conv  # tuple of n_groups arrays, each (n_delta, B, conv_dim, kernel)
         all_gqa_ks   = cache.gqa_k        # (n_groups, B, n_kv_heads, max_len, head_dim)
         all_gqa_vs   = cache.gqa_v
     else:
         cache_pos = None
         # Dummy zero arrays — only used for scan signature consistency when cache=None
-        all_delta_Ms    = jnp.zeros((n_groups, n_delta, B,
-                                     config.delta_n_v_heads,
-                                     config.delta_qk_head_dim,
-                                     config.delta_v_head_dim))
-        all_delta_convs = jnp.zeros((n_groups, n_delta, B,
-                                     conv_dim, config.delta_conv_kernel))
+        all_delta_Ms    = tuple(
+            jnp.zeros((n_delta, B, config.delta_n_v_heads,
+                       config.delta_qk_head_dim, config.delta_v_head_dim))
+            for _ in range(n_groups)
+        )
+        all_delta_convs = tuple(
+            jnp.zeros((n_delta, B, conv_dim, config.delta_conv_kernel))
+            for _ in range(n_groups)
+        )
         all_gqa_ks      = jnp.zeros((n_groups, B, config.gqa_n_kv_heads,
                                      T, config.gqa_head_dim))
         all_gqa_vs      = jnp.zeros((n_groups, B, config.gqa_n_kv_heads,
@@ -436,8 +439,8 @@ def forward_offload(
 
     if _use_rpa:
         new_cache = HybridCache(
-            delta_M=jnp.stack(new_delta_Ms, axis=0),
-            delta_conv=jnp.stack(new_delta_convs, axis=0),
+            delta_M=tuple(new_delta_Ms),
+            delta_conv=tuple(new_delta_convs),
             gqa_k=cache.gqa_k,  # keep contiguous cache unchanged (paged is authoritative)
             gqa_v=cache.gqa_v,
             pos=new_pos,
@@ -452,8 +455,8 @@ def forward_offload(
         return logits, new_cache, new_paged
     else:
         new_cache = HybridCache(
-            delta_M=jnp.stack(new_delta_Ms, axis=0),
-            delta_conv=jnp.stack(new_delta_convs, axis=0),
+            delta_M=tuple(new_delta_Ms),
+            delta_conv=tuple(new_delta_convs),
             gqa_k=jnp.stack(new_gqa_ks, axis=0),
             gqa_v=jnp.stack(new_gqa_vs, axis=0),
             pos=new_pos,

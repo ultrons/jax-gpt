@@ -164,7 +164,8 @@ class TestEightDevices:
         cache = init_cache(config, batch_size=1, max_len=32)
 
         sharded = shard_cache(cache, mesh, config, AXIS_RULES_B)
-        assert sharded.delta_M.shape == cache.delta_M.shape
+        assert len(sharded.delta_M) == len(cache.delta_M)
+        assert sharded.delta_M[0].shape == cache.delta_M[0].shape
         assert sharded.gqa_k.shape == cache.gqa_k.shape
 
     def test_forward_with_cache_sharded_8dev(self, config, params):
