@@ -47,7 +47,7 @@ spec:
                 cloud.google.com/gke-tpu-topology: 2x4x4
               containers:
                 - name: bench
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v123
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v127
                   imagePullPolicy: Always
                   command: ["python", "scripts/collective_bench.py"]
                   env:

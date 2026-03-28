@@ -1,0 +1,117 @@
+# Download DeepSeek-V3 bf16 + fp8 weights from HuggingFace to ds-v3-weights disk.
+#
+# Disk: projects/cloud-tpu-multipod-dev/zones/us-central1-c/disks/ds-v3-weights (2TB)
+# Downloads:
+#   /mnt/model/DeepSeek-V3        — bf16 (~1.34 TB)  deepseek-ai/DeepSeek-V3
+#   /mnt/model/DeepSeek-V3-fp8   — fp8 (~670 GB)    deepseek-ai/DeepSeek-V3 (fp8 variant)
+#
+# Monitor:
+#   kubectl logs -f dsv3-download \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     2>&1 | tee -a /tmp/dsv3-download.log
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ds-v3-weights-pv
+spec:
+  capacity:
+    storage: 2000Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: pd.csi.storage.gke.io
+    volumeHandle: projects/cloud-tpu-multipod-dev/zones/us-central1-c/disks/ds-v3-weights
+    readOnly: false
+    fsType: ext4
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values:
+                - us-central1-c
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ds-v3-weights-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2000Gi
+  volumeName: ds-v3-weights-pv
+  storageClassName: ""
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dsv3-download
+  namespace: default
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-nodepool: cpu-np
+  containers:
+    - name: download
+      image: python:3.11-slim
+      command: ["bash", "-c"]
+      args:
+        - |
+          set -e
+          pip install -q huggingface_hub hf_transfer
+
+          echo "=== Disk usage before download ==="
+          df -h /mnt/model
+
+          echo "=== Files in deepseek-ai/DeepSeek-V3 repo ==="
+          python -c "
+from huggingface_hub import list_repo_files
+files = list(list_repo_files('deepseek-ai/DeepSeek-V3'))
+for f in sorted(files)[:40]:
+    print(f)
+print(f'... total {len(files)} files')
+"
+
+          echo "=== Downloading deepseek-ai/DeepSeek-V3 ==="
+          python -c "
+import os
+os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='deepseek-ai/DeepSeek-V3',
+    local_dir='/mnt/model/DeepSeek-V3',
+    local_dir_use_symlinks=False,
+)
+print('Done.')
+"
+
+          echo "=== Final disk usage ==="
+          df -h /mnt/model
+          du -sh /mnt/model/*
+          echo "=== Download complete ==="
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+      resources:
+        requests:
+          cpu: "8"
+          memory: "16Gi"
+        limits:
+          cpu: "8"
+          memory: "16Gi"
+      volumeMounts:
+        - name: model-weights
+          mountPath: /mnt/model
+  volumes:
+    - name: model-weights
+      persistentVolumeClaim:
+        claimName: ds-v3-weights-pvc

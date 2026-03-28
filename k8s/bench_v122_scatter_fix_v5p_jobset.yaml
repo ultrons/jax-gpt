@@ -1,0 +1,87 @@
+# Scatter DUS fix validation on v5p 4×4×4.
+#
+# Tests jnp.stack replacement for 15-group DUS scatter pattern (20.9% of
+# v7x step time). Measures TPS/chip on v5p as functional validation before
+# running on v7x (currently unavailable).
+#
+# Mesh: (dp=8, tp=8) = 64 chips = 4×4×4 v5p
+# Sharding: Config B — TP=8 for all axes (same as v113 v7x baseline)
+# Batch: BS=1024, decode-micro-batches=2 (page_B=512, ~10 GB HLO temps)
+# Note: 15 group outputs held simultaneously ≈ +1.5 GB peak vs DUS path.
+#
+# Profile: gs://sivaibhav-exp/qwen-profiles/v122-scatter-bs1024-v5p-decode
+#
+# Deploy:
+#   kubectl apply -f k8s/bench_v122_scatter_fix_v5p_jobset.yaml \
+#     --context gke_cloud-tpu-multipod-dev_europe-west4_mlperf-rl-v5p-128
+#
+# Monitor:
+#   kubectl logs -l app=qwen35-v122-scatter-v5p --prefix=true -f \
+#     --max-log-requests=16 \
+#     --context gke_cloud-tpu-multipod-dev_europe-west4_mlperf-rl-v5p-128 \
+#     2>&1 | tee -a /tmp/qwen35-v122-scatter-v5p.log
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qwen35-v122-scatter-v5p
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: qwen35-v122-scatter-v5p
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+                cloud.google.com/gke-tpu-topology: 4x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v122
+                  imagePullPolicy: Always
+                  command: ["python", "scripts/qwen35_benchmark.py"]
+                  args:
+                    - "--config=full"
+                    - "--dtype=fp8"
+                    - "--sharding=B"
+                    - "--batch-size=1024"
+                    - "--prompt-len=1024"
+                    - "--decode-steps=32"
+                    - "--dp=8"
+                    - "--n-runs=3"
+                    - "--use-rpa"
+                    - "--scan-mode=unrolled"
+                    - "--moe-backend=gmm"
+                    - "--skip-prefill"
+                    - "--decode-micro-batches=2"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_latency_hiding_layer_scheduler=true
+                        --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true
+                        --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true
+                        --xla_tpu_scheduler_percent_shared_memory_limit=150
+                        --xla_tpu_prefer_async_allgather_to_allreduce=true
+                        --xla_tpu_aggressive_opt_barrier_removal=true
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

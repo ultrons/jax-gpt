@@ -1,0 +1,61 @@
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: oss-model-dev-pv-rw
+spec:
+  capacity:
+    storage: 1000Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: pd.csi.storage.gke.io
+    volumeHandle: projects/cloud-tpu-multipod-dev/zones/europe-west4-b/disks/oss-model-dev-mlperf
+    readOnly: false
+    fsType: ext4
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values:
+                - europe-west4-b
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oss-model-dev-pvc-rw
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1000Gi
+  volumeName: oss-model-dev-pv-rw
+  storageClassName: ""
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: disk-inspect
+  namespace: default
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-nodepool: cpu-np
+  containers:
+    - name: inspect
+      image: ubuntu:22.04
+      command: ["bash", "-c", "df -h /mnt/model && echo '---' && du -sh /mnt/model/* 2>/dev/null | sort -rh | head -20 && echo 'Done.' && sleep 3600"]
+      volumeMounts:
+        - name: model-weights
+          mountPath: /mnt/model
+  volumes:
+    - name: model-weights
+      persistentVolumeClaim:
+        claimName: oss-model-dev-pvc-rw

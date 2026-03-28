@@ -1,34 +1,24 @@
-# TP=4/EP=2 topology experiment — mid config (16 routed experts).
+# v113: BS=4096 decode with XLA profile capture → GCS
 #
-# Uses a 3D mesh (dp=8, tp=4, ep=2) = 64 TCs = 32 chips.
-# Expert weights shard on 'ep' (2-way); DeltaNet/GQA shard on 'tp' (4-way).
+# Same config as v101 (confirmed 728 TPS/chip), adds --profile + PROFILE_DIR.
+# Image: v113 (latest stable, einsum deltanet + chunked prefill fixes).
 #
-# Why mid config? Full model (512 experts, fp8) at EP=2 needs 256 experts/device
-# = ~193 GB expert weights alone — far exceeds 101 GB HBM.
-# Mid config (16 experts) at EP=2: 8 experts/device = ~0.5 GB — fits easily.
-#
-# This benchmark measures the TOPOLOGY EFFECT: does using the fast within-chip
-# ep axis for MoE psum (2 devices) vs the torus tp axis (8 devices) change
-# latency? The expert count is reduced but the communication pattern is real.
-#
-# Mesh: dp=8, tp=4, ep=2 → 64 TCs. 8*4*2=64 ✓
-# Model: mid (d_model=4096, 32 layers, 16 experts top-4)
-# BS: 4096, dp=8, decode-micro-batches=2
+# Profile will be written to: gs://sivaibhav-exp/qwen-profiles/v113-bs4096-decode
 #
 # Deploy:
-#   kubectl apply -f k8s/bench_v113_tp4ep2_mid_jobset.yaml \
+#   kubectl apply -f k8s/bench_v113_bs4096_profile_jobset.yaml \
 #     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
 #
 # Monitor:
-#   kubectl logs -l app=qwen35-v113-tp4ep2-mid --prefix=true -f --max-log-requests=8 \
+#   kubectl logs -l app=qwen35-v113-bs4096-profile --prefix=true -f --max-log-requests=8 \
 #     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
-#     2>&1 | tee -a /tmp/qwen35-v113-tp4ep2-mid.log
+#     2>&1 | tee -a /tmp/qwen35-v113-bs4096-profile.log
 
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: qwen35-v113-tp4ep2-mid
+  name: qwen35-v113-bs4096-profile
   namespace: default
   labels:
     kueue.x-k8s.io/queue-name: multislice-queue
@@ -49,7 +39,7 @@ spec:
           template:
             metadata:
               labels:
-                app: qwen35-v113-tp4ep2-mid
+                app: qwen35-v113-bs4096-profile
             spec:
               restartPolicy: Never
               nodeSelector:
@@ -57,18 +47,17 @@ spec:
                 cloud.google.com/gke-tpu-topology: 2x4x4
               containers:
                 - name: bench
-                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v114
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v113
                   imagePullPolicy: Always
                   command: ["python", "scripts/qwen35_benchmark.py"]
                   args:
-                    - "--config=mid"
-                    - "--dtype=bfloat16"
-                    - "--sharding=EP"
+                    - "--config=full"
+                    - "--dtype=fp8"
+                    - "--sharding=B"
                     - "--batch-size=4096"
                     - "--prompt-len=1024"
                     - "--decode-steps=32"
                     - "--dp=8"
-                    - "--ep=2"
                     - "--n-runs=3"
                     - "--use-rpa"
                     - "--scan-mode=unrolled"
@@ -80,14 +69,28 @@ spec:
                     - name: PYTHONUNBUFFERED
                       value: "1"
                     - name: PROFILE_DIR
-                      value: "gs://sivaibhav-exp/qwen-profiles/v113-tp4ep2-mid"
+                      value: "gs://sivaibhav-exp/qwen-profiles/v113-bs4096-decode"
                     - name: LIBTPU_INIT_ARGS
                       value: >-
+                        --xla_tpu_offload_gather_to_sparsecore=true
+                        --xla_tpu_enable_offloading_scatter_to_sparsecore=true
+                        --xla_tpu_enable_offloading_sort_to_sparsecore=true
                         --xla_tpu_enable_latency_hiding_layer_scheduler=true
                         --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true
                         --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true
+                        --xla_tpu_scheduler_percent_shared_memory_limit=150
                         --xla_tpu_prefer_async_allgather_to_allreduce=true
+                        --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true
+                        --xla_tpu_quantized_all_reduce_level=3
+                        --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true
+                        --xla_tpu_enable_sparse_core_reduce_scatter_v2=true
+                        --xla_tpu_sparse_core_reduce_scatter_latency_multiplier=3
+                        --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+                        --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true
+                        --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true
                         --xla_enable_async_all_gather=true
+                        --xla_tpu_enable_concurrent_sparse_core_offloading=true
+                        --xla_tpu_pcie_bandwidth_multiplier=0.03
                         --xla_tpu_aggressive_opt_barrier_removal=true
                         --xla_tpu_enable_sparse_core_collective_aggregator=true
                   resources:
