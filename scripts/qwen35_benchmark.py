@@ -756,16 +756,6 @@ def run_decode_benchmark(
                 ))
             print(f"  Paged KV shape per group per micro-batch: {page_caches[0].paged_kv[0].shape} × {len(page_caches[0].paged_kv)} groups")
 
-            # Build per-group params list for trace-time indexing (v133 params fix).
-            # Closing over per-group slices gives XLA separate input buffers per
-            # group, eliminating the slice_bitcast_fusion that arises when 15 groups
-            # all slice the same stacked (n_groups, ...) tensor inside the JIT.
-            # Use default-arg capture (_g=g) to avoid Python late-binding in lambda.
-            groups_list = [
-                jax.tree.map(lambda a, _g=g: a[_g], params['groups'])
-                for g in range(n_groups)
-            ]
-
             @functools.partial(jax.jit, donate_argnums=(2,))
             def decode_step_micro(p, tok, c):
                 top_ids, new_c = forward(
@@ -773,7 +763,6 @@ def run_decode_benchmark(
                     cache_sharding=cache_sharding, n_devices=n_devices,
                     mesh=mesh, use_rpa=True, scan_mode='unrolled',
                     moe_backend=moe_backend, output_top_k=1,
-                    groups_list=groups_list,
                 )
                 return top_ids[:, 0, 0], new_c
 
