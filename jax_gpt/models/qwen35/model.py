@@ -295,6 +295,7 @@ def forward(
     scan_mode: str = 'scan',
     moe_backend: str = 'ragged_dot',
     output_top_k: int = 0,
+    groups_list: list | None = None,
 ) -> tuple[jax.Array, HybridCache | None]:
     """Full model forward pass.
 
@@ -369,11 +370,10 @@ def forward(
     # Traces 15 sequential group calls into one XLA program.
     # No WhileOp → no XLA copy insertion of expert weights.
     #
-    # If params contains 'groups_list' (a Python list of pre-split per-group
-    # dicts), we use those directly — avoids the expensive jax.tree.map(a[g])
-    # squeeze/slice operations that dominate device time when slicing from
-    # stacked (n_groups, ...) arrays.
-    groups_list = params.get('groups_list', None)
+    # If groups_list parameter is not provided, fall back to params.get('groups_list').
+    # groups_list parameter (from benchmark) takes precedence over params-embedded list.
+    if groups_list is None:
+        groups_list = params.get('groups_list', None)
 
     def _dyn_idx(tensor, g):
         """Dynamic index into axis-0 of tensor at position g.
@@ -504,8 +504,10 @@ def forward(
                 if cache_sharding is not None:
                     new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
                     new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
-                    if 'paged_kv' in cache_sharding:
-                        updated_kv = jax.lax.with_sharding_constraint(updated_kv, cache_sharding['paged_kv'])
+                    # paged_kv sharding constraint deferred to after the loop (v133 DUS overlap).
+                    # Applying it per-group here can act as a barrier that serializes the
+                    # DUS HBM write, preventing the XLA latency-hiding scheduler from
+                    # overlapping DUS[g] with GDN compute of group g+1.
                 new_delta_Ms.append(new_dM)
                 new_delta_convs.append(new_dC)
                 new_paged_kvs.append(updated_kv)
@@ -513,6 +515,14 @@ def forward(
             # Keep all caches as tuples of per-group arrays.
             # tuple[g] inside JIT = Python indexing at trace time → direct input
             # parameter reference, zero JAX op, no slice_bitcast_fusion.
+            #
+            # Apply paged_kv sharding constraint after all groups complete, not
+            # per-group, so the XLA scheduler can overlap DUS writes with GDN compute.
+            if cache_sharding is not None and 'paged_kv' in cache_sharding:
+                new_paged_kvs = [
+                    jax.lax.with_sharding_constraint(kv, cache_sharding['paged_kv'])
+                    for kv in new_paged_kvs
+                ]
             result_delta_M = tuple(new_delta_Ms)
             result_delta_conv = tuple(new_delta_convs)
             result_paged_kv = tuple(new_paged_kvs)
