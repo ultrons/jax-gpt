@@ -686,6 +686,7 @@ def run_decode_benchmark(
             # program binary, causing RuntimeProgramAllocationFailure at v100.
             #
             # Extract the shape/sharding metadata we need, then delete.
+            n_delta = len(cache.delta_M[0])            # n_delta layers per group (=3)
             dm_tail = cache.delta_M[0][0].shape[1:]   # per-layer (B, n_v_heads, qk_head_dim, v_head_dim) → tail
             dc_tail = cache.delta_conv[0][0].shape[1:]  # per-layer (B, conv_dim, conv_kernel) → tail
             dm_sharding = cache.delta_M[0][0].sharding
@@ -700,6 +701,7 @@ def run_decode_benchmark(
             # large gqa_k/v tensors on device (90 GB OOM with params already loaded).
             # Reuse sharding specs from the existing input cache (extracted above).
             cpu = jax.devices('cpu')[0]
+            n_delta = cfg.full_attention_interval - 1  # may not be set if --skip-prefill skipped chunked path
             dm_per_layer = (page_B,) + dm_tail
             dc_per_layer = (page_B,) + dc_tail
 
