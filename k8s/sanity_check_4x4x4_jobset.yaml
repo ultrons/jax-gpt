@@ -1,0 +1,54 @@
+# Cluster sanity check — warms up 4x4x4 nodes, verifies JAX device init.
+# Usage:
+#   kubectl apply -f k8s/sanity_check_4x4x4_jobset.yaml \
+#     --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: sanity-check-4x4x4
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: sanity-check-4x4x4
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x4x4
+              containers:
+                - name: bench
+                  image: gcr.io/tpu-vm-gke-testing/jax-gpt-tpu:v135
+                  imagePullPolicy: Always
+                  command: ["python", "-c"]
+                  args:
+                    - |
+                      import jax
+                      devs = jax.devices()
+                      print(f'JAX devices: {len(devs)}')
+                      for d in devs[:4]:
+                          print(f'  {d}')
+                      print('OK')
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
