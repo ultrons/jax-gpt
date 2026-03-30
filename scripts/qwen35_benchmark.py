@@ -405,7 +405,7 @@ def run_decode_benchmark(
         print(f"  Creating paged KV cache directly (page_size={page_size}, "
               f"pages_per_seq={pages_per_seq})...")
 
-        cache_dtype = cache.delta_M[0].dtype
+        cache_dtype = cache.delta_M[0][0].dtype
         from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
             get_kv_cache_shape as _gkcs,
         )
@@ -470,8 +470,8 @@ def run_decode_benchmark(
             )
             pfill_bs = B // prefill_micro_batches
 
-            n_delta = cache.delta_M[0].shape[0]
-            conv_dim_size = cache.delta_conv[0].shape[2]
+            n_delta = len(cache.delta_M[0])
+            conv_dim_size = cache.delta_conv[0][0].shape[1]  # per-layer shape: (B, conv_dim, kernel)
 
             @jax.jit
             def prefill_chunk_fn(p, t, c):
@@ -487,13 +487,13 @@ def run_decode_benchmark(
             def _make_chunk_cache(bs_local):
                 """Zero-initialized HybridCache for bs_local seqs with gqa_len=chunk_gqa_len."""
                 if mesh is not None:
-                    # Reuse per-group sharding specs from the existing cache.
-                    # delta_M/delta_conv are tuples; use [0] for the per-group spec.
-                    dm_per_group_shape = (n_delta, bs_local, cfg.delta_n_v_heads,
+                    # Reuse per-layer sharding specs from the existing cache.
+                    # delta_M/delta_conv are nested tuples; use [0][0] for the per-layer spec.
+                    dm_per_layer_shape = (bs_local, cfg.delta_n_v_heads,
                                           cfg.delta_qk_head_dim, cfg.delta_v_head_dim)
-                    dc_per_group_shape = (n_delta, bs_local, conv_dim_size, cfg.delta_conv_kernel)
-                    dm_spec = _safe_spec(cache.delta_M[0].sharding.spec, dm_per_group_shape, mesh)
-                    dc_spec = _safe_spec(cache.delta_conv[0].sharding.spec, dc_per_group_shape, mesh)
+                    dc_per_layer_shape = (bs_local, conv_dim_size, cfg.delta_conv_kernel)
+                    dm_spec = _safe_spec(cache.delta_M[0][0].sharding.spec, dm_per_layer_shape, mesh)
+                    dc_spec = _safe_spec(cache.delta_conv[0][0].sharding.spec, dc_per_layer_shape, mesh)
                     dm_sharding = NamedSharding(mesh, dm_spec)
                     dc_sharding = NamedSharding(mesh, dc_spec)
                     gqa_shape = (n_groups, bs_local, cfg.gqa_n_kv_heads, chunk_gqa_len, cfg.gqa_head_dim)
@@ -511,15 +511,21 @@ def run_decode_benchmark(
 
                     with mesh:
                         delta_M_chunk = tuple(
-                            jax.make_array_from_callback(
-                                dm_per_group_shape, dm_sharding,
-                                lambda idx, _sh=dm_per_group_shape: _zero_cb(idx, _sh))
+                            tuple(
+                                jax.make_array_from_callback(
+                                    dm_per_layer_shape, dm_sharding,
+                                    lambda idx, _sh=dm_per_layer_shape: _zero_cb(idx, _sh))
+                                for _ in range(n_delta)
+                            )
                             for _ in range(n_groups)
                         )
                         delta_conv_chunk = tuple(
-                            jax.make_array_from_callback(
-                                dc_per_group_shape, dc_sharding,
-                                lambda idx, _sh=dc_per_group_shape: _zero_cb(idx, _sh))
+                            tuple(
+                                jax.make_array_from_callback(
+                                    dc_per_layer_shape, dc_sharding,
+                                    lambda idx, _sh=dc_per_layer_shape: _zero_cb(idx, _sh))
+                                for _ in range(n_delta)
+                            )
                             for _ in range(n_groups)
                         )
                         gqa_k_chunk = jax.make_array_from_callback(
@@ -603,21 +609,29 @@ def run_decode_benchmark(
             # paged_kv is fully populated — no assembly step needed.
             # Free per-chunk lists immediately after concat to avoid holding
             # 16 × delta_M + 16 × delta_conv in HBM during decode compilation.
-            # each chunk is a tuple of n_groups arrays with shape (n_delta, pfill_bs, ...)
-            # concatenate along axis=1 (batch dimension) per group.
+            # each chunk is a nested tuple: outer=n_groups, inner=n_delta per-layer arrays (pfill_bs, ...)
+            # concatenate along axis=0 (batch dimension) per group per layer.
             prefill_delta_M = tuple(
-                jnp.concatenate([chunk[g] for chunk in all_delta_M], axis=1)
+                tuple(
+                    jnp.concatenate([chunk[g][d] for chunk in all_delta_M], axis=0)
+                    for d in range(n_delta)
+                )
                 for g in range(n_groups)
             )
-            for arr in prefill_delta_M:
-                arr.block_until_ready()
+            for group_tuple in prefill_delta_M:
+                for arr in group_tuple:
+                    arr.block_until_ready()
             del all_delta_M
             prefill_delta_conv = tuple(
-                jnp.concatenate([chunk[g] for chunk in all_delta_conv], axis=1)
+                tuple(
+                    jnp.concatenate([chunk[g][d] for chunk in all_delta_conv], axis=0)
+                    for d in range(n_delta)
+                )
                 for g in range(n_groups)
             )
-            for arr in prefill_delta_conv:
-                arr.block_until_ready()
+            for group_tuple in prefill_delta_conv:
+                for arr in group_tuple:
+                    arr.block_until_ready()
             del all_delta_conv
             first_token = jnp.concatenate(all_first_tokens, axis=0)
             del all_first_tokens
@@ -672,10 +686,10 @@ def run_decode_benchmark(
             # program binary, causing RuntimeProgramAllocationFailure at v100.
             #
             # Extract the shape/sharding metadata we need, then delete.
-            dm_tail = cache.delta_M[0].shape[2:]   # (n_v_heads, qk_head_dim, v_head_dim)
-            dc_tail = cache.delta_conv[0].shape[2:]  # (conv_dim, conv_kernel)
-            dm_sharding = cache.delta_M[0].sharding
-            dc_sharding = cache.delta_conv[0].sharding
+            dm_tail = cache.delta_M[0][0].shape[1:]   # per-layer (B, n_v_heads, qk_head_dim, v_head_dim) → tail
+            dc_tail = cache.delta_conv[0][0].shape[1:]  # per-layer (B, conv_dim, conv_kernel) → tail
+            dm_sharding = cache.delta_M[0][0].sharding
+            dc_sharding = cache.delta_conv[0][0].sharding
             del cache_after, paged_kv, kv_lens, page_indices, dummy_gqa_k, dummy_gqa_v
             del cache
             del prefill_delta_M, prefill_delta_conv  # v111: free chunked-prefill delta states
@@ -686,8 +700,8 @@ def run_decode_benchmark(
             # large gqa_k/v tensors on device (90 GB OOM with params already loaded).
             # Reuse sharding specs from the existing input cache (extracted above).
             cpu = jax.devices('cpu')[0]
-            dm_per_group = (3, page_B) + dm_tail
-            dc_per_group = (3, page_B) + dc_tail
+            dm_per_layer = (page_B,) + dm_tail
+            dc_per_layer = (page_B,) + dc_tail
 
             def _sharded_zeros(global_shape, sharding, dtype):
                 def cb(idx):
@@ -702,11 +716,11 @@ def run_decode_benchmark(
             page_caches = []
             for _mi in range(micro_batches):
                 page_delta_M = tuple(
-                    _sharded_zeros(dm_per_group, dm_sharding, cache_dtype)
+                    tuple(_sharded_zeros(dm_per_layer, dm_sharding, cache_dtype) for _ in range(n_delta))
                     for _ in range(n_groups)
                 )
                 page_delta_conv = tuple(
-                    _sharded_zeros(dc_per_group, dc_sharding, cache_dtype)
+                    tuple(_sharded_zeros(dc_per_layer, dc_sharding, cache_dtype) for _ in range(n_delta))
                     for _ in range(n_groups)
                 )
 
@@ -1414,17 +1428,23 @@ def main():
                     return jnp.zeros(shard_shape, dtype=dt)
             return jax.make_array_from_callback(shape, sharding, _cb)
 
-        # Per-group shapes for delta_M/delta_conv (no leading n_groups dim — stored as tuple)
-        dm_pg_shape = (n_delta, B, cfg.delta_n_v_heads, cfg.delta_qk_head_dim, cfg.delta_v_head_dim)
-        dc_pg_shape = (n_delta, B, conv_dim, cfg.delta_conv_kernel)
-        dm_spec = P(None, dp_axis, tp_axis, None, None)
-        dc_spec = P(None, dp_axis, tp_axis, None)
+        # Per-layer shapes for delta_M/delta_conv (outer=n_groups, inner=n_delta, no stacked dim)
+        dm_layer_shape = (B, cfg.delta_n_v_heads, cfg.delta_qk_head_dim, cfg.delta_v_head_dim)
+        dc_layer_shape = (B, conv_dim, cfg.delta_conv_kernel)
+        dm_spec = P(dp_axis, tp_axis, None, None)
+        dc_spec = P(dp_axis, tp_axis, None)
         gqa_shape = (n_groups, B, cfg.gqa_n_kv_heads, gqa_len, cfg.gqa_head_dim)
         gqa_spec = P(None, dp_axis, gqa_kv_axis, None, None)
 
         with mesh:
-            delta_M = tuple(_make_zeros(dm_pg_shape, dm_spec) for _ in range(n_groups))
-            delta_conv = tuple(_make_zeros(dc_pg_shape, dc_spec) for _ in range(n_groups))
+            delta_M = tuple(
+                tuple(_make_zeros(dm_layer_shape, dm_spec) for _ in range(n_delta))
+                for _ in range(n_groups)
+            )
+            delta_conv = tuple(
+                tuple(_make_zeros(dc_layer_shape, dc_spec) for _ in range(n_delta))
+                for _ in range(n_groups)
+            )
             gqa_k = _make_zeros(gqa_shape, gqa_spec)
             gqa_v = _make_zeros(gqa_shape, gqa_spec)
             pos_arr = jax.make_array_from_callback(

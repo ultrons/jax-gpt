@@ -315,20 +315,26 @@ def forward_offload(
 
     if cache is not None:
         cache_pos    = cache.pos
-        all_delta_Ms   = cache.delta_M    # tuple of n_groups arrays, each (n_delta, B, n_v_heads, qk_dim, v_dim)
-        all_delta_convs = cache.delta_conv  # tuple of n_groups arrays, each (n_delta, B, conv_dim, kernel)
+        all_delta_Ms   = cache.delta_M    # tuple of n_groups tuples, each a tuple of n_delta arrays (B, n_v_heads, qk_dim, v_dim)
+        all_delta_convs = cache.delta_conv  # tuple of n_groups tuples, each a tuple of n_delta arrays (B, conv_dim, kernel)
         all_gqa_ks   = cache.gqa_k        # (n_groups, B, n_kv_heads, max_len, head_dim)
         all_gqa_vs   = cache.gqa_v
     else:
         cache_pos = None
         # Dummy zero arrays — only used for scan signature consistency when cache=None
         all_delta_Ms    = tuple(
-            jnp.zeros((n_delta, B, config.delta_n_v_heads,
-                       config.delta_qk_head_dim, config.delta_v_head_dim))
+            tuple(
+                jnp.zeros((B, config.delta_n_v_heads,
+                           config.delta_qk_head_dim, config.delta_v_head_dim))
+                for _ in range(n_delta)
+            )
             for _ in range(n_groups)
         )
         all_delta_convs = tuple(
-            jnp.zeros((n_delta, B, conv_dim, config.delta_conv_kernel))
+            tuple(
+                jnp.zeros((B, conv_dim, config.delta_conv_kernel))
+                for _ in range(n_delta)
+            )
             for _ in range(n_groups)
         )
         all_gqa_ks      = jnp.zeros((n_groups, B, config.gqa_n_kv_heads,

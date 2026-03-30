@@ -502,8 +502,8 @@ def forward(
                     group_idx=g if _use_gmm_stacking else None,
                 )
                 if cache_sharding is not None:
-                    new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
-                    new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
+                    new_dM = tuple(jax.lax.with_sharding_constraint(a, cache_sharding['delta_M']) for a in new_dM)
+                    new_dC = tuple(jax.lax.with_sharding_constraint(a, cache_sharding['delta_conv']) for a in new_dC)
                     # paged_kv sharding constraint deferred to after the loop (v133 DUS overlap).
                     # Applying it per-group here can act as a barrier that serializes the
                     # DUS HBM write, preventing the XLA latency-hiding scheduler from
@@ -571,8 +571,8 @@ def forward(
                     group_idx=g if _use_gmm_stacking else None,
                 )
                 if cache_sharding is not None:
-                    new_dM = jax.lax.with_sharding_constraint(new_dM, cache_sharding['delta_M'])
-                    new_dC = jax.lax.with_sharding_constraint(new_dC, cache_sharding['delta_conv'])
+                    new_dM = tuple(jax.lax.with_sharding_constraint(a, cache_sharding['delta_M']) for a in new_dM)
+                    new_dC = tuple(jax.lax.with_sharding_constraint(a, cache_sharding['delta_conv']) for a in new_dC)
                     new_gk = jax.lax.with_sharding_constraint(new_gk, cache_sharding['gqa_kv'])
                     new_gv = jax.lax.with_sharding_constraint(new_gv, cache_sharding['gqa_kv'])
                 result_delta_Ms[g] = new_dM
@@ -676,6 +676,12 @@ def forward(
         )
 
     elif cache is not None:
+        if isinstance(delta_Ms, tuple):
+            raise ValueError(
+                "scan_mode='scan' requires delta_Ms as stacked jax.Array (n_groups, n_delta, ...). "
+                "Got tuple. Use scan_mode='unrolled' when using tuple caches."
+            )
+
         def _group_step(carry, group_inputs):
             x_carry = carry
             g_params, g_delta_M, g_delta_conv, g_gqa_k, g_gqa_v = group_inputs

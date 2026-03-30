@@ -445,12 +445,12 @@ def shard_cache(
     gqa_kv_axis = axis_rules.get('gqa_kv_heads')
     dp_axis = 'dp' if 'dp' in mesh.axis_names else None
 
-    # delta_M per-group: (3, B, n_v_heads, qk_head_dim, v_head_dim)
+    # delta_M per-layer: (B, n_v_heads, qk_head_dim, v_head_dim) — inner tuple, no leading n_delta axis
     delta_M_spec = _safe_spec(
-        P(None, dp_axis, tp_axis, None, None), cache.delta_M[0].shape, mesh)
-    # delta_conv per-group: (3, B, conv_dim, kernel)
+        P(dp_axis, tp_axis, None, None), cache.delta_M[0][0].shape, mesh)
+    # delta_conv per-layer: (B, conv_dim, kernel)
     delta_conv_spec = _safe_spec(
-        P(None, dp_axis, tp_axis, None), cache.delta_conv[0].shape, mesh)
+        P(dp_axis, tp_axis, None), cache.delta_conv[0][0].shape, mesh)
     # gqa_k/v: (n_groups, B, n_kv_heads, max_len, head_dim)
     gqa_spec = _safe_spec(
         P(None, dp_axis, gqa_kv_axis, None, None), cache.gqa_k.shape, mesh)
@@ -460,8 +460,14 @@ def shard_cache(
     dc_sharding = NamedSharding(mesh, delta_conv_spec)
 
     return HybridCache(
-        delta_M=tuple(jax.device_put(arr, dm_sharding) for arr in cache.delta_M),
-        delta_conv=tuple(jax.device_put(arr, dc_sharding) for arr in cache.delta_conv),
+        delta_M=tuple(
+            tuple(jax.device_put(arr, dm_sharding) for arr in group_tuple)
+            for group_tuple in cache.delta_M
+        ),
+        delta_conv=tuple(
+            tuple(jax.device_put(arr, dc_sharding) for arr in group_tuple)
+            for group_tuple in cache.delta_conv
+        ),
         gqa_k=jax.device_put(cache.gqa_k, NamedSharding(mesh, gqa_spec)),
         gqa_v=jax.device_put(cache.gqa_v, NamedSharding(mesh, gqa_spec)),
         pos=jax.device_put(cache.pos, NamedSharding(mesh, pos_spec)),
@@ -492,24 +498,23 @@ def make_cache_sharding(
     gqa_kv_axis = axis_rules.get('gqa_kv_heads')
     dp_axis = 'dp' if 'dp' in mesh.axis_names else None
 
-    # Per-group shapes (no leading n_groups dim — inside scan body):
-    # delta_M: (3, B, n_v_heads, qk_head_dim, v_head_dim)
-    delta_M_spec = P(None, dp_axis, tp_axis, None, None)
-    # delta_conv: (3, B, conv_dim, kernel)
-    delta_conv_spec = P(None, dp_axis, tp_axis, None)
+    # Per-layer shapes (no leading n_groups or n_delta dims — inner tuple elements):
+    # delta_M per layer: (B, n_v_heads, qk_head_dim, v_head_dim)
+    delta_M_spec = P(dp_axis, tp_axis, None, None)
+    # delta_conv per layer: (B, conv_dim, kernel)
+    delta_conv_spec = P(dp_axis, tp_axis, None)
     # gqa_k/v: (B, n_kv_heads, max_len, head_dim)
     gqa_spec = P(dp_axis, gqa_kv_axis, None, None)
 
     # Safe-check divisibility — use actual batch_size (not placeholder B=1)
     # so that dp_axis isn't incorrectly dropped when B=1 % dp != 0.
-    n_delta = config.full_attention_interval - 1
-    delta_M_shape = (n_delta, batch_size, config.delta_n_v_heads, config.delta_qk_head_dim, config.delta_v_head_dim)
+    delta_M_shape = (batch_size, config.delta_n_v_heads, config.delta_qk_head_dim, config.delta_v_head_dim)
     delta_M_spec = _safe_spec(delta_M_spec, delta_M_shape, mesh)
 
     key_dim = config.delta_n_qk_heads * config.delta_qk_head_dim
     value_dim = config.delta_n_v_heads * config.delta_v_head_dim
     conv_dim = key_dim * 2 + value_dim
-    delta_conv_shape = (n_delta, batch_size, conv_dim, config.delta_conv_kernel)
+    delta_conv_shape = (batch_size, conv_dim, config.delta_conv_kernel)
     delta_conv_spec = _safe_spec(delta_conv_spec, delta_conv_shape, mesh)
 
     gqa_shape = (batch_size, config.gqa_n_kv_heads, 1, config.gqa_head_dim)

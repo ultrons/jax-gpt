@@ -222,8 +222,8 @@ def group_forward(
 
         x, new_M, new_conv = deltanet_layer_forward(
             x, layer_p,
-            jax.lax.dynamic_index_in_dim(delta_Ms, i_idx, axis=0, keepdims=False),
-            jax.lax.dynamic_index_in_dim(delta_convs, i_idx, axis=0, keepdims=False),
+            delta_Ms[i],
+            delta_convs[i],
             config, is_decode,
             n_devices=n_devices, mesh=mesh, axis_name=axis_name,
             moe_backend=moe_backend,
@@ -232,8 +232,8 @@ def group_forward(
         )
         new_Ms_list.append(new_M)
         new_convs_list.append(new_conv)
-    new_Ms = jnp.stack(new_Ms_list)
-    new_convs = jnp.stack(new_convs_list)
+    new_Ms = tuple(new_Ms_list)
+    new_convs = tuple(new_convs_list)
 
     gqa_p = group_params['gqa_layer']
     if gqa_moe is not None:
@@ -322,8 +322,8 @@ def group_forward_rpa(
 
         x, new_M, new_conv = deltanet_layer_forward(
             x, layer_p,
-            jax.lax.dynamic_index_in_dim(delta_Ms, i_idx, axis=0, keepdims=False),
-            jax.lax.dynamic_index_in_dim(delta_convs, i_idx, axis=0, keepdims=False),
+            delta_Ms[i],
+            delta_convs[i],
             config, is_decode=True,
             n_devices=n_devices, mesh=mesh, axis_name=axis_name,
             moe_backend=moe_backend,
@@ -332,8 +332,8 @@ def group_forward_rpa(
         )
         new_Ms_list.append(new_M)
         new_convs_list.append(new_conv)
-    new_Ms = jnp.stack(new_Ms_list)
-    new_convs = jnp.stack(new_convs_list)
+    new_Ms = tuple(new_Ms_list)
+    new_convs = tuple(new_convs_list)
 
     gqa_p = group_params['gqa_layer']
     if gqa_moe is not None:

@@ -22,11 +22,12 @@ class HybridCache:
     """Full model cache for all groups.
 
     DeltaNet state:
-        delta_M:     tuple of n_groups arrays, each (3, B, n_qk_heads, qk_head_dim, v_head_dim)
-            Recurrent state matrix per DeltaNet layer. Python tuple avoids XLA
+        delta_M:     tuple of n_groups tuples, each a tuple of n_delta arrays (B, n_qk_heads, qk_head_dim, v_head_dim)
+            Recurrent state matrix per DeltaNet layer. Outer tuple avoids XLA
             slice_bitcast_fusion when indexing delta_M[g] inside @jax.jit.
-        delta_conv:  tuple of n_groups arrays, each (3, B, d_model, conv_kernel)
-            Causal conv1d state per DeltaNet layer. Same tuple rationale.
+            Inner tuple avoids jnp.stack at write-back (eliminates broadcast_in_dim).
+        delta_conv:  tuple of n_groups tuples, each a tuple of n_delta arrays (B, d_model, conv_kernel)
+            Causal conv1d state per DeltaNet layer. Same nested-tuple rationale.
 
     GQA cache (contiguous — used for prefill and non-RPA decode):
         gqa_k:       (n_groups, B, n_kv_heads, max_len, head_dim)
@@ -88,15 +89,21 @@ def init_cache(
     value_dim = config.delta_n_v_heads * config.delta_v_head_dim
     conv_dim = key_dim * 2 + value_dim
 
-    # Tuple of per-group arrays — Python tuple indexing inside JIT is trace-time,
-    # avoiding XLA slice_bitcast_fusion when reading delta_M[g]/delta_conv[g].
-    per_group_dm_shape = (n_delta_per_group, batch_size,
+    # Nested tuples: outer = per-group, inner = per-delta-layer.
+    # Python tuple indexing inside JIT is trace-time, avoiding XLA
+    # slice_bitcast_fusion (outer) and broadcast_in_dim from jnp.stack (inner).
+    per_layer_dm_shape = (batch_size,
                           config.delta_n_v_heads, config.delta_qk_head_dim,
                           config.delta_v_head_dim)
-    per_group_dc_shape = (n_delta_per_group, batch_size,
-                          conv_dim, config.delta_conv_kernel)
-    delta_M = tuple(jnp.zeros(per_group_dm_shape, dtype=dtype) for _ in range(n_groups))
-    delta_conv = tuple(jnp.zeros(per_group_dc_shape, dtype=dtype) for _ in range(n_groups))
+    per_layer_dc_shape = (batch_size, conv_dim, config.delta_conv_kernel)
+    delta_M = tuple(
+        tuple(jnp.zeros(per_layer_dm_shape, dtype=dtype) for _ in range(n_delta_per_group))
+        for _ in range(n_groups)
+    )
+    delta_conv = tuple(
+        tuple(jnp.zeros(per_layer_dc_shape, dtype=dtype) for _ in range(n_delta_per_group))
+        for _ in range(n_groups)
+    )
     gqa_k = jnp.zeros(
         (n_groups, batch_size, config.gqa_n_kv_heads, max_len, config.gqa_head_dim),
         dtype=dtype,
