@@ -772,6 +772,39 @@ def run_decode_benchmark(
                 ))
             print(f"  Paged KV shape per group per micro-batch: {page_caches[0].paged_kv[0].shape} × {len(page_caches[0].paged_kv)} groups")
 
+            # Pre-extract per-layer non-expert param dicts (attn + small moe) using
+            # static Python indexing outside JIT. Eliminates 45 dynamic_index_in_dim
+            # retiling ops (~5-7ms/step) when gmm backend is active.
+            # Memory cost: ~8 GB extra (fp8 attn params per layer, no expert weight copies).
+            _pre_layer_lists = None
+            _pre_gqa_list = None
+            if moe_backend == 'gmm':
+                _expert_keys = {'gate_proj', 'up_proj', 'down_proj'}
+                _ng = cfg.n_groups
+                _nd = cfg.full_attention_interval - 1
+                print("  Pre-extracting per-layer param slices (eliminates retiling)...")
+                _pre_layer_lists = []
+                for _g in range(_ng):
+                    _grp = []
+                    for _i in range(_nd):
+                        _lp = jax.tree.map(
+                            lambda a, g=_g, i=_i: a[g, i],
+                            params['groups']['delta_layers'])
+                        _lp = {**_lp, 'moe': {k: v for k, v in _lp['moe'].items()
+                                               if k not in _expert_keys}}
+                        _grp.append(_lp)
+                    _pre_layer_lists.append(_grp)
+                _pre_gqa_list = []
+                for _g in range(_ng):
+                    _gp = jax.tree.map(
+                        lambda a, g=_g: a[g],
+                        params['groups']['gqa_layer'])
+                    _gp = {**_gp, 'moe': {k: v for k, v in _gp['moe'].items()
+                                           if k not in _expert_keys}}
+                    _pre_gqa_list.append(_gp)
+                jax.effects_barrier()
+                print("  Pre-extraction done.")
+
             @functools.partial(jax.jit, donate_argnums=(2,))
             def decode_step_micro(p, tok, c):
                 top_ids, new_c = forward(
@@ -779,6 +812,8 @@ def run_decode_benchmark(
                     cache_sharding=cache_sharding, n_devices=n_devices,
                     mesh=mesh, use_rpa=True, scan_mode='unrolled',
                     moe_backend=moe_backend, output_top_k=1,
+                    delta_layer_lists=_pre_layer_lists,
+                    gqa_layer_list=_pre_gqa_list,
                 )
                 return top_ids[:, 0, 0], new_c
 

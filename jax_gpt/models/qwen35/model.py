@@ -296,6 +296,8 @@ def forward(
     moe_backend: str = 'ragged_dot',
     output_top_k: int = 0,
     groups_list: list | None = None,
+    delta_layer_lists: list | None = None,
+    gqa_layer_list: list | None = None,
 ) -> tuple[jax.Array, HybridCache | None]:
     """Full model forward pass.
 
@@ -475,10 +477,19 @@ def forward(
             new_paged_kvs = []
 
             for g in range(n_groups):
-                if groups_list is not None:
+                if delta_layer_lists is not None:
+                    # Pre-extracted per-layer dicts: zero dynamic slicing inside JIT.
+                    g_params = _slice_group(params['groups'], g) if groups_list is None else groups_list[g]
+                    g_delta_moe_list = None
+                    g_gqa_moe = None
+                    g_delta_ll = delta_layer_lists[g]
+                    g_gqa_lp = gqa_layer_list[g] if gqa_layer_list is not None else None
+                elif groups_list is not None:
                     g_params = groups_list[g]
                     g_delta_moe_list = None
                     g_gqa_moe = None
+                    g_delta_ll = None
+                    g_gqa_lp = None
                 else:
                     g_params = _slice_group(params['groups'], g)
                     g_delta_moe_list = [
@@ -486,6 +497,8 @@ def forward(
                         for i in range(n_delta)
                     ]
                     g_gqa_moe = _slice_moe_flat(gqa_moe_flat, g)
+                    g_delta_ll = None
+                    g_gqa_lp = None
 
                 x, new_dM, new_dC, updated_kv = group_forward_rpa(
                     x, g_params,
@@ -500,6 +513,8 @@ def forward(
                     stacked_delta_expert_weights=stacked_delta_expert,
                     stacked_gqa_expert_weights=stacked_gqa_expert,
                     group_idx=g if _use_gmm_stacking else None,
+                    delta_layer_list=g_delta_ll,
+                    gqa_layer_params=g_gqa_lp,
                 )
                 if cache_sharding is not None:
                     new_dM = tuple(jax.lax.with_sharding_constraint(a, cache_sharding['delta_M']) for a in new_dM)
@@ -545,10 +560,18 @@ def forward(
             result_gqa_v = gqa_vs
 
             for g in range(n_groups):
-                if groups_list is not None:
+                if delta_layer_lists is not None:
+                    g_params = _slice_group(params['groups'], g) if groups_list is None else groups_list[g]
+                    g_delta_moe_list = None
+                    g_gqa_moe = None
+                    g_delta_ll = delta_layer_lists[g]
+                    g_gqa_lp = gqa_layer_list[g] if gqa_layer_list is not None else None
+                elif groups_list is not None:
                     g_params = groups_list[g]
                     g_delta_moe_list = None
                     g_gqa_moe = None
+                    g_delta_ll = None
+                    g_gqa_lp = None
                 else:
                     g_params = _slice_group(params['groups'], g)
                     g_delta_moe_list = [
@@ -556,6 +579,8 @@ def forward(
                         for i in range(n_delta)
                     ]
                     g_gqa_moe = _slice_moe_flat(gqa_moe_flat, g)
+                    g_delta_ll = None
+                    g_gqa_lp = None
 
                 x, new_dM, new_dC, new_gk, new_gv = group_forward(
                     x, g_params,
@@ -569,6 +594,8 @@ def forward(
                     stacked_delta_expert_weights=stacked_delta_expert,
                     stacked_gqa_expert_weights=stacked_gqa_expert,
                     group_idx=g if _use_gmm_stacking else None,
+                    delta_layer_list=g_delta_ll,
+                    gqa_layer_params=g_gqa_lp,
                 )
                 if cache_sharding is not None:
                     new_dM = tuple(jax.lax.with_sharding_constraint(a, cache_sharding['delta_M']) for a in new_dM)

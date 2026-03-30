@@ -183,6 +183,8 @@ def group_forward(
     stacked_delta_expert_weights: dict | None = None,
     stacked_gqa_expert_weights: dict | None = None,
     group_idx: int | None = None,
+    delta_layer_list: list[dict] | None = None,
+    gqa_layer_params: dict | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Forward pass through one 4-layer group (3 DeltaNet + 1 GQA).
 
@@ -201,18 +203,24 @@ def group_forward(
     """
 
     # Unrolled DeltaNet layers (3 iterations) — see group_forward_rpa comment.
-    delta_layer_params = group_params['delta_layers']
+    # delta_layer_list: pre-sliced per-layer dicts (built outside JIT with static Python
+    # indexing). When provided, no dynamic_index_in_dim is needed → eliminates retiling.
+    if delta_layer_list is None:
+        delta_layer_params = group_params['delta_layers']
     n_delta = config.full_attention_interval - 1
     new_Ms_list, new_convs_list = [], []
     for i in range(n_delta):
-        i_idx = jnp.int32(i)
-        # Use dynamic_index_in_dim (not static a[i]) to prevent XLA from
-        # fusing all 3 layer slices into one slice_bitcast_fusion.
-        layer_p = jax.tree.map(
-            lambda a: jax.lax.dynamic_index_in_dim(a, i_idx, axis=0, keepdims=False),
-            delta_layer_params)
-        if delta_moe_list is not None:
-            layer_p = {**layer_p, 'moe': delta_moe_list[i]}
+        if delta_layer_list is not None:
+            layer_p = delta_layer_list[i]  # Python tuple index — zero JAX ops, no retiling
+        else:
+            i_idx = jnp.int32(i)
+            # Use dynamic_index_in_dim (not static a[i]) to prevent XLA from
+            # fusing all 3 layer slices into one slice_bitcast_fusion.
+            layer_p = jax.tree.map(
+                lambda a: jax.lax.dynamic_index_in_dim(a, i_idx, axis=0, keepdims=False),
+                delta_layer_params)
+            if delta_moe_list is not None:
+                layer_p = {**layer_p, 'moe': delta_moe_list[i]}
 
         stacked_ew = None
         l_idx = None
@@ -235,9 +243,12 @@ def group_forward(
     new_Ms = tuple(new_Ms_list)
     new_convs = tuple(new_convs_list)
 
-    gqa_p = group_params['gqa_layer']
-    if gqa_moe is not None:
-        gqa_p = {**gqa_p, 'moe': gqa_moe}
+    if gqa_layer_params is not None:
+        gqa_p = gqa_layer_params
+    else:
+        gqa_p = group_params['gqa_layer']
+        if gqa_moe is not None:
+            gqa_p = {**gqa_p, 'moe': gqa_moe}
 
     stacked_gqa_ew = None
     gqa_l_idx = None
@@ -279,6 +290,8 @@ def group_forward_rpa(
     stacked_delta_expert_weights: dict | None = None,
     stacked_gqa_expert_weights: dict | None = None,
     group_idx: int | None = None,
+    delta_layer_list: list[dict] | None = None,
+    gqa_layer_params: dict | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Forward pass through one group using RPA for GQA decode.
 
@@ -301,18 +314,25 @@ def group_forward_rpa(
     # scan forces XLA to tile stacked [3,E,K,N] as T(8,128), but ragged_dot
     # needs T(32,128), causing a ~386ms copy per step. Unrolling lets XLA
     # tile each layer's [E,K,N] weights independently.
-    delta_layer_params = group_params['delta_layers']
+    #
+    # delta_layer_list: pre-sliced per-layer dicts (built outside JIT with static Python
+    # indexing). When provided, no dynamic_index_in_dim is needed → eliminates retiling.
+    if delta_layer_list is None:
+        delta_layer_params = group_params['delta_layers']
     n_delta = config.full_attention_interval - 1
     new_Ms_list, new_convs_list = [], []
     for i in range(n_delta):
-        i_idx = jnp.int32(i)
-        # Use dynamic_index_in_dim (not static a[i]) to prevent XLA from
-        # fusing all 3 layer slices into one slice_bitcast_fusion.
-        layer_p = jax.tree.map(
-            lambda a: jax.lax.dynamic_index_in_dim(a, i_idx, axis=0, keepdims=False),
-            delta_layer_params)
-        if delta_moe_list is not None:
-            layer_p = {**layer_p, 'moe': delta_moe_list[i]}
+        if delta_layer_list is not None:
+            layer_p = delta_layer_list[i]  # Python list index — zero JAX ops, no retiling
+        else:
+            i_idx = jnp.int32(i)
+            # Use dynamic_index_in_dim (not static a[i]) to prevent XLA from
+            # fusing all 3 layer slices into one slice_bitcast_fusion.
+            layer_p = jax.tree.map(
+                lambda a: jax.lax.dynamic_index_in_dim(a, i_idx, axis=0, keepdims=False),
+                delta_layer_params)
+            if delta_moe_list is not None:
+                layer_p = {**layer_p, 'moe': delta_moe_list[i]}
 
         stacked_ew = None
         l_idx = None
@@ -335,9 +355,12 @@ def group_forward_rpa(
     new_Ms = tuple(new_Ms_list)
     new_convs = tuple(new_convs_list)
 
-    gqa_p = group_params['gqa_layer']
-    if gqa_moe is not None:
-        gqa_p = {**gqa_p, 'moe': gqa_moe}
+    if gqa_layer_params is not None:
+        gqa_p = gqa_layer_params
+    else:
+        gqa_p = group_params['gqa_layer']
+        if gqa_moe is not None:
+            gqa_p = {**gqa_p, 'moe': gqa_moe}
 
     stacked_gqa_ew = None
     gqa_l_idx = None
