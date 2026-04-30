@@ -165,4 +165,11 @@ for the canonical pattern.
   research workspace. SparseCore backward kernel suite at
   `kernels/fused_moe_bwd/`. v337/v338 benchmarks pending re-run after
   the layout normalization.
-- **Training loop** (`scripts/train.py`): stub — Phase 2 of the project plan.
+- **Training loop**: **only used in production with DSv3.**
+  `jax_gpt/models/dsv3/train.py` (507 lines) is the real, production
+  trainer — it has driven the entire v304b–v338 experiment series on
+  v7x 4×8×8. The generic Phase-2 entry point at `scripts/train.py`
+  (model-agnostic CLI + data loader) is still a stub; for now, model-
+  specific trainers like `dsv3/train.py` carry the workload, and a
+  unified abstraction can come later if a second consumer (Qwen3.5,
+  DSv4) needs it.
