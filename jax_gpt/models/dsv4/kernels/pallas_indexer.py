@@ -168,6 +168,6 @@ def aot_compile_check(
 
 if __name__ == "__main__":
     # Smoke check from the command line:
-    #   PYTHONPATH=. python -m jax_gpt.models.dsv4.pallas_indexer
+    #   PYTHONPATH=. python -m jax_gpt.models.dsv4.kernels.pallas_indexer
     aot_compile_check()
     print("indexer Pallas AOT compile: OK")

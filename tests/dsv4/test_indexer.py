@@ -65,7 +65,7 @@ def test_reference_causal_mask_excludes_future():
 def test_pallas_score_matches_reference():
     """The Pallas score tensor matches the reference on small toy shapes."""
     from jax_gpt.models.dsv4.indexer import indexer_topk_reference
-    from jax_gpt.models.dsv4.pallas_indexer import indexer_score_pallas
+    from jax_gpt.models.dsv4.kernels.pallas_indexer import indexer_score_pallas
 
     B, M, n_heads, head_dim, S_comp, topk = 1, 1, 4, 8, 64, 4
     rng = np.random.default_rng(0)
@@ -102,7 +102,7 @@ def test_aot_compile_v7x():
     (e.g. `source ~/xdb/.xprof/bin/activate`) — `libtpu` alone is not
     sufficient if the JAX TPU PJRT plugin hasn't been registered.
     """
-    from jax_gpt.models.dsv4.pallas_indexer import aot_compile_check
+    from jax_gpt.models.dsv4.kernels.pallas_indexer import aot_compile_check
     try:
         aot_compile_check(M=1, S_comp=8192, tile_size=256)
     except RuntimeError as e:
