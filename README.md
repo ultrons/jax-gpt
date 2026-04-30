@@ -3,6 +3,13 @@
 Minimal, optimized implementation of frontier language models in JAX, focused
 on TPU inference.
 
+> **Status:** open exploration / personal research repo. Not packaged for
+> external use — APIs are unstable, performance numbers are
+> hardware-specific, and several pieces (training loop, DSv4 wiring) are
+> in-flight. Issues and PRs from outside collaborators are not actively
+> solicited at this stage. Treat the code as reading material rather than
+> a library.
+
 ## Models
 
 | Model | Status | Highlights |
@@ -38,12 +45,6 @@ jax-gpt/
     docs/          # engineering reports + slide decks
     Dockerfile.tpu, Dockerfile.test_k, Dockerfile.v322_fix
     LOGBOOK.md, dsv3_*_analysis.md
-```
-
-## Environment
-
-```bash
-source ~/xdb/.xprof/bin/activate    # always — base env lacks JAX
 ```
 
 ## Quick start — local
