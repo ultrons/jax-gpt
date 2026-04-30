@@ -1,0 +1,94 @@
+# DSv3 671B — v288: pure FSDP=1024, no EP, no TP, GBS=4096 on 8×8×8 slice.
+# 512 chips × 2 cores = 1024 devices. FSDP spans entire 3D torus.
+# 8 sub-slices of 4×4×4 (16 nodes each) → 128 nodes total.
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v288-fsdp1k
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "240"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 128
+        parallelism: 128
+        template:
+          metadata:
+            labels:
+              app: v288-fsdp1k
+              declared-duration-minutes: "240"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "8x8x8"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v287-agep4
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=full
+              - --moe_backend=gmm_ag
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=1024
+              - --ep=1
+              - --tp=1
+              - --gbs=4096
+              - --dtype=bfloat16
+              - --steps=5
+              - --grad_clip=1.0
+              - --gradient_checkpoint
+              - --no_cp
+              - --profile
+              - --profile_dir=gs://max-experiments/dsv3/profiles/v288-fsdp1k-fsdp1024-8x8x8/
+              - --profile_skip=2
+              - --profile_steps=1
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/8x8x8-fsdp1024-ep1-tp1-gbs4096-v288
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

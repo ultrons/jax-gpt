@@ -1,0 +1,124 @@
+# Run a quick logit comparison using HF transformers on CPU.
+# Loads the full model in FP8 (641 GB fits in 743 GB CPU RAM node),
+# runs a few tokens, saves logits to GCS for comparison.
+#
+# kubectl --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot apply -f k8s/dsv3-eval-logits.yaml
+# kubectl --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot logs dsv3-eval-logits -f
+# kubectl --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot delete pod dsv3-eval-logits
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dsv3-eval-logits
+  namespace: default
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-nodepool: cpu-np
+  volumes:
+    - name: model-weights
+      persistentVolumeClaim:
+        claimName: ds-v3-weights-pvc
+  containers:
+    - name: eval
+      image: python:3.11-slim
+      command: ["bash", "-c"]
+      args:
+        - |
+          set -e
+          pip install torch --index-url https://download.pytorch.org/whl/cpu -q
+          pip install transformers safetensors sentencepiece gcsfs -q
+
+          python3 << 'PYEOF'
+          import torch
+          import json
+          import os
+          import time
+
+          os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+          model_path = "/mnt/model/DeepSeek-V3"
+
+          print("Loading tokenizer...")
+          from transformers import AutoTokenizer
+          tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+          # Test prompts
+          prompts = [
+              "The capital of France is",
+              "What is 2 + 2? The answer is",
+              "The following is a multiple choice question about world capitals.\n\nQ: What is the capital of Japan?\nA. Beijing\nB. Seoul\nC. Tokyo\nD. Osaka\n\nAnswer:",
+          ]
+
+          for prompt in prompts:
+              input_ids = tokenizer.encode(prompt, return_tensors="pt")
+              print(f"\nPrompt: {prompt!r}")
+              print(f"Tokens: {input_ids.shape}")
+              print(f"Token IDs: {input_ids[0].tolist()[:20]}...")
+
+          print("\nLoading model (FP8, this will take a while on CPU)...")
+          t0 = time.time()
+
+          from transformers import AutoModelForCausalLM
+          model = AutoModelForCausalLM.from_pretrained(
+              model_path,
+              trust_remote_code=True,
+              torch_dtype=torch.bfloat16,
+              device_map="cpu",
+          )
+          print(f"Model loaded in {time.time()-t0:.0f}s")
+
+          model.eval()
+
+          results = {}
+          for i, prompt in enumerate(prompts):
+              input_ids = tokenizer.encode(prompt, return_tensors="pt")
+              with torch.no_grad():
+                  out = model(input_ids)
+                  logits = out.logits[0, -1, :]  # last token logits
+
+              # Top-5 predictions
+              top5 = torch.topk(logits.float(), 5)
+              top5_tokens = [tokenizer.decode([t]) for t in top5.indices.tolist()]
+              top5_logits = top5.values.tolist()
+
+              print(f"\nPrompt {i}: {prompt!r}")
+              for j, (tok, logit) in enumerate(zip(top5_tokens, top5_logits)):
+                  print(f"  {j+1}. {tok!r} ({logit:.2f})")
+
+              results[f"prompt_{i}"] = {
+                  "prompt": prompt,
+                  "input_ids": input_ids[0].tolist(),
+                  "top5_tokens": top5_tokens,
+                  "top5_logits": top5_logits,
+                  "last_logits_sample": logits[:20].float().tolist(),
+              }
+
+          # Save results
+          with open("/tmp/dsv3_reference_logits.json", "w") as f:
+              json.dump(results, f, indent=2)
+
+          # Upload to GCS
+          import subprocess
+          subprocess.run(["pip", "install", "google-cloud-storage", "-q"], check=True)
+          from google.cloud import storage
+          client = storage.Client()
+          bucket = client.bucket("max-experiments")
+          blob = bucket.blob("sivaibhav-dsv3/reference_logits.json")
+          blob.upload_from_filename("/tmp/dsv3_reference_logits.json")
+          print(f"\nReference logits saved to gs://max-experiments/sivaibhav-dsv3/reference_logits.json")
+
+          PYEOF
+      volumeMounts:
+        - name: model-weights
+          mountPath: /mnt/model
+      resources:
+        requests:
+          memory: "700Gi"
+          cpu: "64"
+        limits:
+          memory: "720Gi"
+          cpu: "192"
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"

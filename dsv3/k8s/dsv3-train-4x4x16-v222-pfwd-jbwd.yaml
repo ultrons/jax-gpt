@@ -1,0 +1,123 @@
+# DSv3 671B mini — Pallas forward + JAX backward, EP=32 TP=1.
+#
+# Key changes from v221:
+#   v222: replace ICI ring all-reduce with JAX lax.all_gather precomputation.
+#
+#   v221 crashed silently at runtime (Exit Code 1, no Python traceback) ~46s
+#   after "[DBG] train_step returned (compilation done, awaiting exec)".
+#   Root cause: all_reduce_metadata() did a 31-step ICI ring all-reduce inside
+#   the outer lax.fori_loop(0, num_bt=8192, run_per_bt) while_loop.  At EP=32:
+#     31 × 8192 bt_tiles × 32 signals = ~8.4M semaphore_signal ops per kernel call.
+#   ICI ops inside a single while_loop at this scale are unreliable: signals
+#   arrive out-of-order → semaphore_wait never unblocks → 60-second XLA
+#   collective timeout → os._exit(1).
+#   v221 had already fixed the doubly-nested while_loop (run_per_expert) but left
+#   the ring inside the outer while_loop.
+#
+#   Fix: precompute all ring-reduce metadata in JAX BEFORE calling pallas_call.
+#   Inside fused_ep_moe_fwd_streaming_v1 (before pallas_call):
+#     1. Compute local_send_counts[num_bt, E_global] via jax.vmap(segment_sum)
+#     2. lax.all_gather across EP → all_send_counts[EP, num_bt, E_global]
+#     3. expert_sizes_precomp = sum over EP axis
+#     4. expert_starts_precomp = exclusive prefix sum
+#     5. d2e_count_compact = slice for MY local experts → (num_bt, EP×E_local)
+#   Pass these 3 arrays as HBM inputs to pallas_call.
+#   Inside the kernel, load_precomp_metadata(bt_id) replaces all_reduce_metadata:
+#   HBM → VMEM → SMEM DMA (local, no ICI).
+#   Result: 0 ICI ops for metadata per bt tile; all ICI moved to one XLA all_gather.
+#   Also: d2e_count_compact_smem is fully statically indexed → zero SC GatherOps.
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     -n poc-dev apply -f k8s/dsv3-train-4x4x16-v222-pfwd-jbwd.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v222-pfwd-jbwd --prefix=true -f --max-log-requests=64 -n poc-dev \
+#     2>&1 | tee -a /tmp/v222-pfwd-jbwd.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v222-pfwd-jbwd -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v222-pfwd-jbwd
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "30"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v222-pfwd-jbwd
+              declared-duration-minutes: "30"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x16"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v222-pfwd-jbwd
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=mini
+              - --moe_backend=pfwd_jbwd
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=32
+              - --tp=1
+              - --gbs=256
+              - --steps=3
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x4x16-ep32-fsdp16-tp1-v222-pfwd-jbwd
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

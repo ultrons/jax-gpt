@@ -1,0 +1,122 @@
+# DSv3 671B — megablox GMM MoE, FSDP=16 EP=16 TP=2 on 4x8x8, full 671B config.
+#
+# Key changes from v247-rd:
+#   v248: reduce GBS 4096→256 to fix attention-backward 1.04 TB compile OOM.
+#
+#   Root cause of v247 OOM: With FSDP=16, TP=2, GBS=4096:
+#     B_l = GBS/FSDP = 256, S_l = S/TP = 2048, H_tp = H/TP = 64, qk_head = 192
+#     q_t = bf16[256,64,2048,192] = 24 GB per attention tensor.
+#     9 attention tensors alive simultaneously in one-layer backward = 228 GB.
+#     XLA fragmentation factor ≈ 3.65× → 228 × 4.65 = 1.04 TB > 94.75 GB limit.
+#     All of q_t, k_t, v_t must be live simultaneously as inputs to Splash
+#     backward, cannot be freed or reused between dQ/dK/dV backward kernels.
+#
+#   Fix: GBS=256 → B_l=16, attention tensors 16× smaller → working set 14 GB.
+#     14 GB × 4.65 = 65 GB < 94.75 GB ✓
+#     T_fsdp = GBS × S / FSDP = 256 × 4096 / 16 = 65536 = SC row limit → no chunking ✓
+#
+#   v247 OOM 1.04 TB: attention backward 228 GB padded + 833 GB fragmentation.
+#   v246 TypeError: one_hot() takes 2 positional arguments but 3 were given.
+#   v245 UnexpectedTracerError: targets in nondiff_argnums — JAX tracer can't be nondiff.
+#   v244 OOM 1.04 TB: jax.checkpoint on scan body → XLA unrolls bwd pass.
+#   v243 int32 DMA crash: lax.scan VJP stacks lg f32[25,B,S,4096]=200GB > INT32_MAX.
+#   v242 OOM 1.05 TB: Python for-loop 25 iters unrolled → 1.05 TB HLO.
+#   v241 OOM 107 GB: megablox_gmm no VJP → Jacobian 107 GB.
+#   v235b baseline (mini, L=2): 1338 TPS/chip, 1.0% MFU, no OOM, no NaN.
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     -n poc-dev apply -f k8s/dsv3-train-4x8x8-v248-rd.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v248-rd --prefix=true -f --max-log-requests=64 -n poc-dev \
+#     2>&1 | tee -a /tmp/v248-rd.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v248-rd -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v248-rd
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "240"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v248-rd
+              declared-duration-minutes: "240"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x8x8"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v247-rd
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=full
+              - --moe_backend=ragged_dot
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=16
+              - --tp=2
+              - --gbs=256
+              - --dtype=bfloat16
+              - --steps=5
+              - --grad_clip=1.0
+              - --gradient_checkpoint
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x8x8-ep16-fsdp16-tp2-gbs256-v248-rd
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

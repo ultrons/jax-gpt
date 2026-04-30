@@ -1,0 +1,52 @@
+# Copy first 8 layers + embed + lm_head to GCS for multi-host eval.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dsv3-copy-gcs
+  namespace: default
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-nodepool: cpu-np
+  volumes:
+    - name: model-weights
+      persistentVolumeClaim:
+        claimName: ds-v3-weights-pvc
+  containers:
+    - name: copy
+      image: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+      command: ["bash", "-c"]
+      args:
+        - |
+          set -e
+          GCS_DIR=gs://max-experiments/sivaibhav-dsv3/weights-8layer
+          SRC=/mnt/model/DeepSeek-V3
+
+          echo "Copying config and index..."
+          gsutil cp $SRC/config.json $GCS_DIR/
+          gsutil cp $SRC/model.safetensors.index.json $GCS_DIR/
+          gsutil cp -r $SRC/tokenizer* $GCS_DIR/ 2>/dev/null || true
+          gsutil cp $SRC/tokenizer.json $GCS_DIR/ 2>/dev/null || true
+          gsutil cp $SRC/tokenizer_config.json $GCS_DIR/ 2>/dev/null || true
+          gsutil cp $SRC/special_tokens_map.json $GCS_DIR/ 2>/dev/null || true
+
+          echo "Copying 16 weight shards (~65 GB)..."
+          for i in $(seq -w 1 15) 160; do
+            shard="model-000${i}-of-000163.safetensors"
+            echo "  $shard..."
+            gsutil -o GSUtil:parallel_composite_upload_threshold=150M cp $SRC/$shard $GCS_DIR/
+          done
+
+          echo "Done! Files at $GCS_DIR"
+          gsutil ls -lh $GCS_DIR/ | tail -5
+      volumeMounts:
+        - name: model-weights
+          mountPath: /mnt/model
+          readOnly: true
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+      resources:
+        requests:
+          cpu: "8"
+          memory: "16Gi"

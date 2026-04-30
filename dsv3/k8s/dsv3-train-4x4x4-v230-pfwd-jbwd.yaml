@@ -1,0 +1,107 @@
+# DSv3 671B mini — Pallas forward + JAX backward, EP=8 FSDP=16 on 4x4x4.
+#
+# Key changes from v229:
+#   v230: FSDP=16, EP=8 (was FSDP=8, EP=16) — fix HBM OOM.
+#
+#   v229 OOM at compile time: 131.06G used of 94.75G limit (+36.32G over).
+#   Root cause: FSDP=8 → 32 seqs/device (vs 16 with FSDP=16).  Dominant
+#   allocation: output_head logits [32,4095,102400] = 25 GB alone.
+#   All activations scale with seqs/device (GBS/FSDP).
+#
+#   Fix: FSDP=16, EP=8.  Same 128 devices (16×8×1=128), same GBS=256.
+#   16 seqs/device → output_head logits ≈ 12.5 GB.  F_shard = 2048/16 = 128
+#   (kernel-aligned, no weight gather).  Same v229 image (no code change).
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     -n poc-dev apply -f k8s/dsv3-train-4x4x4-v230-pfwd-jbwd.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v230-pfwd-jbwd --prefix=true -f --max-log-requests=16 -n poc-dev \
+#     2>&1 | tee -a /tmp/v230-pfwd-jbwd.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v230-pfwd-jbwd -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v230-pfwd-jbwd
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "30"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 16
+        parallelism: 16
+        template:
+          metadata:
+            labels:
+              app: v230-pfwd-jbwd
+              declared-duration-minutes: "30"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v229-pfwd-jbwd
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=mini
+              - --moe_backend=pfwd_jbwd
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=8
+              - --tp=1
+              - --gbs=256
+              - --steps=3
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x4x4-ep8-fsdp16-tp1-v230-pfwd-jbwd
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

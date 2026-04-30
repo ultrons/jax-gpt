@@ -1,0 +1,59 @@
+# sc_gather_rows correctness test — all 16 pods, no JAX distributed.
+#
+# 4x4x4 = 64 chips = 16 pods × 4 chips each. All 16 pods run the test
+# independently (no inter-pod communication needed). Each pod verifies
+# SC gather fix on its local 4 chips:
+#   - No NotImplementedError at compile time
+#   - SC output == TC reference bit-for-bit (f32 and bf16, multiple D values)
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/dsv3-test-sc-gather-v1.yaml
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=dsv3-test-sc-gather-v1 --prefix=true -f --max-log-requests=16 \
+#     2>&1 | tee -a /tmp/dsv3-test-sc-gather-v1.log
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset dsv3-test-sc-gather-v1
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-test-sc-gather-v1
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-test-sc-gather-v1
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x4x4
+              containers:
+                - name: test
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v87-train
+                  imagePullPolicy: Always
+                  command: ["python", "test_sc_gather_rows.py"]
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

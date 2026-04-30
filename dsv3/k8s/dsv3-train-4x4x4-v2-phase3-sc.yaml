@@ -1,0 +1,88 @@
+# Phase 3 SparseCore correctness + performance check — SC path (v2).
+#
+# Runs streaming_bwd v1 with Phase 3 sc_gather_rows (v82-train image).
+# On v7x hardware: sc_gather_rows uses plsc.BlockSpec(indexed_by=1) SC path.
+# Compare loss step-by-step to v3-phase3-baseline (same config, v81-train, TC gather).
+# Matching loss = SC gather is numerically correct.
+# Faster step time = SC/TC overlap is working.
+#
+# Mini config: D=2048, E=16, K=4, L=8.
+# 4x4x4 = 128 JAX devices (2/chip × 64 chips). EP=4, FSDP=32.
+# max_tpe = 2 × (128 × 2048 / 32) × 4 / 4 = 16384 tokens per expert.
+# SC gather block: 128 × 2048 × bfloat16 = 512 KB/step — fits in SC subcore VMEM.
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/dsv3-train-4x4x4-v2-phase3-sc.yaml
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=dsv3-4x4x4-v2-phase3-sc --prefix=true -f --max-log-requests=16 \
+#     2>&1 | tee -a /tmp/dsv3-4x4x4-v2-phase3-sc.log
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset dsv3-4x4x4-v2-phase3-sc
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-4x4x4-v2-phase3-sc
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-4x4x4-v2-phase3-sc
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x4x4
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v84-train
+                  imagePullPolicy: Always
+                  command: ["python", "train.py"]
+                  args:
+                    - "--config=mini"
+                    - "--moe_backend=streaming_bwd"
+                    - "--attn_backend=splash"
+                    - "--optimizer=sgd"
+                    - "--fsdp=32"
+                    - "--ep=4"
+                    - "--gbs=128"
+                    - "--steps=10"
+                    - "--gradient_checkpoint"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/4x4x4-ep4-fsdp32-mini-v2-phase3-sc"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_async_collective_fusion=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                        --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                        --xla_tpu_overlap_compute_collective_tc=true
+                        --xla_enable_async_all_gather=true
+                        --xla_enable_async_all_reduce=true
+                        --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                        --xla_tpu_enable_ag_backward_pipelining=true
+                        --xla_tpu_scoped_vmem_limit_kib=65536
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

@@ -1,0 +1,64 @@
+# v2 streaming backward correctness test on 4x4x4.
+#
+# Tests fused_ep_moe_bwd_streaming_v2 (FSDP async weight prefetch):
+#   Test 1: EP=1, FSDP=8 (per-pod, local devices only, no cross-pod collectives)
+#   Test 2: EP=8, FSDP=16 (4x4x4 = 16 pods × 8 devices = 128 total)
+#            v2 via shard_map(ep, fsdp) vs EP=1 v1 reference
+#            d_tokens and d_gating must match after EP psum.
+#
+# Topology: 4x4x4 = 16 pods × 4 chips × 2 cores = 128 JAX devices.
+# Mesh: (16, 8) → ("fsdp"=16, "ep"=8).
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/test-v2-4x4x4-v1.yaml
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=test-v2-4x4x4-v1 --prefix=true -f --max-log-requests=16 \
+#     2>&1 | tee -a /tmp/test-v2-4x4x4-v1.log
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset test-v2-4x4x4-v1
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: test-v2-4x4x4-v1
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: test-v2-4x4x4-v1
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x4x4
+              containers:
+                - name: test
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v88-train
+                  imagePullPolicy: Always
+                  command: ["python", "/app/test_grad_check_v2.py", "--distributed"]
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/test-v2-4x4x4-v1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

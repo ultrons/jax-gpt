@@ -1,0 +1,103 @@
+# DSv3 671B mini — JAX MoE backend (isolation test), EP=32 TP=1.
+#
+# Purpose: isolate whether gather_emitter.cc SC error is in the JAX graph
+# (shared by all backends) or specific to pfwd_jbwd backward.
+#
+# Uses v206 image (same code), switches --moe_backend=jax.
+# If this also fails with the same SC gather error → fix is in model.py JAX graph.
+# If this passes → fix is in pfwd_jbwd backward specifically.
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     -n poc-dev apply -f k8s/dsv3-train-4x4x16-v206b-jax-jbwd.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v206b-jax-jbwd --prefix=true -f --max-log-requests=64 -n poc-dev \
+#     2>&1 | tee -a /tmp/v206b-jax-jbwd.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v206b-jax-jbwd -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v206b-jax-jbwd
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "30"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v206b-jax-jbwd
+              declared-duration-minutes: "30"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x16"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v206-pfwd-jbwd
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=mini
+              - --moe_backend=jax
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=32
+              - --tp=1
+              - --gbs=256
+              - --steps=3
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x4x16-ep32-fsdp16-tp1-v206b-jax
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

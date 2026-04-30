@@ -1,0 +1,64 @@
+# Medium DeepSeek-v3 (37B) v3: GBS=4 for better compute/comm overlap.
+#
+# Deploy:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot apply -f k8s/dsv3-medium-v3.yaml
+# Monitor:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot logs -l app=dsv3-med-v3 --prefix=true -f --max-log-requests=16 2>&1 | tee -a /tmp/dsv3-med-v3.log
+# Cleanup:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot delete jobset dsv3-med-v3
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-med-v3
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-med-v3
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v3
+                  imagePullPolicy: Always
+                  args:
+                    - "--config=medium"
+                    - "--moe_backend=ragged_dot"
+                    - "--optimizer=sgd"
+                    - "--fsdp=32"
+                    - "--ep=2"
+                    - "--gbs=4"
+                    - "--steps=20"
+                    - "--profile"
+                    - "--profile_dir=gs://max-experiments/sivaibhav-dsv3/profiles/med-v3-pdbs4"
+                    - "--profile_skip=5"
+                    - "--profile_steps=3"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://max-experiments/sivaibhav-dsv3/jax-cc/mini-dsv3-med-v3"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

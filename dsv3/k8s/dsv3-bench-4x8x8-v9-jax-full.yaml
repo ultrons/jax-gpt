@@ -1,0 +1,104 @@
+# MoE backend benchmark — Pallas fwd (streaming v1) + fused_ep_moe_bwd_v3.
+#
+# v134: fix valid_mask NaN — use ones_like*(N,1)f to get (N,D)f mask, then jnp.where
+# v133: attempted jnp.where with bool (N,1) — Mosaic "unsupported shape cast" (failed)
+#       replaced with jnp.where (XLA Select) so VMEM garbage in invalid rows → 0, not NaN.
+# v121: _moe_pallas_sg_bwd now calls fused_ep_moe_bwd_v3 instead of streaming_bwd_v2.
+# v3 bwd: fully-fused EP A2A inside Pallas — packed scatter (tokens+d_out → experts),
+#         expert_bwd, gather (d_tokens → owners). No 4× all_gather in backward.
+# After kernel: psum("fsdp") for F-partial d_tok. No psum_scatter("ep") needed.
+# Note: d_topk=zeros (routing weight grad placeholder; doesn't affect TPS measurement).
+#
+# Config: FULL 671B (D=7168, L=61, L_dense=3 → 58 MoE layers, E=256, K=8, D_moe=2048, D_mlp=18432)
+# Mesh: EP=32, FSDP=16, DP=1 — 512 devices
+# GBS=1024, S=4096, steps=20 (steps 1-2 warmup/JIT, steps 3-20 steady state)
+#
+# Baseline comparison (v4):
+#   JAX bwd (v4-jax-100steps):     see jobset-dsv3-bench-4x8x8-v4-jax-100steps
+#   Pallas v2 bwd (v3-pallas):     see jobset-dsv3-bench-4x8x8-v3-pallas
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     apply -f k8s/dsv3-bench-4x8x8-v9-jax-full.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=dsv3-bench-4x8x8-v9-jax-full --prefix=true -f --max-log-requests=64 \
+#     2>&1 | tee -a /tmp/dsv3-bench-4x8x8-v9-jax-full.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset dsv3-bench-4x8x8-v9-jax-full
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-bench-4x8x8-v9-jax-full
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: dsv3-bench-4x8x8-v9-jax-full
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x8x8"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v134-pallas-v3bwd
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=full
+              - --moe_backend=jax
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=32
+              - --gbs=1024
+              - --steps=20
+              - --gradient_checkpoint
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x8x8-ep32-fsdp16-gbs1024-bench-v9-jax-full-v132
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

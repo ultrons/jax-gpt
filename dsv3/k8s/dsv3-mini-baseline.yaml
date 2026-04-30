@@ -1,0 +1,65 @@
+# Mini DeepSeek-v3 baseline on v7x 2x4x4 (32 chips, 64 devices).
+# SGD, ragged_dot MoE, FSDP=32, EP=2, GBS=2.
+#
+# Deploy:
+#   kubectl apply -f k8s/dsv3-mini-baseline.yaml
+# Monitor:
+#   kubectl logs -l app=dsv3-mini-v1 --prefix=true -f --max-log-requests=16 2>&1 | tee -a /tmp/dsv3-mini-v1.log
+# Cleanup:
+#   kubectl delete jobset dsv3-mini-v1
+
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-mini-v1
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-mini-v1
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v1
+                  imagePullPolicy: Always
+                  args:
+                    - "--config=mini"
+                    - "--moe_backend=ragged_dot"
+                    - "--optimizer=sgd"
+                    - "--fsdp=32"
+                    - "--ep=2"
+                    - "--gbs=2"
+                    - "--steps=20"
+                    - "--profile"
+                    - "--profile_dir=gs://max-experiments/sivaibhav-dsv3/profiles/mini-v1"
+                    - "--profile_skip=5"
+                    - "--profile_steps=3"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://max-experiments/sivaibhav-dsv3/jax-cc/mini-dsv3-v1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

@@ -1,0 +1,131 @@
+# DSv3 671B v322 — production scatter Pallas kernel on JAX nightly Apr 17,
+# patched to drop the inner @api.jit on _make_kernel.wrapper (fix for
+# pl.kernel + lax.scan + grad ref leak). v304-nightly already confirmed the
+# baseline (1936 TPS/chip) on the same image without --moe_use_sc_scatter.
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v337c-noag
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "240"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v337c-noag
+              declared-duration-minutes: "240"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x8x8"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:noag-v1
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=full
+              - --moe_backend=gmm
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=32
+              - --ep=8
+              - --tp=2
+              - --gbs=4096
+              - --dtype=bfloat16
+              - --steps=5
+              - --grad_clip=1.0
+              - --gradient_checkpoint
+              - --no_cp
+              - --moe_no_weight_ag
+              - --profile
+              - --profile_dir=gs://max-experiments/dsv3/profiles/v337c-noag-ep8tp2-fsdp32-gbs4096-4x8x8/
+              - --profile_skip=2
+              - --profile_steps=1
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x8x8-ep8-fsdp32-tp2-gbs4096-noag-v1c
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_scoped_vmem_limit_kib=65536
+                  --xla_tpu_bf16_emission_mode=NATIVE_EMISSION
+                  --xla_tpu_num_sparse_cores_for_gather_offloading=2
+                  --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+                  --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true
+                  --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true
+                  --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true
+                  --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true
+                  --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true
+                  --xla_tpu_enable_sparse_core_reduce_scatter_v2=true
+                  --xla_tpu_use_single_sparse_core_for_all_gather_offload=false
+                  --xla_tpu_enable_concurrent_sparse_core_offloading=true
+                  --xla_tpu_enable_offloading_gather_to_sparsecore=true
+                  --xla_tpu_use_tc_device_shape_on_sc=True
+                  --xla_sc_disable_megacore_partitioning=True
+                  --xla_tpu_enable_sparse_core_collective_aggregator=true
+                  --xla_tpu_enable_latency_hiding_layer_scheduler=false
+                  --xla_tpu_enable_layer_scheduler_for_dependent_collectives=false
+                  --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=false
+                  --xla_tpu_rerun_latency_hiding_scheduler_post_sc_assignment=true
+                  --xla_tpu_scheduler_percent_shared_memory_limit=150
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=false
+                  --xla_tpu_enable_async_collective_fusion_fuse_reduce_scatter=true
+                  --xla_enable_async_reduce_scatter_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_prefer_async_allgather_to_allreduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_enable_ici_ag_pipelining=true
+                  --xla_tpu_enable_ici_rs_pipelining=true
+                  --xla_max_concurrent_async_all_gathers=8
+                  --xla_max_concurrent_async_reduce_scatters=8
+                  --xla_tpu_pcie_bandwidth_multiplier=0.03
+                  --xla_tpu_sparse_core_all_gather_latency_multiplier=1
+                  --xla_tpu_sparse_core_reduce_scatter_latency_multiplier=3
+                  --xla_tpu_enable_3d_reduce_scatter_decomposer=false
+                  --xla_tpu_enable_all_gather_offload_tracing=false
+                  --xla_tpu_enable_all_reduce_offload_tracing=false
+                  --xla_tpu_aggregate_data_dependent_sc_ops=false
+                  --xla_tpu_scheduling_annotation_deannotate_unsupported_groups=true
+              resources:
+                limits:
+                  google.com/tpu: "4"

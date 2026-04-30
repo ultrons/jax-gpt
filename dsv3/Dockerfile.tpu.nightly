@@ -1,0 +1,71 @@
+# Mini DeepSeek-v3 trainer on TPU.
+#
+# Build:
+#   sudo docker build -f Dockerfile.tpu -t gcr.io/tpu-vm-gke-testing/mini-dsv3:v1 .
+# Push:
+#   sudo docker push gcr.io/tpu-vm-gke-testing/mini-dsv3:v1
+
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install JAX nightly Apr 28 — the JAX team rewrote _make_kernel.wrapper
+# (now uses mpmd.mpmd_map instead of new_ref/core_map/freeze), which fixes
+# the lax.scan + grad ref-leak bug. Kernel uses out_type= API (Apr 24+).
+RUN pip install --upgrade pip && \
+    pip install \
+        "jax==0.10.1.dev20260428" "jaxlib==0.10.1.dev20260428" \
+        --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax-public-nightly-artifacts-registry/simple/ && \
+    pip install \
+        "https://storage.googleapis.com/libtpu-nightly-releases/wheels/libtpu/libtpu-0.0.41.dev20260428+nightly-cp312-cp312-manylinux_2_31_x86_64.whl" && \
+    pip install \
+        "etils[epath]" \
+        tensorboard-plugin-profile \
+        tensorflow \
+        gcsfs
+
+# Copy only what we need
+COPY mini_dsv3/model.py /app/model.py
+COPY test_ragged_a2a_bwd.py /app/test_ragged_a2a_bwd.py
+COPY mini_dsv3/train.py /app/train.py
+COPY mini_dsv3/load_weights.py /app/load_weights.py
+COPY mini_dsv3/eval_logits.py /app/eval_logits.py
+COPY mini_dsv3/eval_mmlu.py /app/eval_mmlu.py
+COPY mini_dsv3/compare_layers.py /app/compare_layers.py
+# Vendored MaxText kernels: SC gather-reduce + sort/route helpers
+COPY mini_dsv3/kernels /app/kernels
+
+# Pallas backward kernel (Stage C/D): fused_ep_moe_bwd with D-tiling
+COPY fused_moe_bwd/backward_kernel.py /app/backward_kernel.py
+COPY fused_moe_bwd/backward.py /app/backward.py
+# Pallas forward kernel (streaming v1): FSDP-sharded weights, EP A2A pipeline
+# fwd_kernel_train.py: grid-based training kernel (grid-lift for fast Mosaic compile)
+COPY fused_moe_bwd/fwd_kernel_train.py /app/fwd_kernel_train.py
+COPY fused_moe_bwd/forward_kernel.py /app/forward_kernel.py
+COPY fused_moe_bwd/test_grad_check_phase2.py /app/test_grad_check_phase2.py
+# Pallas backward kernel v3: fully-fused A2A (tokens+d_out scatter, d_tokens gather)
+COPY fused_moe_bwd/backward_kernel_v3.py /app/backward_kernel_v3.py
+COPY fused_moe_bwd/test_bwd_v3.py /app/test_bwd_v3.py
+# Pallas backward kernel v4: bins layout, D-tile outer, VMEM zero-init accumulation
+COPY fused_moe_bwd/backward_kernel_v4.py /app/backward_kernel_v4.py
+
+# Stage 1: per-expert streaming backward correctness tests
+COPY fused_moe_bwd/test_grad_check_stage1.py /app/test_grad_check_stage1.py
+COPY fused_moe_bwd/test_grad_check_v7x.py /app/test_grad_check_v7x.py
+COPY fused_moe_bwd/test_grad_check_v2.py /app/test_grad_check_v2.py
+COPY fused_moe_bwd/sanity_check_devices.py /app/sanity_check_devices.py
+COPY fused_moe_bwd/test_sc_gather_rows.py /app/test_sc_gather_rows.py
+
+# fused_ep_moe forward kernel (needed by make_fused_ep_moe_train_v2 and ref_moe)
+COPY tpu_inference /app/tpu_inference
+
+# For weight loading + eval: transformers, safetensors, datasets
+RUN pip install transformers safetensors sentencepiece datasets -q
+
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "train.py"]

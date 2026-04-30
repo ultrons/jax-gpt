@@ -1,0 +1,103 @@
+# DSv3 671B mini — JAX baseline, 4x4x16 topology.
+#
+# Config: EP=16 (4x4x1 chip plane), FSDP=16 (1x1x16 chip axis), TP=2.
+# 4x4x16 = 256 chips = 512 JAX devices; 256/4=64 pods.
+#
+# Key metrics:
+#   F_shard = D_moe/FSDP = 2048/16 = 128  → 128-aligned, Pallas v4 kernel works natively
+#   T_fsdp  = GBS*S/FSDP = 256*4096/16 = 65536 → exactly at SC limit, no chunking needed
+#   E_local = E/EP = 256/16 = 16 experts/device
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     apply -f k8s/dsv3-train-4x4x16-v162-ep16.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v162-ep16 --prefix=true -f --max-log-requests=64 -n poc-dev \
+#     2>&1 | tee -a /tmp/v162-ep16.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v162-ep16 -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v162-ep16
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "30"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v162-ep16
+              declared-duration-minutes: "30"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x16"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v160-no-chunks
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=mini
+              - --moe_backend=jax
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=16
+              - --tp=2
+              - --gbs=256
+              - --steps=3
+              - --gradient_checkpoint
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x4x16-ep16-fsdp16-tp2-v162-ep16
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

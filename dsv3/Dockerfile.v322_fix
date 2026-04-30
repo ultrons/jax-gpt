@@ -1,0 +1,7 @@
+FROM gcr.io/tpu-vm-gke-testing/mini-dsv3:nightly-apr17
+# Drop-in the original pl.kernel-decorated sc_gather_reduce (was hand-rolled bypass before)
+COPY mini_dsv3/kernels/gather_reduce_pallas.py /app/kernels/gather_reduce_pallas.py
+# Apply the JAX fix: drop @api.jit on _make_kernel.wrapper so scan_p transpose can see refs
+COPY patch_pallas_helpers.py /tmp/patch_pallas_helpers.py
+RUN python /tmp/patch_pallas_helpers.py
+ENTRYPOINT ["python", "train.py"]

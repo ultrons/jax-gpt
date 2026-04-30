@@ -1,0 +1,4 @@
+FROM gcr.io/tpu-vm-gke-testing/mini-dsv3:test-k
+COPY patch_pallas_helpers.py /tmp/patch_pallas_helpers.py
+RUN python /tmp/patch_pallas_helpers.py
+ENTRYPOINT ["python", "/test_k.py"]

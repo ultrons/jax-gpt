@@ -1,0 +1,46 @@
+# Test ragged_all_to_all backward bug on 4 v4 chips (v4-8 slice = 1 host, 4 devices).
+# Runs test_ragged_a2a_bwd.py which tests:
+#   1. Raw ragged_all_to_all bwd: no checkpoint, checkpoint, scan, checkpoint+scan
+#   2. custom_vjp wrapper: checkpoint + scan (should pass even on JAX 0.9.2)
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     apply -f k8s/test-ragged-a2a-v4.yaml
+#
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     logs -l app=test-ragged-a2a --prefix=true -f
+#
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_ninja-v7x-64-spot \
+#     delete job test-ragged-a2a
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-ragged-a2a
+  namespace: default
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: test-ragged-a2a
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v4-podslice
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      containers:
+        - name: test
+          image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v31-train
+          imagePullPolicy: Always
+          command: ["python", "/app/test_ragged_a2a_bwd.py"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            limits:
+              google.com/tpu: "4"

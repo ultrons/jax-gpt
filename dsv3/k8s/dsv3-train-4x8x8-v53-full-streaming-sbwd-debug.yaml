@@ -1,0 +1,96 @@
+# DS-v3 full config — streaming_bwd SBWD input/output debug (v53).
+# Adds jax.debug.print OUTSIDE shard_map in _moe_jax_ep_fn_bwd.
+# Fires on all 512 devices × 58 layers × 2 steps = ~928 lines per pod log.
+#
+# Each SBWD line shows (local-shard NaN status):
+#   g_nan/g_max       — incoming gradient (from custom_vjp)
+#   INP: fx_nan       — stored token activations from forward residuals (KEY: was this NaN?)
+#        fw_nan       — stored routing weights from forward residuals
+#        w0_nan       — gate weight shard (FSDP-local)
+#   OUT: dfx_nan      — token gradient (was False at layer 57 in v47)
+#        dw0_nan/max  — weight gradient (was True at layer 57 in v47 with g=2.3e-8)
+#
+# Expected outcome at layer 57 (first backward, step-0):
+#   g_nan=False AND fx_nan=False AND w0_nan=False AND dw0_nan=True
+#   → NaN comes from INSIDE fused_ep_moe_bwd_streaming kernel
+# OR:
+#   g_nan=False AND fx_nan=True AND dw0_nan=True
+#   → Stored activations are corrupted; check forward pass or gradient_checkpoint recompute
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/dsv3-train-4x8x8-v53-full-streaming-sbwd-debug.yaml
+# Logs (one pod, ~928 lines):
+#   POD=$(kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     get pods -l app=dsv3-4x8x8-v53-full-streaming-sbwd-debug --no-headers \
+#     -o custom-columns=NAME:.metadata.name | head -1) && \
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs $POD 2>&1 | tee /tmp/dsv3-4x8x8-v53-full-streaming-sbwd-debug.log
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset dsv3-4x8x8-v53-full-streaming-sbwd-debug
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-4x8x8-v53-full-streaming-sbwd-debug
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 64
+          parallelism: 64
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-4x8x8-v53-full-streaming-sbwd-debug
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x8x8
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v70-train
+                  imagePullPolicy: Always
+                  command: ["python", "train.py"]
+                  args:
+                    - "--config=full"
+                    - "--moe_backend=streaming_bwd"
+                    - "--attn_backend=splash"
+                    - "--optimizer=sgd"
+                    - "--fsdp=64"
+                    - "--ep=8"
+                    - "--gbs=1024"
+                    - "--steps=2"
+                    - "--gradient_checkpoint"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/4x8x8-ep8-fsdp64-gbs1024-v53-full-streaming-sbwd"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_async_collective_fusion=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                        --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                        --xla_tpu_overlap_compute_collective_tc=true
+                        --xla_enable_async_all_gather=true
+                        --xla_enable_async_all_reduce=true
+                        --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                        --xla_tpu_enable_ag_backward_pipelining=true
+                        --xla_tpu_scoped_vmem_limit_kib=81920
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

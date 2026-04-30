@@ -1,0 +1,85 @@
+# Phase 3 SparseCore correctness check — TC baseline (v3).
+#
+# Runs streaming_bwd v1 WITHOUT sc_gather_rows (v81-train image = no SC code).
+# Same config as v2-phase3-sc. Compare loss step-by-step:
+#   v2 (v82 SC) == v3 (v81 TC) → Phase 3 SC gather is numerically correct.
+#   v2 step_time < v3 step_time → SC/TC overlap is reducing gather latency.
+#
+# Mini config: D=2048, E=16, K=4, L=8.
+# 4x4x4 = 128 JAX devices. EP=4, FSDP=32.
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/dsv3-train-4x4x4-v3-phase3-baseline.yaml
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=dsv3-4x4x4-v3-phase3-baseline --prefix=true -f --max-log-requests=16 \
+#     2>&1 | tee -a /tmp/dsv3-4x4x4-v3-phase3-baseline.log
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset dsv3-4x4x4-v3-phase3-baseline
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-4x4x4-v3-phase3-baseline
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-4x4x4-v3-phase3-baseline
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x4x4
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v84-train
+                  imagePullPolicy: Always
+                  command: ["python", "train.py"]
+                  args:
+                    - "--config=mini"
+                    - "--moe_backend=jax"
+                    - "--attn_backend=splash"
+                    - "--optimizer=sgd"
+                    - "--fsdp=32"
+                    - "--ep=4"
+                    - "--gbs=128"
+                    - "--steps=10"
+                    - "--gradient_checkpoint"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/4x4x4-ep4-fsdp32-mini-v3-phase3-baseline"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_async_collective_fusion=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                        --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                        --xla_tpu_overlap_compute_collective_tc=true
+                        --xla_enable_async_all_gather=true
+                        --xla_enable_async_all_reduce=true
+                        --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                        --xla_tpu_enable_ag_backward_pipelining=true
+                        --xla_tpu_scoped_vmem_limit_kib=65536
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

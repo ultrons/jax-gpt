@@ -1,0 +1,111 @@
+# DSv3 671B mini — Pallas forward + JAX backward, EP=32 TP=1.
+#
+# Key changes from v207:
+#   v208: fix SC gather in compute_loss (take_along_axis → jax.vmap).
+#
+#   v207 crashed with:
+#     INTERNAL: RET_CHECK failure (gather_emitter.cc:4783) num_indices_per_output == 1
+#     Expected packed element gather indices to either be 1 dimensional or bitpacked.
+#   Root cause: compute_loss used take_along_axis(log_prob, targets[...,None], axis=-1)
+#   which produces a (B_l, S_l, 1) 3D index tensor → SC gather_emitter rejects.
+#   (moe_routing had the same bug; fixed in v207 via sort_key_val. compute_loss was
+#   the remaining source.)
+#
+#   Fix: replace with jax.vmap(lambda lp, t: lp[t])(flat_log, flat_targ).
+#   flat_targ is 1D (shape (B_l*S_l,)) → SC produces a batched gather with 1D
+#   index tensor, which gather_emitter handles correctly.
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     -n poc-dev apply -f k8s/dsv3-train-4x4x16-v208-pfwd-jbwd.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v208-pfwd-jbwd --prefix=true -f --max-log-requests=64 -n poc-dev \
+#     2>&1 | tee -a /tmp/v208-pfwd-jbwd.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v208-pfwd-jbwd -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v208-pfwd-jbwd
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "30"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v208-pfwd-jbwd
+              declared-duration-minutes: "30"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x16"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v208-pfwd-jbwd
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=mini
+              - --moe_backend=pfwd_jbwd
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=32
+              - --tp=1
+              - --gbs=256
+              - --steps=3
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x4x16-ep32-fsdp16-tp1-v208-pfwd-jbwd
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

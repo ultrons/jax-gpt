@@ -1,0 +1,63 @@
+# Stage 1 correctness test on 4x4x4: fused_ep_moe_bwd_streaming vs ref_moe.
+#
+# Tests fused_ep_moe_bwd_streaming (streaming v1) at DSv3 expert count:
+#   EP=1 (T=32, D=1024, F=512, E=256, K=8): streaming backward vs ref_moe.
+#   EP=8 shard_map test auto-SKIPs (requires 512 devices; 4x4x4 has 64).
+#
+# Topology: 4x4x4 = 16 pods x 4 chips = 64 JAX devices.
+# Each pod runs Test 1 independently (jax.distributed.initialize but no
+# cross-pod collectives in EP=1 test).
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/test-stage1-4x4x4-v1.yaml
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=test-stage1-4x4x4-v1 --prefix=true -f --max-log-requests=16 \
+#     2>&1 | tee -a /tmp/test-stage1-4x4x4-v1.log
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset test-stage1-4x4x4-v1
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: test-stage1-4x4x4-v1
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: test-stage1-4x4x4-v1
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x4x4
+              containers:
+                - name: test
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v87-train
+                  imagePullPolicy: Always
+                  command: ["python", "/app/test_grad_check_v7x.py"]
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/test-stage1-4x4x4-v1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

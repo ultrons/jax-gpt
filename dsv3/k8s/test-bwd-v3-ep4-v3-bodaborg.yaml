@@ -1,0 +1,69 @@
+# backward_kernel_v3 EP=1 + EP=4 correctness test on bodaborg 4x4x4.
+#
+# v120t: conditional prev_scale fix — scale HBM read by (bt_id != 0) to discard
+# stale HBM garbage on first tile. Avoids DMA zero-init (which caused Mosaic hang).
+# Expects ALL tests to pass: EP=1 (num_bt=4), EP=4 passthrough, EP=4 full bwd.
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     apply -f k8s/test-bwd-v3-ep4-v3-bodaborg.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=test-bwd-v3-ep4-v3 --prefix=true -f --max-log-requests=16 \
+#     2>&1 | tee -a /tmp/test-bwd-v3-ep4-v3.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset test-bwd-v3-ep4-v3
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: test-bwd-v3-ep4-v3
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: test-bwd-v3-ep4-v3
+              annotations:
+                cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+                cloud.google.com/skip-tpu-webhook-check: "true"
+                kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+                kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              tolerations:
+                - key: "google.com/tpu"
+                  value: "present"
+                  operator: "Equal"
+                  effect: "NoSchedule"
+              containers:
+                - name: test
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v120t-bwd-v3-fix
+                  imagePullPolicy: Always
+                  command: ["python", "/app/test_bwd_v3.py"]
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://max-experiments/dsv3/jax-cc/test-bwd-v3-ep4-v3-t"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

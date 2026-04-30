@@ -1,0 +1,113 @@
+# DSv3 671B mini — Pallas v4 MoE, fix: remaining (bt,padded_k=128) i1 bools.
+#
+# v169 failed: same MosaicError: Invalid relayout vector<16x128xi1>
+# Root cause: padded_top_k = align_to(top_k, 128) = 128, so padded_k_shape
+#   = (bt=16, 128).  Two more (16,128) bool sources in compute_gating:
+#   1. this_row = row_iota_k == i  → (bt, padded_k=128) bool
+#      used in:
+#        jnp.where(this_row, row_max, top_k_logits)
+#        jnp.where(this_row, row_argmax, top_k_indices)
+#   2. padded_k_iota == k_id  → (bt, padded_k=128) bool
+#      used in:
+#        jnp.where(padded_k_iota == k_id, top_k_indices, t2e_routing)
+# Fix: same int32 arithmetic pattern applied to all remaining cases:
+#   row_eq_i_k = 1 - min(|row_iota_k - i|, 1)   # (bt,K) int32
+#   top_k_logits = top_k_logits*(1-row_eq_i_k).bf16 + row_eq_i_k.bf16 * row_max
+#   top_k_indices = top_k_indices*(1-row_eq_i_k) + row_argmax*row_eq_i_k
+#   k_eq_iota = 1 - min(|padded_k_iota - k_id|, 1)  # (bt,K) int32
+#   t2e_routing = t2e_routing*(1-k_eq_iota) + k_eq_iota*top_k_indices
+# All (bt,128) bool expressions are now gone from compute_gating.
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     apply -f k8s/dsv3-train-4x4x16-v170-pallas-v4.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v170-pallas-v4 --prefix=true -f --max-log-requests=64 -n poc-dev \
+#     2>&1 | tee -a /tmp/v170-pallas-v4.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v170-pallas-v4 -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v170-pallas-v4
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "60"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v170-pallas-v4
+              declared-duration-minutes: "60"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x16"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v170-pallas-v4
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=mini
+              - --moe_backend=fused_ep_moe_v4
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=16
+              - --tp=2
+              - --gbs=256
+              - --steps=3
+              - --gradient_checkpoint
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x4x16-ep16-fsdp16-tp2-v170-pallas-v4
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

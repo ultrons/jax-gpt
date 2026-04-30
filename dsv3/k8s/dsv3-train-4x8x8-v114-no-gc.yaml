@@ -1,0 +1,98 @@
+# Pallas forward WITHOUT --gradient_checkpoint.
+#
+# v112 (with grad_checkpoint): initial_loss=25.068, crash at step 1 (NaN params from NaN grads).
+# Hypothesis: jax.checkpoint(_moe_layer_body) rematerializes the forward during backward,
+# and the Pallas custom_vjp residuals get corrupted or JAX 0.9.2 has a bug with
+# checkpoint + custom_vjp.
+#
+# If THIS run succeeds for all 5 steps → grad_checkpoint is the root cause.
+# If THIS run also crashes → the NaN is intrinsic to Pallas fwd + streaming_bwd_v2.
+#
+# Config: debug (D=7168, L=13, L_dense=3 → 10 MoE layers, E=256, K=8, D_moe=2048)
+# Mesh: EP=32, FSDP=16, DP=1 — 512 devices
+# GBS=1024, S=4096, steps=5
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     apply -f k8s/dsv3-train-4x8x8-v114-no-gc.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=dsv3-4x8x8-v114-no-gc --prefix=true -f --max-log-requests=64 \
+#     2>&1 | tee -a /tmp/dsv3-4x8x8-v114-no-gc.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset dsv3-4x8x8-v114-no-gc
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-4x8x8-v114-no-gc
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: dsv3-4x8x8-v114-no-gc
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x8x8"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v111-train
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=debug
+              - --moe_backend=fused_ep_moe_v1
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=32
+              - --gbs=1024
+              - --steps=5
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x8x8-ep32-fsdp16-gbs1024-v114-no-gc
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

@@ -1,0 +1,100 @@
+# DS-v3 671B: jax backend, EP=8, FSDP=64, GBS=1024, v41-train.
+#
+# Motivation: reduce EP collective overhead vs v22 (EP=32, FSDP=16).
+#
+# v22 profile (EP=32): MXU=13.7%, HBM=11.8%, ICI=12.8% — all severely underutilized.
+# - EP=32 on 4×8×8 torus: EP axis spans 2 physical dims (4×8=32) → suboptimal ICI routing
+# - EP all_gather: 3.75 GB per layer (flat_x after EP gather) → 52.9% collective time
+# - psum_scatter: another 3.75 GB → latency bottleneck
+# - Total EP volume per layer: ~7.5 GB → 22.2% idle wait
+#
+# EP=8 advantages:
+# - EP axis = 8 chips on ONE physical dimension → perfect ring alignment on 4×8×8
+# - EP all_gather: 940 MB per layer (4× smaller)
+# - psum_scatter: 940 MB per layer (4× smaller)
+# - 4× more experts per device (32 vs 8) but same total compute per device
+# - max_tpe = 2 × T_fsdp × K / E = 2 × (1024×4096/64) × 8 / 256 = 4096
+#
+# Expected vs v22: better ICI alignment → less idle → higher TPS/chip.
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/dsv3-train-4x8x8-v23.yaml
+#
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=dsv3-4x8x8-v23 --prefix=true -f --max-log-requests=64 \
+#     2>&1 | tee -a /tmp/dsv3-4x8x8-v23.log
+#
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset dsv3-4x8x8-v23
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-4x8x8-v23
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 64
+          parallelism: 64
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-4x8x8-v23
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x8x8
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v41-train
+                  imagePullPolicy: Always
+                  command: ["python", "train.py"]
+                  args:
+                    - "--config=full"
+                    - "--moe_backend=jax"
+                    - "--attn_backend=splash"
+                    - "--optimizer=sgd"
+                    - "--fsdp=64"
+                    - "--ep=8"
+                    - "--gbs=1024"
+                    - "--steps=15"
+                    - "--gradient_checkpoint"
+                    - "--profile"
+                    - "--profile_dir=gs://sivaibhav-exp/dsv3/profiles/4x8x8-ep8-fsdp64-gbs1024-v23"
+                    - "--profile_skip=5"
+                    - "--profile_steps=2"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/4x8x8-ep8-fsdp64-gbs1024-v23"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_async_collective_fusion=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                        --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                        --xla_tpu_overlap_compute_collective_tc=true
+                        --xla_enable_async_all_gather=true
+                        --xla_enable_async_all_reduce=true
+                        --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                        --xla_tpu_enable_ag_backward_pipelining=true
+                        --xla_tpu_scoped_vmem_limit_kib=81920
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

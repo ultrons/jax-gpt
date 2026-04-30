@@ -1,0 +1,101 @@
+# DS-v3 671B: jax backend, EP=8, FSDP=64, GBS=1024, v47-train.
+#
+# Fix over v28: also batch the gather operation (Phase 2).
+#   - v28 fixed: 32 serial forward scatter-adds → 1 batched scatter-add → 2.48s/step savings
+#   - Remaining issue: 32 individual gathers `sel_x_e = flat_x[safe_tids_e]` in forward
+#     → backward = 32 serial scatter-adds into d_flat_x (copy-on-write, same issue as before)
+#   - Fix: single batched gather `all_sel_x = flat_x[all_safe_tids]` then static slices
+#     → backward = 1 scatter-add d_flat_x.at[all_safe_tids].add(d_all_sel_x) (single op)
+#     → static slice backward = static pad (no scatter-add needed, free)
+#
+# v28 baseline: 13.32s/step, 1230 TPS/chip.
+# Expected additional saving: ~2-3s (backward scatter-adds for d_flat_x).
+#   - New expected: ~10.3-11.3s/step, ~1480-1624 TPS/chip
+#
+# Memory risk:
+#   - all_sel_x: E_local × max_tpe × D × 2 = 32 × 4096 × 7168 × 2 = 1.88 GB extra peak
+#   - Cumulative extra vs v24: v28 already added 1.88 GB (all_weighted_out_cat)
+#     With all_sel_x: +1.88 GB more → total +3.76 GB vs v24 → ~93.76 GB compile-time
+#   - Below 94.75 GB limit, but tight.
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/dsv3-train-4x8x8-v29.yaml
+#
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=dsv3-4x8x8-v29 --prefix=true -f --max-log-requests=64 \
+#     2>&1 | tee -a /tmp/dsv3-4x8x8-v29.log
+#
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset dsv3-4x8x8-v29
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-4x8x8-v29
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 64
+          parallelism: 64
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-4x8x8-v29
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x8x8
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v47-train
+                  imagePullPolicy: Always
+                  command: ["python", "train.py"]
+                  args:
+                    - "--config=full"
+                    - "--moe_backend=jax"
+                    - "--attn_backend=splash"
+                    - "--optimizer=sgd"
+                    - "--fsdp=64"
+                    - "--ep=8"
+                    - "--gbs=1024"
+                    - "--steps=15"
+                    - "--gradient_checkpoint"
+                    - "--profile"
+                    - "--profile_dir=gs://sivaibhav-exp/dsv3/profiles/4x8x8-ep8-fsdp64-gbs1024-v29"
+                    - "--profile_skip=5"
+                    - "--profile_steps=2"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/4x8x8-ep8-fsdp64-gbs1024-v29"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_async_collective_fusion=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                        --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                        --xla_tpu_overlap_compute_collective_tc=true
+                        --xla_enable_async_all_gather=true
+                        --xla_enable_async_all_reduce=true
+                        --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                        --xla_tpu_enable_ag_backward_pipelining=true
+                        --xla_tpu_scoped_vmem_limit_kib=81920
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

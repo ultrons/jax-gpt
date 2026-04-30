@@ -1,0 +1,66 @@
+# Phase 2 gradient check: fused_ep_moe (Pallas fwd) + JAX backward.
+#
+# Tests make_fused_ep_moe_train_v2 at DSv3 tiny/mini/medium dims on v7x.
+# v7x has 64 MB VMEM, so mini (50 MB) compiles without D-tiling.
+#
+# Must run as 16 pods (4x4x4 slice): TPU firmware requires all hosts in the
+# slice to register before any pod can initialize the TPU backend.
+# Each pod runs the gradient check independently on its local 8 devices (EP=1).
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/test-phase2-v7x.yaml
+#
+# Logs (pod 0 has all meaningful output):
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=test-phase2 --prefix=true -f --max-log-requests=16 \
+#     2>&1 | tee -a /tmp/test-phase2.log
+#
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset test-phase2
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: test-phase2
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          ttlSecondsAfterFinished: 3600
+          template:
+            metadata:
+              labels:
+                app: test-phase2
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x4x4
+              containers:
+                - name: test
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:phase2-test
+                  imagePullPolicy: Always
+                  command: ["python", "/app/test_grad_check_phase2.py"]
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_scoped_vmem_limit_kib=65536
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

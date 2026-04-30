@@ -1,0 +1,92 @@
+# DS-v3 full config — streaming_bwd inner debug v54.
+# Adds short jax.debug.print INSIDE _streaming_bwd_fn (inside shard_map):
+#   "SB e={ep} f={fsdp} gn={g_nan} fxn={fx_nan} fwn={fw_nan} dwn={dw1_nan}"
+#
+# Inside shard_map, fx_full/g_full are LOCAL (all-gathered), so jnp.any(isnan)
+# is a LOCAL op — no AllReduce → compiles in ~3 min (proven by v49 pattern).
+#
+# Pod-0 (8 devices) sees 8 * 58 * 2 steps = 928 SB lines (~42 KB).
+# Retrieve with: kubectl logs $POD0 2>&1 | tee /tmp/v54.log
+# Then: grep "SB e=0 f=0" /tmp/v54.log | head -120
+#
+# Diagnostic: find the FIRST layer (in backward order, layer 57 fires first) where
+#   gn=False AND fxn=True  → stored activations corrupted in forward / grad_ckpt
+#   gn=False AND fxn=False AND dwn=True  → NaN from inside kernel computation
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/dsv3-train-4x8x8-v54-full-streaming-inner-debug.yaml
+# Logs (from COMPLETED pod):
+#   POD=$(kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     get pods -l app=dsv3-4x8x8-v54-full-streaming-inner-debug --no-headers \
+#     -o custom-columns=NAME:.metadata.name | head -1) && \
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs $POD 2>&1 | tee /tmp/dsv3-4x8x8-v54-full-streaming-inner-debug.log
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset dsv3-4x8x8-v54-full-streaming-inner-debug
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-4x8x8-v54-full-streaming-inner-debug
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 64
+          parallelism: 64
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-4x8x8-v54-full-streaming-inner-debug
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x8x8
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v71-train
+                  imagePullPolicy: Always
+                  command: ["python", "train.py"]
+                  args:
+                    - "--config=full"
+                    - "--moe_backend=streaming_bwd"
+                    - "--attn_backend=splash"
+                    - "--optimizer=sgd"
+                    - "--fsdp=64"
+                    - "--ep=8"
+                    - "--gbs=1024"
+                    - "--steps=2"
+                    - "--gradient_checkpoint"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/4x8x8-ep8-fsdp64-gbs1024-v54-full-streaming-inner"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_async_collective_fusion=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                        --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                        --xla_tpu_overlap_compute_collective_tc=true
+                        --xla_enable_async_all_gather=true
+                        --xla_enable_async_all_reduce=true
+                        --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                        --xla_tpu_enable_ag_backward_pipelining=true
+                        --xla_tpu_scoped_vmem_limit_kib=81920
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

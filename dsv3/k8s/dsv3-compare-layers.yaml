@@ -1,0 +1,58 @@
+---
+# Layer comparison: JAX vs HF numpy reference.
+# Same 8-pod multihost topology as eval job; only pod 0 does real work.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-compare
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-compare
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              volumes:
+                - name: model-weights
+                  persistentVolumeClaim:
+                    claimName: ds-v3-weights-pvc
+              containers:
+                - name: compare
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v17-eval
+                  imagePullPolicy: Always
+                  command: ["python", "compare_layers.py"]
+                  args:
+                    - "--model_dir=/mnt/model/DeepSeek-V3"
+                    - "--layer=3"
+                    - "--seq_len=8"
+                  volumeMounts:
+                    - name: model-weights
+                      mountPath: /mnt/model
+                      readOnly: true
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: TRANSFORMERS_OFFLINE
+                      value: "1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

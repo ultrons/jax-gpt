@@ -1,0 +1,105 @@
+# DS-v3 671B: jax backend, EP=8, FSDP=64, GBS=1024, v49-train.
+#
+# Fix over v30: remove the Phase 2 multiply-mask on all_sel_x entirely.
+#   - v30 replaced jnp.where(all_valid, all_sel_x, 0) with multiply:
+#     all_sel_x = all_sel_x * all_valid.astype(dtype)[:, None]
+#   - Profile showed add_multiply_fusion.4/.5 = 1.49s/step — just as expensive!
+#     XLA still materializes the full 1.88 GB intermediate for the element-wise multiply.
+#   - Root cause: masking the 1.88 GB all_sel_x tensor before slicing is fundamentally wrong.
+#     The mask is REDUNDANT because Phase 3 already applies valid_e[:, None] to out_e:
+#       d_out_e[invalid] = 0  →  d_sel_x_e[invalid] = 0  →  d_flat_x.at[0].add(0) (no-op)
+#   - Fix: remove the mask line entirely. flat_x[0] flows through the expert matmuls for
+#     invalid slots, but the valid_e[:, None] in weighted_out_e zeroes the output → safe.
+#
+# v28 baseline: 13.32s/step, 1230 TPS/chip.
+# v30 measured: 14.26s/step (add_multiply_fusion: 1.49s, gather_offload: 0.84s,
+#               scatter savings: -0.74s vs v28 per-expert gathers).
+# Expected v31: ~12.77s/step (v30 - 1.49s mask = 12.77s)
+#   - Keeps v30's batched gather (0.84s vs ~1.39s for 32 per-expert gathers → -0.55s vs v28)
+#   - Keeps v30's batched scatter savings (-0.74s vs v26)
+#   - Eliminates add_multiply_fusion: -1.49s
+#   - Expected: ~12.77s/step, ~1283 TPS/chip
+#
+# Memory: same as v30 (~93.76 GB compile-time, under 94.75 GB limit).
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/dsv3-train-4x8x8-v31.yaml
+#
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=dsv3-4x8x8-v31 --prefix=true -f --max-log-requests=64 \
+#     2>&1 | tee -a /tmp/dsv3-4x8x8-v31.log
+#
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset dsv3-4x8x8-v31
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-4x8x8-v31
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 64
+          parallelism: 64
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-4x8x8-v31
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x8x8
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v49-train
+                  imagePullPolicy: Always
+                  command: ["python", "train.py"]
+                  args:
+                    - "--config=full"
+                    - "--moe_backend=jax"
+                    - "--attn_backend=splash"
+                    - "--optimizer=sgd"
+                    - "--fsdp=64"
+                    - "--ep=8"
+                    - "--gbs=1024"
+                    - "--steps=15"
+                    - "--gradient_checkpoint"
+                    - "--profile"
+                    - "--profile_dir=gs://sivaibhav-exp/dsv3/profiles/4x8x8-ep8-fsdp64-gbs1024-v31"
+                    - "--profile_skip=5"
+                    - "--profile_steps=2"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/4x8x8-ep8-fsdp64-gbs1024-v31"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_async_collective_fusion=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                        --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                        --xla_tpu_overlap_compute_collective_tc=true
+                        --xla_enable_async_all_gather=true
+                        --xla_enable_async_all_reduce=true
+                        --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                        --xla_tpu_enable_ag_backward_pipelining=true
+                        --xla_tpu_scoped_vmem_limit_kib=81920
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

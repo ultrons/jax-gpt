@@ -1,0 +1,111 @@
+# DSv3 671B mini — Pallas forward + JAX backward, EP=8 FSDP=16 on 4x4x4.
+#
+# Key changes from v230:
+#   v231: double-barrier pattern — get_barrier_semaphore() (dummy) +
+#         pl.run_scoped(REGULAR) for actual ICI signaling.
+#
+#   v230 SIGABRT at 18:04:49 on all 16 pods simultaneously.
+#   Root cause: get_barrier_semaphore() returns ONE device-global semaphore
+#   per pallas_call.  Python for loop unrolls to 8 bt_id call sites, all
+#   sharing the same semaphore slot.  Fast device K+1 signals arrive at slow
+#   device's K-wait → K-wait fires early → K+1-wait hangs → TPU watchdog
+#   kills all devices at the same time.  Same mechanism as v222–v224 (EP=32).
+#
+#   Fix: call get_barrier_semaphore() (discarded) to satisfy Mosaic's
+#   collective_id check, then use pl.run_scoped(REGULAR) for the actual
+#   signal/wait.  Each Python-for call site gets a unique SMEM slot → no
+#   aliasing between bt_id iterations.  Pattern from util.py local_barrier().
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     -n poc-dev apply -f k8s/dsv3-train-4x4x4-v231-pfwd-jbwd.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v231-pfwd-jbwd --prefix=true -f --max-log-requests=16 -n poc-dev \
+#     2>&1 | tee -a /tmp/v231-pfwd-jbwd.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v231-pfwd-jbwd -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v231-pfwd-jbwd
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "30"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 16
+        parallelism: 16
+        template:
+          metadata:
+            labels:
+              app: v231-pfwd-jbwd
+              declared-duration-minutes: "30"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v231-pfwd-jbwd
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=mini
+              - --moe_backend=pfwd_jbwd
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=8
+              - --tp=1
+              - --gbs=256
+              - --steps=3
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x4x4-ep8-fsdp16-tp1-v231-pfwd-jbwd
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

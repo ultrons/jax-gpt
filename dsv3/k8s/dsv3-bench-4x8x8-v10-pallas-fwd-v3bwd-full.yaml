@@ -1,0 +1,159 @@
+# MoE backend benchmark — Pallas fwd (streaming v1) + streaming_bwd_v2.
+#
+# v149: fix SC Get '(1, 16)' from b_acc_vmem (acc1/acc3 accumulator) in
+#       dynamic_ffn1 + dynamic_ffn2.  Root cause: b_acc_vmem was float32
+#       (2, bt*num_devices, 1, bf).  Inside lax.fori_loop with dynamic btc_id,
+#       acc1_vmem[pl.ds(btc_id*btc,btc), pl.ds(bfc_id*bfc,bfc)] reads (8,2048)
+#       float32 from VMEM; SC tiles it as (1,16) → NotImplementedError.
+#       SC's Get constraint is float32-specific (bf16 is exempt).
+#       Fix: change b_acc_vmem dtype from float32 → bfloat16.  Cast the f32
+#       dot-product result (preferred_element_type=float32) to bf16 before
+#       writing to acc1_vmem/acc3_vmem.  Reads in dynamic_ffn2 now return bf16
+#       and feed into apply_act_fn + jnp.dot(preferred_element_type=float32) ✓.
+# v148: fix scatter_p unsupported in Pallas TC context.
+#       v147 used .at[i].set() on non-ref arrays → lowers to scatter_p → error.
+#       Fix: use jnp.where(row_iota==i, scalar, array) to assemble per-row
+#       scalars into 2-D arrays.  jnp.where lowers to select_n (VPU) not
+#       scatter_p (TC-blocked).  Precompute row_iota_k and row_iota_1d once.
+# v147: fix Mosaic argmax: 'Only float32 is supported' when input stays bf16.
+#       v146 removed input.astype(float32) → fixed SC (1,16) but uncovered that
+#       Mosaic argmax / reduce-max only support float32 operands (not bf16).
+#       Fix: per-row loop over bt=8 (compile-time const); each row is (E,)
+#       float32 1-D → max/argmax valid; SC loads (16,) chunks ✓.  Cast logit to
+#       bf16 before [:, None] expansion to avoid any 2-D float32 temp.
+# v146: fix SC lowering 'Get only supports float32 arrays of shapes [(16,)], got (1, 16)'.
+#       Root cause: get_top_k in kernel.py cast input to float32 (line 387), creating 2-D
+#       float32 VMEM arrays (bt=8, E=256) and (bt=8, padded_top_k=128).  The SC lowers
+#       jnp.max / jnp.argmax / top_k_logits_sum+= as (1,16) tile loads — unsupported.
+#       Fix: remove the float32 cast; keep input in bf16.  Change top_k_logits_sum from
+#       (bt, padded_top_k) float32 to (bt,) float32 (1-D, SC loads (16,) ✓).  Normalize
+#       via inv_sum cast to bf16 before the 2-D multiply to stay in bf16 throughout.
+#       v145 (pyc cache clear) and v144 (jnp.int32 prefix) did not fix this; those changes
+#       addressed int32 routing, not the float32 2-D VMEM SC constraint.
+# v144: fix SC lowering 'Get only supports float32 arrays of shapes [(16,)], got (1, 16)'.
+#       extra_device_id_prefix=(0,) passed Python int 0; SC lowering broadcast it to
+#       (1,) while fsdp_rank is (16,) → produces (1,16) instead of ()-shaped jax scalar.
+#       Fix: convert extra_device_id_prefix elements to jnp.int32(x) (shape () scalars).
+# v143: fix TypeError: _fused_ep_moe_kernel() got unexpected kwarg 'non_ep_axis_name'.
+#       ~/dsv3/tpu_inference/kernels/fused_moe/v1/kernel.py was an old version
+#       without non_ep_axis_name / extra_device_id_prefix params.
+#       Fix: sync kernel.py from ~/ml-experiments/dsv3/tpu_inference (updated version).
+# v142: fix ModuleNotFoundError: No module named 'vllm' at import time.
+#       tpu_inference/__init__.py imported tpu_info → logger → vllm.logger.
+#       Fix: vendored __init__.py and logger.py with stdlib logging (no vllm dep).
+#       logger.warning_once() re-implemented via a set to deduplicate messages.
+# v141: switch backward from fused_ep_moe_bwd_v3 to streaming_bwd_v2.
+#       Root cause of v140 hang: v3 bwd had O(num_bt * EP) = O(1024 * 32) serial
+#       ring-barrier rounds per layer. At EP=32 with bt=8 and T_local=8192, num_bt=1024.
+#       Each bt tile ran 31 rounds of sync_barrier (31 ICI signals × 32 devices), giving
+#       43,009 barriers × 58 layers = ~2.5M barriers/step → 40+ min/step (not a hang).
+#       v3 bwd can't increase bt to reduce tiles: bt×EP VMEM (14.7 MB at bt=8) would
+#       be 235 MB at bt=128 (forward's bt), exceeding 64 MB VMEM limit.
+#       Fix: use streaming_bwd_v2 which uses JAX collectives (no per-tile barriers).
+#       DCE of Pallas fwd via checkpoint save_only_these_names prevents ICI conflict.
+# v140: _moe_pallas_sg_fwd names ALL outputs (p_out+p_fx..p_wo) with checkpoint_name.
+#       save_only_these_names DCEs _fwd from jaxpr_bwd → Pallas fwd never re-runs.
+#       Compiled without VMEM OOM (confirms DCE worked) but step 1 took 47+ min.
+# v139: nested checkpoint approach — failed (fwd still ran in backward context).
+# v138: VMEM flags (AGGRESSIVE scavenging + msa_expanded) fixed VMEM OOM but step 1
+#       still hung: two sequential Pallas A2A (recomputed fwd + v3 bwd) → ICI deadlock.
+# v137: VMEM OOM (31.95M vs 30.00M) — only 'pallas_moe_out' named, JAX calls _fwd
+#       for residuals → fused-moe-fwd-streaming-v1 appears in jvp(moe_scan).
+# v136: fix compile-time HBM OOM (172 GB vs 94.75 GB limit).
+#
+# Config: FULL 671B (D=7168, L=61, L_dense=3 → 58 MoE layers, E=256, K=8, D_moe=2048, D_mlp=18432)
+# Mesh: EP=32, FSDP=16, DP=1 — 512 devices
+# GBS=1024, S=4096, steps=20 (steps 1-2 warmup/JIT, steps 3-20 steady state)
+#
+# Baseline comparison:
+#   JAX fwd+bwd (v9-jax-full): see jobset-dsv3-bench-4x8x8-v9-jax-full
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     apply -f k8s/dsv3-bench-4x8x8-v10-pallas-fwd-v3bwd-full.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=dsv3-bench-4x8x8-v10-pallas-fwd-v3bwd-full --prefix=true -f --max-log-requests=64 \
+#     2>&1 | tee -a /tmp/dsv3-bench-4x8x8-v10-pallas-fwd-v3bwd-full.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset dsv3-bench-4x8x8-v10-pallas-fwd-v3bwd-full
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-bench-4x8x8-v10-pallas-fwd-v3bwd-full
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: dsv3-bench-4x8x8-v10-pallas-fwd-v3bwd-full
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x8x8"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v149-pallas-fwd-v2bwd
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=full
+              - --moe_backend=fused_ep_moe_v1
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=32
+              - --gbs=1024
+              - --steps=20
+              - --gradient_checkpoint
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x8x8-ep32-fsdp16-gbs1024-bench-v10-pallas-fwd-v2bwd-full-v149
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+                  --xla_tpu_vmem_scavenging_mode=AGGRESSIVE
+                  --xla_msa_expanded_scoped_alternate_memory_mode=enabled
+              resources:
+                limits:
+                  google.com/tpu: "4"

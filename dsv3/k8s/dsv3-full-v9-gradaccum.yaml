@@ -1,0 +1,72 @@
+# Full DS-v3 671B v9: grad accumulation (2 micro-batches, GBS=2).
+# Same total batch as v8 GBS=1 per micro-batch, but 2 micro-batches.
+# The all-reduce after accumulation should overlap with next step's forward.
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-full-v9
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-full-v9
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v6
+                  imagePullPolicy: Always
+                  args:
+                    - "--config=full"
+                    - "--moe_backend=ragged_dot"
+                    - "--optimizer=sgd"
+                    - "--fsdp=64"
+                    - "--ep=1"
+                    - "--gbs=2"
+                    - "--grad_accum=2"
+                    - "--steps=10"
+                    - "--gradient_checkpoint"
+                    - "--profile"
+                    - "--profile_dir=gs://max-experiments/sivaibhav-dsv3/profiles/full-v9-gradaccum"
+                    - "--profile_skip=3"
+                    - "--profile_steps=2"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://max-experiments/sivaibhav-dsv3/jax-cc/dsv3-full-v9"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_async_collective_fusion=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                        --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                        --xla_tpu_overlap_compute_collective_tc=true
+                        --xla_enable_async_all_gather=true
+                        --xla_enable_async_all_reduce=true
+                        --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                        --xla_tpu_enable_ag_backward_pipelining=true
+                        --xla_tpu_scoped_vmem_limit_kib=81920
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

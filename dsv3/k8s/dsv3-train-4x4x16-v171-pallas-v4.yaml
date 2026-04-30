@@ -1,0 +1,118 @@
+# DSv3 671B mini — Pallas v4 MoE, fix: [:, None] shape cast + bins OOM.
+#
+# v170 failed with two issues:
+#
+# Issue 1 (forward kernel Mosaic error, caught by local test_fwd_v4):
+#   MosaicError: infer-vector-layout: unsupported shape cast
+#     "tpu.reshape": vector<16xbf16> -> vector<16x1xbf16>
+#   Root cause: inv_sum_bf16[:, None] in compute_gating renormalization.
+#     [:, None] reshapes (bt,) bf16 → (bt,1). Mosaic cannot tile/layout
+#     a single-column 2-D matrix (no vector<bt×1×dtype> tile exists).
+#   Fix (kernel.py): build a (bt, padded_k) scale_mat row-by-row using
+#     the same row_iota_k int32 arithmetic already used above:
+#       scale_mat[i,:] = inv_i  via  row_eq_i_n*(inv_i - scale_mat) + scale_mat
+#     Then: top_k_logits_lst[k] *= scale_mat  (element-wise, no reshape)
+#
+# Issue 2 (backward OOM at cluster compile time):
+#   Used 98.78G of 94.75G hbm. Exceeded hbm capacity by 4.03G.
+#   Root cause: bins_tokens + bins_d_exp at 2× safety factor:
+#     TK_padded = E_local * max_tpe = 16 * 65536 = 1048576
+#     bins shape = (1048576, 7168) f32 = 28 GB each → 56 GB total
+#   Fix (backward_kernel_v4.py): reduce 2× → 1.5× safety factor:
+#     avg_tpe = ceil(1.5 × TK/E_local) → max_tpe = 49152 instead of 65536
+#     TK_padded = 16 * 49152 = 786432 → bins = 22.6 GB each → 45 GB total
+#     Saves ~11 GB; puts us ~7 GB below the 94.75 GB compile limit.
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     apply -f k8s/dsv3-train-4x4x16-v171-pallas-v4.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v171-pallas-v4 --prefix=true -f --max-log-requests=64 -n poc-dev \
+#     2>&1 | tee -a /tmp/v171-pallas-v4.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v171-pallas-v4 -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v171-pallas-v4
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "60"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v171-pallas-v4
+              declared-duration-minutes: "60"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x16"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v171-pallas-v4
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=mini
+              - --moe_backend=fused_ep_moe_v4
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=16
+              - --tp=2
+              - --gbs=256
+              - --steps=3
+              - --gradient_checkpoint
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x4x16-ep16-fsdp16-tp2-v171-pallas-v4
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

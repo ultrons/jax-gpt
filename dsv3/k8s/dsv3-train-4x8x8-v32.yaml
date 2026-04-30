@@ -1,0 +1,111 @@
+# DS-v3 671B: jax backend, EP=8, FSDP=64, GBS=1024, v50-train.
+#
+# Revert to v28's per-expert gather approach after v29/v30/v31 regressions.
+#
+# The v29-v31 "batched gather" approach was wrong:
+#   - Batching all_sel_x = flat_x[all_safe_tids] creates a 1.88 GB synchronization point.
+#   - XLA cannot pipeline per-expert gather with per-expert matmuls.
+#   - Result: expensive "add_multiply_fusion" (Phase 3 output mask + Phase 4 concat) = 1.49s/step.
+#   - Plus gather_offload_async_done overhead = 0.84s/step.
+#   - Total: +2.33s vs v28's per-expert approach, partially offset by scatter savings -0.74s.
+#   - Net regression: ~+0.94s vs v28.
+#
+# v29: 14.42s/step (+1.10s regression vs v28)
+# v30: 14.26s/step (multiply mask didn't help — XLA still materializes 1.88 GB)
+# v31: 14.18s/step (removing mask only saves 0.08s — add_multiply_fusion was Phase 3+4, not Phase 2!)
+#
+# Root cause of add_multiply_fusion:
+#   - With batched gather, all_sel_x (131072×7168) must be in HBM before expert e can start.
+#   - XLA cannot overlap gather with compute → expert matmuls read from static HBM slices.
+#   - This materializes (expert_output) concat as explicit 1.88 GB → HBM write.
+#   - Per-expert gather: XLA pipelines flat_x[safe_tids_e] with matmul → gather hidden by compute.
+#
+# XLA also already consolidates 32 backward d_flat_x scatter-adds internally (v28 profile showed
+# scatter_custom_fusion.77 uses 61440 real tokens, not 32×4096=131072). So the batched gather
+# provided no backward benefit either.
+#
+# v32 = v28 approach: per-expert gathers + batched Phase 4 forward scatter.
+# Expected: back to 13.32s/step, 1230 TPS/chip (confirmed v28 baseline).
+# Profile: compare with v28 profile to confirm same structure.
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/dsv3-train-4x8x8-v32.yaml
+#
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=dsv3-4x8x8-v32 --prefix=true -f --max-log-requests=64 \
+#     2>&1 | tee -a /tmp/dsv3-4x8x8-v32.log
+#
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset dsv3-4x8x8-v32
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-4x8x8-v32
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 64
+          parallelism: 64
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-4x8x8-v32
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x8x8
+              containers:
+                - name: trainer
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v50-train
+                  imagePullPolicy: Always
+                  command: ["python", "train.py"]
+                  args:
+                    - "--config=full"
+                    - "--moe_backend=jax"
+                    - "--attn_backend=splash"
+                    - "--optimizer=sgd"
+                    - "--fsdp=64"
+                    - "--ep=8"
+                    - "--gbs=1024"
+                    - "--steps=15"
+                    - "--gradient_checkpoint"
+                    - "--profile"
+                    - "--profile_dir=gs://sivaibhav-exp/dsv3/profiles/4x8x8-ep8-fsdp64-gbs1024-v32"
+                    - "--profile_skip=5"
+                    - "--profile_steps=2"
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/4x8x8-ep8-fsdp64-gbs1024-v32"
+                    - name: LIBTPU_INIT_ARGS
+                      value: >-
+                        --xla_tpu_enable_async_collective_fusion=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                        --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                        --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                        --xla_tpu_overlap_compute_collective_tc=true
+                        --xla_enable_async_all_gather=true
+                        --xla_enable_async_all_reduce=true
+                        --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                        --xla_tpu_enable_ag_backward_pipelining=true
+                        --xla_tpu_scoped_vmem_limit_kib=81920
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

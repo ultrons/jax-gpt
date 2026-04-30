@@ -1,0 +1,67 @@
+# Sanity check: initialize distributed JAX on 4x8x8, print device counts.
+# Purpose: trigger cluster scale-up before submitting test-stage1-4x8x8.yaml.
+# Uses existing image (no rebuild needed).
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/sanity-check-stage1.yaml
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=sanity-stage1 --prefix=true -f --max-log-requests=64 \
+#     2>&1 | tee -a /tmp/sanity-stage1.log
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset sanity-stage1
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: sanity-stage1
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 64
+          parallelism: 64
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: sanity-stage1
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x8x8
+              containers:
+                - name: sanity
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v56-train
+                  imagePullPolicy: Always
+                  command: ["python", "-c"]
+                  args:
+                    - |
+                      import jax
+                      jax.distributed.initialize(initialization_timeout=600)
+                      proc = jax.process_index()
+                      total = jax.device_count()
+                      local = jax.local_device_count()
+                      print(f"[proc {proc:3d}/{jax.process_count()}] "
+                            f"total={total} local={local} "
+                            f"backend={jax.default_backend()}")
+                      if proc == 0:
+                          print(f"4x8x8 cluster up: {total} JAX devices across {jax.process_count()} processes")
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

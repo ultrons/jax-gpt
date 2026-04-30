@@ -1,0 +1,3 @@
+FROM gcr.io/tpu-vm-gke-testing/mini-dsv3:nightly-apr17
+COPY test_k.py /test_k.py
+ENTRYPOINT ["python", "/test_k.py"]

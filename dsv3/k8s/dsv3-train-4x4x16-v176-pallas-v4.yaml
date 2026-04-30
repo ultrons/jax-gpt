@@ -1,0 +1,115 @@
+# DSv3 671B mini — Pallas v4 MoE, forward kernel bt 16→64.
+#
+# Fix (commit 2c8ef6d): forward_kernel.py bt cap VMEM limit corrected.
+#
+# Root cause of slow forward kernel compilation (v174):
+#   bt=16 → num_bt = T_local/bt = 65536/16 = 4096 outer Mosaic loop iterations.
+#   Mosaic DMA-ordering analysis may be O(num_bt) → ~40 min compile.
+#
+# Fix: with custom_vjp + Pallas backward (v4), forward and backward run in
+#   separate phases — forward VMEM freed before backward starts. The old 2-instance
+#   JVP safety factor (vmem=30 MB, 60%) was stale.
+#   New: vmem=80 MB (physical), 75% for a2a buffers.
+#   bt: 16 → 64 (bt_max=68, rounds to 64 since 65536%64=0)
+#   num_bt: 4096 → 1024  (4× fewer outer loop iterations)
+#   VMEM at bt=64: ~72 MB < 80 MB ✓
+#
+# Also retains backward kernel grid fix (v174): grid=(E_local,) → 3-deep
+# instead of 4-deep nested fori_loops for the backward kernel.
+#
+# Expected compile time: 10-20 min (both forward and backward kernels now ~2-5 min each)
+# Expected HBM at compile: ~50 GB (well under 94.75 GB limit)
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     apply -f k8s/dsv3-train-4x4x16-v176-pallas-v4.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v176-pallas-v4 --prefix=true -f --max-log-requests=64 -n poc-dev \
+#     2>&1 | tee -a /tmp/v176-pallas-v4.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v176-pallas-v4 -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v176-pallas-v4
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "60"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v176-pallas-v4
+              declared-duration-minutes: "60"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x4x16"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v176-pallas-v4
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=mini
+              - --moe_backend=fused_ep_moe_v4
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=16
+              - --tp=2
+              - --gbs=256
+              - --steps=3
+              - --gradient_checkpoint
+              - --grad_clip=1.0
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x4x16-ep16-fsdp16-tp2-v176-pallas-v4
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

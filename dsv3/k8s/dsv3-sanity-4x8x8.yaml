@@ -1,0 +1,49 @@
+# Minimal sanity check on 4x8x8: just print device count.
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-sanity
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 1
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 64
+          parallelism: 64
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-sanity
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x8x8
+              containers:
+                - name: test
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v7
+                  imagePullPolicy: Always
+                  command: ["python", "-c"]
+                  args:
+                    - |
+                      import jax
+                      jax.distributed.initialize(initialization_timeout=600)
+                      print(f"Process {jax.process_index()}/{jax.process_count()}: {jax.device_count()} devices, {jax.local_device_count()} local")
+                      print(f"Devices: {[str(d) for d in jax.devices()[:4]]}...")
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

@@ -1,0 +1,67 @@
+# Stage 1 correctness test on 4x8x8: DSv3 full config (D=7168, F=2048, E=256, K=8).
+#
+# Tests fused_ep_moe_bwd_streaming at DSv3 full scale:
+#   1. EP=1 (T=32): streaming backward vs ref_moe (per-process, no collectives)
+#   2. EP=8 (T=128): shard_map + lax.psum vs EP=1 streaming reference
+#
+# Topology: 4x8x8 = 64 processes x 8 local devices = 512 JAX devices.
+# Mesh: (64, 8) -> ("fsdp"=64, "model"=8). EP uses "model" axis.
+#
+# Build image first:
+#   sudo docker build -f Dockerfile.tpu \
+#     -t gcr.io/tpu-vm-gke-testing/mini-dsv3:stage1-test .
+#   sudo docker push gcr.io/tpu-vm-gke-testing/mini-dsv3:stage1-test
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/test-stage1-4x8x8.yaml
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=test-stage1 --prefix=true -f --max-log-requests=64 \
+#     2>&1 | tee -a /tmp/test-stage1.log
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete jobset test-stage1
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: test-stage1
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 64
+          parallelism: 64
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: test-stage1
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-flex-start: "true"
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 4x8x8
+              containers:
+                - name: test
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:stage1-test
+                  imagePullPolicy: Always
+                  command: ["python", "/app/test_grad_check_v7x.py"]
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://sivaibhav-exp/dsv3/jax-cc/stage1-test"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

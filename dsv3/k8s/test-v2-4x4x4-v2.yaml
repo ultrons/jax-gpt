@@ -1,0 +1,73 @@
+# streaming_bwd v2 correctness test on bodaborg 4x4x4 (128 devices).
+#
+# Validates fused_ep_moe_bwd_streaming_v2 fix (use full-F gathered weights for d_tok):
+#   Test 1: EP=1, FSDP=4, replicated tokens — baseline sanity
+#   Test 3: EP=2, FSDP=2, partitioned tokens — mirrors model.py _streaming_bwd_fn
+#            d_tok and d_topk must match EP=1 v1 reference after EP psum+slice.
+#
+# Image: v96-test (fixed v2 kernel: all_gather weights used for d_tok, not just d_w)
+# Cluster: bodaborg-super-alpha-cluster (Kueue-managed, 4x4x4 v7x)
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     apply -f k8s/test-v2-4x4x4-v2.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=test-v2-4x4x4-v2 --prefix=true -f --max-log-requests=16 \
+#     2>&1 | tee -a /tmp/test-v2-4x4x4-v2.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset test-v2-4x4x4-v2
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: test-v2-4x4x4-v2
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 16
+          parallelism: 16
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: test-v2-4x4x4-v2
+              annotations:
+                cloud.google.com/gke-tpu-slice-topology: "4x4x4"
+                cloud.google.com/skip-tpu-webhook-check: "true"
+                kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+                kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              tolerations:
+                - key: "google.com/tpu"
+                  value: "present"
+                  operator: "Equal"
+                  effect: "NoSchedule"
+              containers:
+                - name: test
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v96-test
+                  imagePullPolicy: Always
+                  command: ["python", "/app/test_grad_check_v2.py" ]
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://max-experiments/dsv3/jax-cc/test-v2-4x4x4-v2"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

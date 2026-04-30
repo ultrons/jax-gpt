@@ -1,0 +1,58 @@
+# Full DS-v3 671B eval with EP=8 for parallel weight reads.
+# Each of 8 hosts reads only 32 of 256 experts → 8x faster loading.
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv3-eval-ep8
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          completions: 8
+          parallelism: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                app: dsv3-eval-ep8
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x4x4
+              volumes:
+                - name: model-weights
+                  persistentVolumeClaim:
+                    claimName: ds-v3-weights-pvc
+              containers:
+                - name: eval
+                  image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v23-eval
+                  imagePullPolicy: Always
+                  command: ["python", "eval_logits.py"]
+                  args:
+                    - "--model_dir=/mnt/model/DeepSeek-V3"
+                    - "--fsdp=8"
+                    - "--ep=8"
+                  volumeMounts:
+                    - name: model-weights
+                      mountPath: /mnt/model
+                      readOnly: true
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: TRANSFORMERS_OFFLINE
+                      value: "1"
+                  resources:
+                    limits:
+                      google.com/tpu: "4"

@@ -1,0 +1,45 @@
+# Test ragged_all_to_all backward bug on v7x (4 devices per pod).
+# Runs test_ragged_a2a_bwd.py — tests raw A2A bwd and custom_vjp wrapper.
+#
+# Submit:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     apply -f k8s/test-ragged-a2a-v7x.yaml
+#
+# Logs:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     logs -l app=test-ragged-a2a --prefix=true -f
+#
+# Delete:
+#   kubectl --context gke_tpu-vm-gke-testing_us-central1_sivaibhav-exp-v7x \
+#     delete job test-ragged-a2a
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-ragged-a2a
+  namespace: default
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: test-ragged-a2a
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-flex-start: "true"
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 4x4x4
+      containers:
+        - name: test
+          image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v31-train
+          imagePullPolicy: Always
+          command: ["python", "/app/test_ragged_a2a_bwd.py"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            limits:
+              google.com/tpu: "4"

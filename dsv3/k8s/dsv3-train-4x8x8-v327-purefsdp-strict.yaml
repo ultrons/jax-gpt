@@ -1,0 +1,116 @@
+# v327: pure FSDP=512 (EP=1, TP=1), GBS=2048 (8M tokens), strict 1-in-flight
+# async config — falsifies the "115.87G OOM" claim by removing all sources of
+# multi-buffer weight pipeline pressure. If this compiles + runs, we
+# incrementally re-enable flags until we find the real OOM trigger.
+#
+# Predicted compile peak (worst case, 1 in flight): ~30-40 GB on v7x (96 GB).
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v327-purefsdp
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "60"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v327-purefsdp
+              declared-duration-minutes: "60"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x8x8"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v304-auxar
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=full
+              - --moe_backend=gmm_ag
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=512
+              - --ep=1
+              - --tp=1
+              - --gbs=2048
+              - --dtype=bfloat16
+              - --steps=5
+              - --grad_clip=1.0
+              - --gradient_checkpoint
+              - --no_cp
+              - --profile
+              - --profile_dir=gs://max-experiments/dsv3/profiles/v327-purefsdp-ep1-fsdp512-gbs2048-4x8x8/
+              - --profile_skip=2
+              - --profile_steps=1
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x8x8-ep1-fsdp512-tp1-gbs2048-v327
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_scoped_vmem_limit_kib=65536
+                  --xla_tpu_bf16_emission_mode=NATIVE_EMISSION
+                  --xla_tpu_scheduler_percent_shared_memory_limit=100
+                  --xla_max_concurrent_async_all_gathers=1
+                  --xla_max_concurrent_async_reduce_scatters=1
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_reduce_scatter_fusion=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_enable_ici_ag_pipelining=true
+                  --xla_tpu_enable_ici_rs_pipelining=true
+                  --xla_tpu_enable_latency_hiding_layer_scheduler=true
+                  --xla_tpu_enable_3d_reduce_scatter_decomposer=false
+                  --xla_tpu_aggregate_data_dependent_sc_ops=false
+                  --xla_tpu_scheduling_annotation_deannotate_unsupported_groups=true
+                  --xla_tpu_num_sparse_cores_for_gather_offloading=2
+                  --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+                  --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true
+                  --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true
+                  --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true
+                  --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true
+                  --xla_tpu_enable_sparse_core_reduce_scatter_v2=true
+                  --xla_tpu_use_single_sparse_core_for_all_gather_offload=false
+                  --xla_tpu_enable_concurrent_sparse_core_offloading=true
+                  --xla_tpu_enable_offloading_gather_to_sparsecore=true
+                  --xla_tpu_use_tc_device_shape_on_sc=True
+                  --xla_sc_disable_megacore_partitioning=True
+                  --xla_tpu_enable_sparse_core_collective_aggregator=true
+              resources:
+                limits:
+                  google.com/tpu: "4"

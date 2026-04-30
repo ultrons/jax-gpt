@@ -1,0 +1,48 @@
+# ReadOnlyMany PV/PVC for DS-v3 weights disk.
+# Allows all TPU pods in the slice to mount the weights simultaneously.
+#
+# To switch from RWO to ROX:
+#   1. Ensure no pods are using the old PVC
+#   2. kubectl delete pvc ds-v3-weights-pvc
+#   3. kubectl delete pv ds-v3-weights-pv
+#   4. kubectl apply -f k8s/dsv3-weights-readonly.yaml
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ds-v3-weights-pv
+spec:
+  capacity:
+    storage: 2000Gi
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: pd.csi.storage.gke.io
+    fsType: ext4
+    readOnly: true
+    volumeHandle: projects/cloud-tpu-multipod-dev/zones/us-central1-c/disks/ds-v3-weights
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values:
+                - us-central1-c
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ds-v3-weights-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: ""
+  volumeName: ds-v3-weights-pv
+  resources:
+    requests:
+      storage: 2000Gi

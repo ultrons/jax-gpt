@@ -1,0 +1,117 @@
+# DSv3 671B — megablox GMM MoE, FSDP=16 EP=16 TP=2 on 4x8x8, full 671B config.
+#
+# Key changes from v242-rd:
+#   v243: fix 1.05 TB XLA unroll from Python for-loop over vocab chunks.
+#         Root cause of v242 OOM: Python for-loop over 25 vocab chunks is
+#         unrolled by JAX — all 25 iterations appear simultaneously in HLO.
+#         XLA allocates temps for each iteration concurrently → 1.05 TB.
+#         Fix: replace for-loop with jax.lax.scan (XLA While loop).
+#           One chunk alive at a time: (B_l, S_l, 4096) × 4B = 8 GB ✓
+#           JAX scan VJP rematerializes body activations by default → O(1) bwd.
+#           Stacked carries: 25 × 6 MB = 150 MB (negligible).
+#           GSPMD hoists output_head all-gather outside while loop ✓
+#
+#   v242 OOM 1.05 TB: Python for-loop 25 iterations unrolled → 1.05 TB HLO.
+#   v241 OOM 107 GB: megablox_gmm no VJP (ragged_dot fix applied but fwd matmul
+#         also OOMs). Forward x@output_head=(256,2048,102400)=107 GB.
+#   v240 OOM 107 GB: megablox_gmm has no VJP → Jacobian broadcast 107 GB.
+#   v239 OOM 135 GB: FSDP=512, D_moe/fsdp=4 → 32× XLA padding → 50.76 GB params.
+#   v238 SC error: EP=16/FSDP=16 → sorted_x=120 GB > SC 16 GiB limit.
+#   v235b baseline (mini, L=2): 1338 TPS/chip, 1.0% MFU, no OOM, no NaN.
+#
+# Submit:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     -n poc-dev apply -f k8s/dsv3-train-4x8x8-v243-rd.yaml
+# Logs:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     logs -l app=v243-rd --prefix=true -f --max-log-requests=64 -n poc-dev \
+#     2>&1 | tee -a /tmp/v243-rd.log
+# Delete:
+#   kubectl --context gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-alpha-cluster \
+#     delete jobset v243-rd -n poc-dev
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: v243-rd
+  namespace: poc-dev
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: dev
+    value-class: development
+    declared-duration-minutes: "240"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 64
+        parallelism: 64
+        template:
+          metadata:
+            labels:
+              app: v243-rd
+              declared-duration-minutes: "240"
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x8x8"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: poc-dev-priority
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:v243-rd
+              imagePullPolicy: Always
+              command: ["python", "train.py"]
+              args:
+              - --config=full
+              - --moe_backend=ragged_dot
+              - --attn_backend=splash
+              - --optimizer=sgd
+              - --fsdp=16
+              - --ep=16
+              - --tp=2
+              - --gbs=4096
+              - --dtype=bfloat16
+              - --steps=5
+              - --grad_clip=1.0
+              - --gradient_checkpoint
+              env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: gs://max-experiments/dsv3/jax-cc/4x8x8-ep16-fsdp16-tp2-gbs4096-v243-rd
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_scoped_vmem_limit_kib=81920
+              resources:
+                limits:
+                  google.com/tpu: "4"

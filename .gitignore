@@ -23,5 +23,53 @@ dist/
 # Log files
 *.log
 
-# macOS
+# macOS / Windows
 .DS_Store
+Thumbs.db
+
+# Internal AI assistant / agent settings (per-user; never tracked).
+# CLAUDE.md is intentionally tracked when present (project guidance file);
+# .claude/ holds per-user state and must NOT travel via git.
+.claude/
+.aider*
+.cursor/
+.continue/
+.copilot/
+.github-copilot/
+.codeium/
+
+# Editor / IDE
+.vscode/
+.idea/
+.project
+.pydevproject
+.settings/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# HF datasets / model caches (often huge, never commit)
+hf_datasets_cache/
+.cache/
+
+# Vendored / external project trees kept on disk for reference but not tracked.
+dsv3/tpu_inference/
+
+# Secrets
+*.pem
+*.key
+credentials*
+service-account*.json
+.pypirc
+
+# Local junk
+*.tmp
+*.bak
+*.orig
+.python-version
