@@ -1,4 +1,10 @@
-"""Tests for fused DeltaNet Pallas kernel correctness."""
+"""Tests for fused DeltaNet Pallas kernel correctness.
+
+These tests exercise the actual Pallas kernel and require a TPU backend.
+The `pytest.mark.skipif(not _ON_TPU, ...)` marker on the test class skips
+cleanly on CPU-only environments instead of failing with
+`ValueError: Only interpret mode is supported on CPU backend`.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +15,8 @@ from jax_gpt.models.qwen35.kernels.pallas_deltanet import (
     fused_deltanet_step,
     fused_deltanet_step_ref,
 )
+
+_ON_TPU = "tpu" in str(jax.devices()[0]).lower()
 
 
 def _random_inputs(B, H, dk, dv, key=None):
@@ -26,6 +34,10 @@ def _random_inputs(B, H, dk, dv, key=None):
     return state, q, k, v, g_factor, beta
 
 
+@pytest.mark.skipif(
+    not _ON_TPU,
+    reason="Pallas kernel requires TPU backend; CPU falls back to interpret mode only.",
+)
 class TestFusedDeltaNetStep:
     """Test fused Pallas kernel against reference implementation."""
 

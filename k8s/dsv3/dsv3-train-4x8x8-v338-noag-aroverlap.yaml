@@ -48,9 +48,13 @@ spec:
               effect: "NoSchedule"
             containers:
             - name: trainer
-              image: gcr.io/tpu-vm-gke-testing/mini-dsv3:noag-v2
+              # Image rebuilt post-restructure with the new layout (jax_gpt/
+              # package, kernels/ subdirs). To rebuild for v339+:
+              #   sudo docker build -f docker/Dockerfile.dsv3.tpu \
+              #     -t gcr.io/tpu-vm-gke-testing/jax-gpt-dsv3:<tag> .
+              image: gcr.io/tpu-vm-gke-testing/jax-gpt-dsv3:noag-v3
               imagePullPolicy: Always
-              command: ["python", "train.py"]
+              command: ["python", "-m", "jax_gpt.models.dsv3.train"]
               args:
               - --config=full
               - --moe_backend=gmm

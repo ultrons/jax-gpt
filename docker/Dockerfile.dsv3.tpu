@@ -1,9 +1,13 @@
-# Mini DeepSeek-v3 trainer on TPU.
+# DeepSeek-V3 trainer on TPU.
 #
 # Build:
-#   sudo docker build -f Dockerfile.tpu -t gcr.io/tpu-vm-gke-testing/mini-dsv3:v1 .
+#   sudo docker build -f docker/Dockerfile.dsv3.tpu \
+#     -t gcr.io/tpu-vm-gke-testing/jax-gpt-dsv3:<tag> .
 # Push:
-#   sudo docker push gcr.io/tpu-vm-gke-testing/mini-dsv3:v1
+#   sudo docker push gcr.io/tpu-vm-gke-testing/jax-gpt-dsv3:<tag>
+#
+# Run inside the container (matches what k8s/dsv3/*.yaml does):
+#   python -m jax_gpt.models.dsv3.train --config=full ...
 
 FROM python:3.12-slim
 
@@ -13,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install JAX with TPU support + profiling + GCS cache deps.
+# JAX with TPU support + profiling + GCS cache deps.
 # jax 0.10.0 + libtpu 0.0.41.dev20260417: fixes host DMA inside lax.scan
 # (device_put to pinned_host for offloaded gradient checkpoints).
 RUN pip install --upgrade pip && \
@@ -28,44 +32,25 @@ RUN pip install --upgrade pip && \
         tensorflow \
         gcsfs
 
-# Copy only what we need
-COPY mini_dsv3/model.py /app/model.py
-COPY test_ragged_a2a_bwd.py /app/test_ragged_a2a_bwd.py
-COPY mini_dsv3/train.py /app/train.py
-COPY mini_dsv3/load_weights.py /app/load_weights.py
-COPY mini_dsv3/eval_logits.py /app/eval_logits.py
-COPY mini_dsv3/eval_mmlu.py /app/eval_mmlu.py
-COPY mini_dsv3/compare_layers.py /app/compare_layers.py
-# Vendored MaxText kernels: SC gather-reduce + sort/route helpers
-COPY mini_dsv3/kernels /app/kernels
-
-# Pallas backward kernel (Stage C/D): fused_ep_moe_bwd with D-tiling
-COPY fused_moe_bwd/backward_kernel.py /app/backward_kernel.py
-COPY fused_moe_bwd/backward.py /app/backward.py
-# Pallas forward kernel (streaming v1): FSDP-sharded weights, EP A2A pipeline
-# fwd_kernel_train.py: grid-based training kernel (grid-lift for fast Mosaic compile)
-COPY fused_moe_bwd/fwd_kernel_train.py /app/fwd_kernel_train.py
-COPY fused_moe_bwd/forward_kernel.py /app/forward_kernel.py
-COPY fused_moe_bwd/test_grad_check_phase2.py /app/test_grad_check_phase2.py
-# Pallas backward kernel v3: fully-fused A2A (tokens+d_out scatter, d_tokens gather)
-COPY fused_moe_bwd/backward_kernel_v3.py /app/backward_kernel_v3.py
-COPY fused_moe_bwd/test_bwd_v3.py /app/test_bwd_v3.py
-# Pallas backward kernel v4: bins layout, D-tile outer, VMEM zero-init accumulation
-COPY fused_moe_bwd/backward_kernel_v4.py /app/backward_kernel_v4.py
-
-# Stage 1: per-expert streaming backward correctness tests
-COPY fused_moe_bwd/test_grad_check_stage1.py /app/test_grad_check_stage1.py
-COPY fused_moe_bwd/test_grad_check_v7x.py /app/test_grad_check_v7x.py
-COPY fused_moe_bwd/test_grad_check_v2.py /app/test_grad_check_v2.py
-COPY fused_moe_bwd/sanity_check_devices.py /app/sanity_check_devices.py
-COPY fused_moe_bwd/test_sc_gather_rows.py /app/test_sc_gather_rows.py
-
-# fused_ep_moe forward kernel (needed by make_fused_ep_moe_train_v2 and ref_moe)
-COPY tpu_inference /app/tpu_inference
-
-# For weight loading + eval: transformers, safetensors, datasets
+# Weight loading + eval deps.
 RUN pip install transformers safetensors sentencepiece datasets -q
 
-ENV PYTHONUNBUFFERED=1
+# ── Copy the source tree ──────────────────────────────────────────────────
+# Post-restructure (commits 4290b00, 3c0870b, 49d6949), the dsv3 model lives
+# at jax_gpt/models/dsv3/ with kernels in jax_gpt/models/dsv3/kernels/
+# (including fused_moe_bwd/). We copy the full package so relative imports
+# (`from .model import ...`) and `python -m jax_gpt.models.dsv3.train` work.
+COPY jax_gpt /app/jax_gpt
 
-ENTRYPOINT ["python", "train.py"]
+# Vendored fused_ep_moe forward kernel (from external tpu-inference repo).
+# Lives at dsv3/tpu_inference/ on disk (gitignored — present locally as a
+# reference vendor copy). The dsv3/kernels/fused_moe_bwd/ tests import it
+# via `from tpu_inference.kernels...` so we expose it on PYTHONPATH.
+COPY dsv3/tpu_inference /app/tpu_inference
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+# Entrypoint = the dsv3 trainer. k8s YAMLs override with the same command
+# (or with custom args) — see k8s/dsv3/dsv3-train-*.yaml.
+ENTRYPOINT ["python", "-m", "jax_gpt.models.dsv3.train"]
