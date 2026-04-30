@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 
 from jax_gpt.models.qwen35.fp8 import matmul_maybe_fp8
-from jax_gpt.models.qwen35.pallas_deltanet import fused_deltanet_step
+from jax_gpt.models.qwen35.kernels.pallas_deltanet import fused_deltanet_step
 
 
 def _l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:

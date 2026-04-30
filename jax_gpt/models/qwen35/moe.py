@@ -92,7 +92,7 @@ def _fp8_gmm_components(w):
 def _gmm_matmul(x, w, group_sizes, rhs_scale=None, group_offset=None,
                 rhs_group_offset=None):
     """Single gmm_v2 matmul. Lazy-imported to avoid top-level Pallas import."""
-    from jax_gpt.models.qwen35.megablox import gmm_v2
+    from jax_gpt.models.qwen35.kernels.megablox import gmm_v2
     return gmm_v2(
         x, w, group_sizes,
         rhs_scale=rhs_scale,

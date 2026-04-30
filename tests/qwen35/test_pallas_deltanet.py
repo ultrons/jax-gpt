@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jax_gpt.models.qwen35.pallas_deltanet import (
+from jax_gpt.models.qwen35.kernels.pallas_deltanet import (
     fused_deltanet_step,
     fused_deltanet_step_ref,
 )
