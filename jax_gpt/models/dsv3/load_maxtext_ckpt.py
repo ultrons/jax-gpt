@@ -259,13 +259,46 @@ def load_maxtext_dsv3(ckpt_path: str, cfg: ModelConfig, mesh: Mesh) -> dict:
     print("  building abstract target from manifest shardings ...")
     abstract = _build_abstract_target_from_manifest(metadata, restore_mesh)
 
-    # 4. Restore (multi-host, manifest-driven)
-    print("  restoring ...")
-    raw = ocp.PyTreeCheckpointer().restore(
-        ckpt_path,
-        args=ocp.args.PyTreeRestore(item=abstract),
+    # 4. Restore — use the v0 API path that MaxText uses
+    # (src/maxtext/common/checkpointing.py:_load_full_state_from_path,
+    # the `else` branch). The plain PyTreeCheckpointer().restore(args=
+    # PyTreeRestore(item=abstract)) path does NOT respect the abstract's
+    # sharding for tensorstore chunk reads — it falls back to save-time
+    # sharding, which leaves most hosts with no addressable shards when
+    # restoring from a 16-fsdp save onto our 512-core cluster.
+    #
+    # The fix: explicit `restore_args` with ArrayRestoreArgs(sharding=...)
+    # per leaf, on a PyTreeCheckpointHandler with use_ocdbt=True.
+    print("  building per-leaf ArrayRestoreArgs ...")
+
+    def _make_restore_args(x):
+        if isinstance(x, jax.ShapeDtypeStruct) and x.sharding is not None:
+            return ocp.type_handlers.ArrayRestoreArgs(sharding=x.sharding)
+        return ocp.RestoreArgs()
+
+    restore_args = jax.tree_util.tree_map(
+        _make_restore_args, abstract,
+        is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct))
+
+    handler = ocp.PyTreeCheckpointHandler(use_ocdbt=True)
+    print("  restoring (Checkpointer + per-leaf ArrayRestoreArgs) ...")
+    raw = ocp.Checkpointer(handler).restore(
+        ckpt_path, abstract, restore_args=restore_args,
     )
     print("  restore complete; mapping MaxText tree → our params ...")
+
+    # Free opt_state (Adam m,v ≈ 2-3x params = ~3 TB) and the unused MTP head
+    # before we start re-sharding params (which briefly holds source +
+    # destination copies). gc.collect() is needed for JAX HBM to actually be
+    # released — `del` alone doesn't trigger XLA dealloc.
+    import gc
+    if "opt_state" in raw:
+        print("  freeing opt_state ...")
+        del raw["opt_state"]
+    if "mtp_block" in raw.get("params", {}).get("params", {}):
+        print("  freeing mtp_block ...")
+        del raw["params"]["params"]["mtp_block"]
+    gc.collect()
 
     # 5. Map MaxText tree → our params, re-sharded onto serving mesh
     p = raw["params"]["params"]
