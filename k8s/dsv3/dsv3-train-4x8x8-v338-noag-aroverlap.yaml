@@ -52,7 +52,7 @@ spec:
               # package, kernels/ subdirs). To rebuild for v339+:
               #   sudo docker build -f docker/Dockerfile.dsv3.tpu \
               #     -t gcr.io/tpu-vm-gke-testing/jax-gpt-dsv3:<tag> .
-              image: gcr.io/tpu-vm-gke-testing/jax-gpt-dsv3:noag-v3
+              image: gcr.io/tpu-vm-gke-testing/jax-gpt-dsv3:noag-v4
               imagePullPolicy: Always
               command: ["python", "-m", "jax_gpt.models.dsv3.train"]
               args:

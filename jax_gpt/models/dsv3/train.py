@@ -482,16 +482,16 @@ def main():
     cfg.moe_n_chunks = args.moe_n_chunks
     if args.moe_shard_e_with_fsdp:
         cfg.moe_shard_e_with_fsdp = True
-        import model as _model
+        from . import model as _model
         _model._SHARD_E_WITH_FSDP = True
     if args.moe_shard_d_with_fsdp:
-        import model as _model
+        from . import model as _model
         _model._SHARD_D_WITH_FSDP = True
     if args.moe_fp8_weights:
         cfg.moe_fp8_weights = True
     if args.moe_no_weight_ag:
         cfg.moe_no_weight_ag = True
-        import model as _model
+        from . import model as _model
         _model._MOE_NO_WEIGHT_AG = True
 
     shard_cfg = ShardConfig(fsdp=args.fsdp, ep=args.ep, tp=args.tp,
