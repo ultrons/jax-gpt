@@ -34,6 +34,8 @@ RUN pip install --upgrade pip && \
 
 # Weight loading + eval deps.
 RUN pip install transformers safetensors sentencepiece datasets -q
+# orbax for MaxText DSv3 checkpoint reading (eval_maxtext_lm_loss.py).
+RUN pip install "orbax-checkpoint" -q
 
 # ── Copy the source tree ──────────────────────────────────────────────────
 # Post-restructure (commits 4290b00, 3c0870b, 49d6949), the dsv3 model lives
