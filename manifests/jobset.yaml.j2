@@ -1,0 +1,163 @@
+{# JobSet template for jax-gpt-dsv3.
+
+   Substitutions provided by `cde run`:
+     run_id, image, team, value_class, declared_minutes, namespace,
+     priority_class, tpu_type, num_slices, overrides (dict), env (list).
+#}
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: {{ run_id }}
+  namespace: {{ namespace }}
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+    team: {{ team }}
+    value-class: {{ value_class }}
+    declared-duration-minutes: "{{ declared_minutes }}"
+    cde.io/run-id: {{ run_id }}
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: {{ num_slices }}
+    template:
+      spec:
+        parallelism: 64
+        completions: 64
+        backoffLimit: 0
+        completionMode: Indexed
+        template:
+          metadata:
+            labels:
+              app: {{ run_id }}
+              declared-duration-minutes: "{{ declared_minutes }}"
+              cde.io/run-id: {{ run_id }}
+            annotations:
+              cloud.google.com/gke-tpu-slice-topology: "4x8x8"
+              cloud.google.com/skip-tpu-webhook-check: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gce-topology-block
+              kueue.x-k8s.io/podset-slice-required-topology: cloud.google.com/gke-tpu-partition-4x4x4-id
+              kueue.x-k8s.io/podset-slice-size: "16"
+          spec:
+            priorityClassName: {{ priority_class }}
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            tolerations:
+            - key: "google.com/tpu"
+              value: "present"
+              operator: "Equal"
+              effect: "NoSchedule"
+            containers:
+            - name: trainer
+              image: {{ image }}
+              imagePullPolicy: Always
+              {# Default entrypoint = the dsv3 trainer; override per-run via
+                 --set entrypoint_module=jax_gpt.models.dsv3.eval_lm_loss
+                 (or any other python -m target). #}
+              command: ["python", "-m", "{{ overrides.get('entrypoint_module', 'jax_gpt.models.dsv3.train') }}"]
+              args:
+                {%- for k, v in overrides.items() %}
+                {%- if k not in ('namespace', 'priority_class', 'gradient_checkpoint', 'no_cp') %}
+                - "--{{ k }}={{ v }}"
+                {%- endif %}
+                {%- endfor %}
+                {# Boolean flags rendered as bare --flag #}
+                {%- if overrides.get('gradient_checkpoint', True) %}
+                - "--gradient_checkpoint"
+                {%- endif %}
+                {%- if overrides.get('no_cp', True) %}
+                - "--no_cp"
+                {%- endif %}
+                {# Profile output dir auto-wired from cde profile.base-uri #}
+                {%- for e in env %}
+                {%- if e.name == 'JAX_PROFILER_DIR' %}
+                - "--profile"
+                - "--profile_dir={{ e.value }}"
+                - "--profile_skip=2"
+                - "--profile_steps=1"
+                {%- endif %}
+                {%- endfor %}
+              env:
+              - name: CDE_RUN_ID
+                value: "{{ run_id }}"
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: JAX_TRACEBACK_FILTERING
+                value: "off"
+              - name: JAX_COMPILATION_CACHE_DIR
+                value: "gs://max-experiments/dsv3/jax-cc/cde-{{ run_id }}"
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_scoped_vmem_limit_kib=65536
+                  --xla_tpu_bf16_emission_mode=NATIVE_EMISSION
+                  --xla_tpu_num_sparse_cores_for_gather_offloading=2
+                  --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+                  --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true
+                  --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true
+                  --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true
+                  --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true
+                  --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true
+                  --xla_tpu_enable_sparse_core_reduce_scatter_v2=true
+                  --xla_tpu_use_single_sparse_core_for_all_gather_offload=false
+                  --xla_tpu_enable_concurrent_sparse_core_offloading=true
+                  --xla_tpu_enable_offloading_gather_to_sparsecore=true
+                  --xla_tpu_use_tc_device_shape_on_sc=True
+                  --xla_sc_disable_megacore_partitioning=True
+                  --xla_tpu_enable_sparse_core_collective_aggregator=true
+                  --xla_tpu_enable_latency_hiding_layer_scheduler=true
+                  --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true
+                  --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true
+                  --xla_tpu_rerun_latency_hiding_scheduler_post_sc_assignment=true
+                  --xla_tpu_scheduler_percent_shared_memory_limit=150
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true
+                  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=false
+                  --xla_tpu_enable_async_collective_fusion_fuse_reduce_scatter=true
+                  --xla_enable_async_reduce_scatter_fusion=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_enable_async_all_gather=true
+                  --xla_enable_async_all_reduce=true
+                  --xla_tpu_prefer_async_allgather_to_allreduce=true
+                  --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                  --xla_tpu_enable_ag_backward_pipelining=true
+                  --xla_tpu_enable_ici_ag_pipelining=true
+                  --xla_tpu_enable_ici_rs_pipelining=true
+                  --xla_max_concurrent_async_all_gathers=2
+                  --xla_max_concurrent_async_reduce_scatters=2
+                  --xla_tpu_pcie_bandwidth_multiplier=0.03
+                  --xla_tpu_sparse_core_all_gather_latency_multiplier=1
+                  --xla_tpu_sparse_core_reduce_scatter_latency_multiplier=3
+                  --xla_tpu_enable_3d_reduce_scatter_decomposer=false
+                  --xla_tpu_enable_all_gather_offload_tracing=false
+                  --xla_tpu_enable_all_reduce_offload_tracing=false
+                  --xla_tpu_aggregate_data_dependent_sc_ops=false
+                  --xla_tpu_scheduling_annotation_deannotate_unsupported_groups=true
+              {%- for e in env %}
+              {%- if e.name not in ('CDE_RUN_ID', 'PYTHONUNBUFFERED', 'JAX_TRACEBACK_FILTERING', 'JAX_COMPILATION_CACHE_DIR', 'TF_CPP_MIN_LOG_LEVEL', 'LIBTPU_INIT_ARGS', 'JAX_PROFILER_DIR') %}
+              - name: {{ e.name }}
+                value: "{{ e.value }}"
+              {%- endif %}
+              {%- endfor %}
+              {# HF DSv3 weights live in the cluster PVC ds-v3-weights-pvc.
+                 Mount it when the workload needs them (eval / load_hf_weights).
+                 Set --set mount_weights=true to enable. #}
+              {%- if overrides.get('mount_weights', False) %}
+              volumeMounts:
+                - name: model-weights
+                  mountPath: /mnt/model
+                  readOnly: true
+              {%- endif %}
+              resources:
+                limits:
+                  google.com/tpu: "4"
+        {%- if overrides.get('mount_weights', False) %}
+            volumes:
+              - name: model-weights
+                persistentVolumeClaim:
+                  claimName: ds-v3-weights-pvc
+        {%- endif %}

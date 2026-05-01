@@ -3180,11 +3180,20 @@ _vocab_ce.defvjp(_vocab_ce_fwd, _vocab_ce_bwd)
 
 
 def compute_loss(params, tokens, cfg: ModelConfig):
-    """Cross-entropy loss + MoE auxiliary load-balancing loss."""
+    """Cross-entropy loss + MoE auxiliary load-balancing loss.
+
+    Returns (total_loss, aux) where aux = {'lm_loss': ..., 'aux_loss': ...} so
+    callers using `jax.value_and_grad(compute_loss, has_aux=True)` can report
+    the LM and MoE-balance components separately. Critical for diagnosing
+    whether a high reported loss reflects a forward-pass issue (LM term high)
+    or just the expected pre-training MoE imbalance penalty (aux term high).
+    """
     x_final, aux_loss = forward(params, tokens, cfg, return_final_x=True)
     x_pred  = x_final[:, :-1]                          # (B_l, S_l, D)
     B_l, S_l = x_pred.shape[:2]
     targets = tokens[:, 1:1+S_l].astype(jnp.int32)    # (B_l, S_l)
     V_CHUNK  = 4096
     n_chunks = cfg.V // V_CHUNK                         # 102400 // 4096 = 25
-    return _vocab_ce(x_pred, params["output_head"], targets, n_chunks, V_CHUNK) + aux_loss
+    lm_loss = _vocab_ce(x_pred, params["output_head"], targets, n_chunks, V_CHUNK)
+    total = lm_loss + aux_loss
+    return total, {"lm_loss": lm_loss, "aux_loss": aux_loss}

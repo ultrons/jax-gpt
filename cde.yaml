@@ -1,0 +1,44 @@
+# cde.yaml — jax-gpt DSv3 training iteration
+
+project: jax-gpt-dsv3
+
+image:
+  registry: gcr.io/tpu-vm-gke-testing
+  name: jax-gpt-dsv3
+  dockerfile: ./docker/Dockerfile.dsv3.tpu
+  context: .
+
+template: ./manifests/jobset.yaml.j2
+
+team: dev
+
+defaults:
+  value-class: development
+  declared-duration-minutes: 240
+  tpu-type: tpu7x-256
+  num-slices: 1
+
+# Override cde's team→namespace derivation to match the existing
+# bodaborg-super-rbq cluster's quota setup (namespace stayed as poc-dev
+# from the original team-quota chart instance).
+defaults_overrides:
+  namespace: poc-dev
+  priority_class: poc-dev-priority
+
+  # v304-auxar reproduction defaults (override per-run with --set).
+  config: full
+  moe_backend: gmm_ag
+  attn_backend: splash
+  optimizer: sgd
+  fsdp: 128
+  ep: 4
+  tp: 1
+  gbs: 4096
+  dtype: bfloat16
+  steps: 5
+  grad_clip: 1.0
+
+profile:
+  base-uri: gs://max-experiments/dsv3/profiles
+
+history: {}

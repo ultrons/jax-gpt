@@ -192,44 +192,56 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
         if n_accum > 1:
             print(f"Gradient accumulation: {n_accum} micro-batches")
 
+        # compute_loss now returns (total, {'lm_loss', 'aux_loss'}) — pass
+        # has_aux=True through value_and_grad and propagate the aux dict so
+        # train_step reports LM and MoE-balance terms separately.
         if args.optimizer == "adamw":
             @jax.jit
             def train_step(params, tokens, opt_state):
                 if n_accum > 1:
-                    # Split batch into micro-batches, accumulate grads
                     micros = tokens.reshape(n_accum, B // n_accum, cfg.S)
                     def _accum_body(carry, micro_tokens):
-                        acc_grads, acc_loss = carry
-                        loss, grads = jax.value_and_grad(compute_loss)(params, micro_tokens, cfg)
+                        acc_grads, acc_loss, acc_aux = carry
+                        (loss, aux), grads = jax.value_and_grad(
+                            compute_loss, has_aux=True)(params, micro_tokens, cfg)
                         acc_grads = jax.tree.map(lambda a, g: a + g, acc_grads, grads)
-                        return (acc_grads, acc_loss + loss), None
+                        acc_aux = jax.tree.map(lambda a, x: a + x, acc_aux, aux)
+                        return (acc_grads, acc_loss + loss, acc_aux), None
                     zero_grads = jax.tree.map(jnp.zeros_like, params)
-                    (grads, total_loss), _ = jax.lax.scan(
-                        _accum_body, (zero_grads, jnp.float32(0.0)), micros)
+                    zero_aux = {"lm_loss": jnp.float32(0.0), "aux_loss": jnp.float32(0.0)}
+                    (grads, total_loss, total_aux), _ = jax.lax.scan(
+                        _accum_body, (zero_grads, jnp.float32(0.0), zero_aux), micros)
                     grads = jax.tree.map(lambda g: g / n_accum, grads)
                     loss = total_loss / n_accum
+                    aux = jax.tree.map(lambda x: x / n_accum, total_aux)
                 else:
-                    loss, grads = jax.value_and_grad(compute_loss)(params, tokens, cfg)
+                    (loss, aux), grads = jax.value_and_grad(
+                        compute_loss, has_aux=True)(params, tokens, cfg)
                 params, opt_state = adam_step(
                     params, grads, opt_state, lr=args.lr)
-                return params, loss, opt_state
+                return params, loss, aux, opt_state
         else:
             @jax.jit
             def train_step(params, tokens):
                 if n_accum > 1:
                     micros = tokens.reshape(n_accum, B // n_accum, cfg.S)
                     def _accum_body(carry, micro_tokens):
-                        acc_grads, acc_loss = carry
-                        loss, grads = jax.value_and_grad(compute_loss)(params, micro_tokens, cfg)
+                        acc_grads, acc_loss, acc_aux = carry
+                        (loss, aux), grads = jax.value_and_grad(
+                            compute_loss, has_aux=True)(params, micro_tokens, cfg)
                         acc_grads = jax.tree.map(lambda a, g: a + g, acc_grads, grads)
-                        return (acc_grads, acc_loss + loss), None
+                        acc_aux = jax.tree.map(lambda a, x: a + x, acc_aux, aux)
+                        return (acc_grads, acc_loss + loss, acc_aux), None
                     zero_grads = jax.tree.map(jnp.zeros_like, params)
-                    (grads, total_loss), _ = jax.lax.scan(
-                        _accum_body, (zero_grads, jnp.float32(0.0)), micros)
+                    zero_aux = {"lm_loss": jnp.float32(0.0), "aux_loss": jnp.float32(0.0)}
+                    (grads, total_loss, total_aux), _ = jax.lax.scan(
+                        _accum_body, (zero_grads, jnp.float32(0.0), zero_aux), micros)
                     grads = jax.tree.map(lambda g: g / n_accum, grads)
                     loss = total_loss / n_accum
+                    aux = jax.tree.map(lambda x: x / n_accum, total_aux)
                 else:
-                    loss, grads = jax.value_and_grad(compute_loss)(params, tokens, cfg)
+                    (loss, aux), grads = jax.value_and_grad(
+                        compute_loss, has_aux=True)(params, tokens, cfg)
                 if args.grad_clip is not None:
                     grad_norm = jnp.sqrt(sum(
                         jnp.sum(g.astype(jnp.float32) ** 2)
@@ -240,7 +252,7 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
                 params = jax.tree.map(
                     lambda p, g: (p.astype(jnp.float32) - args.lr * g.astype(jnp.float32)).astype(p.dtype),
                     params, grads)
-                return params, loss
+                return params, loss, aux
 
         # Synthetic data
         def make_batch(key):
@@ -258,9 +270,9 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
         print("  [DBG] calling train_step (XLA compilation starts)", flush=True)
         try:
             if args.optimizer == "adamw":
-                params, loss, opt_state = train_step(params, tokens, opt_state)
+                params, loss, aux, opt_state = train_step(params, tokens, opt_state)
             else:
-                params, loss = train_step(params, tokens)
+                params, loss, aux = train_step(params, tokens)
             print("  [DBG] train_step returned (compilation done, awaiting exec)", flush=True)
             loss.block_until_ready()
             print("  [DBG] block_until_ready done", flush=True)
@@ -270,7 +282,8 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
             traceback.print_exc()
             raise
         compile_time = time.time() - t0
-        print(f"Compilation: {compile_time:.1f}s, initial loss: {loss:.3f}")
+        print(f"Compilation: {compile_time:.1f}s, initial loss: {loss:.3f} "
+              f"(lm={float(aux['lm_loss']):.3f}, aux={float(aux['aux_loss']):.4f})")
 
         # Profiling setup
         profile_active = False
@@ -293,9 +306,9 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
 
             t0 = time.time()
             if args.optimizer == "adamw":
-                params, loss, opt_state = train_step(params, tokens, opt_state)
+                params, loss, aux, opt_state = train_step(params, tokens, opt_state)
             else:
-                params, loss = train_step(params, tokens)
+                params, loss, aux = train_step(params, tokens)
             loss.block_until_ready()
             step_time = time.time() - t0
 
@@ -332,7 +345,8 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
                   f"MFU: {mfu_str}, "
                   f"TPS/chip: {chip_tps:.1f}, "
                   f"cluster_TPS: {cluster_tps:.0f}, "
-                  f"loss: {loss:.3f}")
+                  f"loss: {loss:.3f} "
+                  f"(lm={float(aux['lm_loss']):.3f}, aux={float(aux['aux_loss']):.4f})")
 
         # Final summary
         print(f"\n{'='*70}")
