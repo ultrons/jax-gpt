@@ -70,7 +70,10 @@ def main():
     # MUST set vocab=129280 BEFORE init/load — output_head & embed shapes depend on it.
     cfg = full_671b_config()
     cfg.V = 129280                      # MaxText DSv3 vocab
-    cfg.moe_backend = "jax"             # einsum backend works under any FSDP/EP
+    # gmm_ag matches v304 training and avoids the _moe_jax_ep code path,
+    # whose `from backward_kernel import sc_gather_rows` (model.py:735) fails
+    # in our pod (PYTHONPATH=/app, but kernel lives at .kernels.fused_moe_bwd).
+    cfg.moe_backend = "gmm_ag"
     cfg.gradient_checkpoint = False     # inference only
 
     shard_cfg = ShardConfig(fsdp=args.fsdp, ep=args.ep, tp=args.tp)
