@@ -99,19 +99,26 @@ def main():
         ids.append(pad_id)
     if len(ids) > cfg.S:
         ids = ids[:cfg.S]
-    tokens = jnp.array([ids], dtype=jnp.int32)  # (B=1, S)
 
+    # Activation sharding constraints in our forward use P('fsdp', 'ep', None)
+    # for (B, S, D) hidden states. B=1 can't be sharded across fsdp=128 (t5
+    # IndivisibleError). Tile to B = fsdp*ep so every replica sees the same
+    # data — final per-token CE is identical, just computed redundantly.
+    B = args.fsdp * args.ep
+    tokens = jnp.tile(jnp.array([ids], dtype=jnp.int32), (B, 1))  # (B, S)
     print(f"\nReal-text tokens: {real_len} / {cfg.S} (padded with id={pad_id})")
+    print(f"  Tiled batch to B={B} to match fsdp*ep activation sharding.")
     print(f"  max id: {max(DEFAULT_IDS)}, min id: {min(DEFAULT_IDS)}")
 
     # ── Forward + LM CE on the real-text positions only ──────────────────
     print("\nRunning forward pass...")
     t0 = time.time()
     x_final, aux_loss = forward(params, tokens, cfg, return_final_x=True)
-    x_pred = x_final[:, :-1]
+    # Use just batch row 0 — all rows are identical.
+    x_pred = x_final[:1, :-1]
     real_S = max(1, real_len - 1)
     x_pred_real = x_pred[:, :real_S, :]
-    targets_real = tokens[:, 1:1 + real_S].astype(jnp.int32)
+    targets_real = tokens[:1, 1:1 + real_S].astype(jnp.int32)
 
     V_CHUNK = 4096
     n_chunks = cfg.V // V_CHUNK     # 31 for V=129280; trailing 2304 dims unused (test ids < 126976)
