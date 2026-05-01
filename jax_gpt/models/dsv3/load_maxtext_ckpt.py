@@ -183,13 +183,18 @@ def _per_layer_mla(d, mesh: Mesh) -> dict:
 
 
 def _per_layer_dense_ffn(d, mesh: Mesh) -> dict:
-    wi0 = _move_layer_axis_to_front(d["mlp"]["wi_0"]["kernel"], layer_axis=1)
+    # init_params layout (model.py:2798-2800):
+    #   wi_gate, wi_up:  (L, D=7168, D_mlp=18432)
+    #   wo_mlp:          (L, D_mlp=18432, D=7168)
+    # MaxText after moveaxis(L→0): MATCHES exactly. No swap needed.
+    # FSDP shards dim 1 of each (per init_params._col / _row = P("fsdp", None)).
+    wi0 = _move_layer_axis_to_front(d["mlp"]["wi_0"]["kernel"], layer_axis=1)  # (L, D, D_mlp)
     wi1 = _move_layer_axis_to_front(d["mlp"]["wi_1"]["kernel"], layer_axis=1)
-    wo  = _move_layer_axis_to_front(d["mlp"]["wo"]["kernel"],  layer_axis=1)
+    wo  = _move_layer_axis_to_front(d["mlp"]["wo"]["kernel"],  layer_axis=1)   # (L, D_mlp, D)
     return {
         "wi_gate": _shard(wi0, mesh, P(None, "fsdp", None)),
         "wi_up":   _shard(wi1, mesh, P(None, "fsdp", None)),
-        "wo_mlp":  _shard(wo,  mesh, P(None, None, "fsdp")),
+        "wo_mlp":  _shard(wo,  mesh, P(None, "fsdp", None)),
     }
 
 
@@ -198,9 +203,18 @@ def _per_layer_moe(d, mesh: Mesh) -> dict:
     block = moe["MoeBlock_0"]
     gate_kernel = _move_layer_axis_to_front(block["gate"]["kernel"], layer_axis=1)
     gate_bias   = _move_layer_axis_to_front(block["gate"]["bias"],   layer_axis=1)
-    wi_0 = jnp.moveaxis(block["wi_0"], 1, 0)  # (E, L, D, D_moe) → (L, E, D, D_moe)
-    wi_1 = jnp.moveaxis(block["wi_1"], 1, 0)
-    wo   = jnp.moveaxis(block["wo"],   1, 0)
+    # init_params layout (model.py:2816-2822): ALL THREE MoE weights are
+    # (E, D_moe=2048, D=7168) — D_moe first, D last. Sharded P("ep", "fsdp", None).
+    # MaxText:
+    #   wi_0/1: (E, L, D=7168, D_moe=2048)  — D before D_moe.  → SWAP needed.
+    #   wo:     (E, L, D_moe=2048, D=7168)  — D_moe before D. → no swap.
+    wi_0 = jnp.moveaxis(block["wi_0"], 1, 0).swapaxes(-1, -2)  # (E,L,D,D_moe)→(L,E,D_moe,D)
+    wi_1 = jnp.moveaxis(block["wi_1"], 1, 0).swapaxes(-1, -2)
+    wo   = jnp.moveaxis(block["wo"],   1, 0)                   # (E,L,D_moe,D)→(L,E,D_moe,D)
+    # Shared experts (3-D, per-layer):
+    #   shared_wi_0/1: (L, D=7168, D_moe=2048)  ← matches init_params (D, D_moe).
+    #   shared_wo:     (L, D_moe=2048, D=7168)  ← matches init_params (D_moe, D).
+    # MaxText after moveaxis(L→0) MATCHES — no swap.
     shared = moe["shared_experts"]
     shared_wi0 = _move_layer_axis_to_front(shared["wi_0"]["kernel"], layer_axis=1)
     shared_wi1 = _move_layer_axis_to_front(shared["wi_1"]["kernel"], layer_axis=1)
@@ -210,10 +224,10 @@ def _per_layer_moe(d, mesh: Mesh) -> dict:
         "gate_bias":   _shard(gate_bias,   mesh, P(None, None)),
         "wi_0":        _shard(wi_0, mesh, P(None, "ep", "fsdp", None)),
         "wi_1":        _shard(wi_1, mesh, P(None, "ep", "fsdp", None)),
-        "wo":          _shard(wo,   mesh, P(None, "ep", None, "fsdp")),
+        "wo":          _shard(wo,   mesh, P(None, "ep", "fsdp", None)),
         "shared_wi_0": _shard(shared_wi0, mesh, P(None, "fsdp", None)),
         "shared_wi_1": _shard(shared_wi1, mesh, P(None, "fsdp", None)),
-        "shared_wo":   _shard(shared_wo,  mesh, P(None, None, "fsdp")),
+        "shared_wo":   _shard(shared_wo,  mesh, P(None, "fsdp", None)),
     }
 
 
