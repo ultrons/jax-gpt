@@ -84,6 +84,13 @@ def main():
     # experts than the model was trained for → very high aux + bad LM CE.
     cfg.n_routing_groups = 8
     cfg.topk_routing_group = 4
+    # YaRN-modified attention softmax scale (MaxText's MLA: rope_factor=40,
+    # mscale=1.0). Effective scale ≈ 0.1352 vs vanilla 0.0722 → ~1.87x
+    # sharper softmax. The model was trained with this; without it, attention
+    # is too flat → high LM CE.
+    cfg.use_yarn_scale = True
+    cfg.attn_mscale = 1.0
+    cfg.rope_factor = 40.0
 
     shard_cfg = ShardConfig(fsdp=args.fsdp, ep=args.ep, tp=args.tp)
     mesh = shard_cfg.create_mesh()

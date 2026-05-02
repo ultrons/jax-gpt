@@ -102,6 +102,14 @@ class ModelConfig:
     # top-K). MaxText DSv3 671B uses (8, 4). Default -1 preserves v304.
     n_routing_groups: int = -1
     topk_routing_group: int = -1
+    # MLA softmax scale: when use_yarn_scale=True, apply MaxText's YaRN-
+    # adjusted scale = (1/sqrt(qk_dim)) * (0.1 * attn_mscale * log(rope_factor) + 1.0)^2.
+    # MaxText DSv3 671B: rope_factor=40, attn_mscale=1.0 → effective scale
+    # ≈ 0.1352 (vs vanilla 0.0722, ~1.87× sharper softmax). Default off for
+    # v304 backward-compat.
+    use_yarn_scale: bool = False
+    attn_mscale: float = 1.0
+    rope_factor: float = 1.0
     # Backend
     moe_backend: str = "jax"     # "jax" | "fused_ep_moe_v4"
     attn_backend: str = "splash" # "splash" | "jax"
@@ -340,6 +348,18 @@ def rms_norm(x, weight, eps: float = 1e-6):
 # MLA Attention
 # ============================================================================
 
+def _attention_softmax_scale(cfg) -> float:
+    """Softmax scale used in MLA. Defaults to 1/sqrt(qk_dim). With YaRN
+    (cfg.use_yarn_scale), applies MaxText DSv3 671B formula:
+        scale = (1/sqrt(qk_dim)) * (0.1 * attn_mscale * log(rope_factor) + 1.0)^2
+    """
+    base = 1.0 / math.sqrt(cfg.qk_dim)
+    if not cfg.use_yarn_scale:
+        return base
+    m = 0.1 * cfg.attn_mscale * math.log(cfg.rope_factor) + 1.0
+    return base * m * m
+
+
 def _splash_attention(query, key, value, scale: float):
     """Causal Splash attention via Pallas (TPU-only).
 
@@ -393,7 +413,7 @@ def _splash_cp_attention(query, key, value, scale: float,
 
 def _mla_attention_cp_body(x, positions, wq_a, wq_b, q_norm, wkv_a, wkv_b, kv_norm, w_out,
                            cfg_H, cfg_d_v, cfg_d_nope, cfg_d_rope, cfg_R_kv, cfg_qk_dim,
-                           cfg_norm_eps, ep_axis):
+                           cfg_norm_eps, ep_axis, cfg_softmax_scale=None):
     """MLA attention with context parallelism — runs inside shard_map with "ep" axis.
 
     AllGathers compressed kv_a across EP (288 MB), expands to full K,V locally,
@@ -437,7 +457,7 @@ def _mla_attention_cp_body(x, positions, wq_a, wq_b, q_norm, wkv_a, wkv_b, kv_no
     q = jnp.concatenate([q_nope, q_rope], axis=-1)
     k = jnp.concatenate([k_nope, k_rope], axis=-1)
 
-    scale = 1.0 / math.sqrt(qk_dim)
+    scale = cfg_softmax_scale if cfg_softmax_scale is not None else 1.0 / math.sqrt(qk_dim)
 
     # Attention: Q(S_local) × K(S_full) — asymmetric, JAX matmul
     q_t = q.transpose(0, 2, 1, 3)   # (B, H, S_local, qk_dim)
@@ -475,6 +495,7 @@ def mla_attention(x, params, positions, cfg: ModelConfig, use_cp: bool | None = 
     d_nope, d_rope = cfg.d_nope, cfg.d_rope
     qk_dim = cfg.qk_dim
     cp_axis = _seq_ax(cfg) if use_cp else None
+    softmax_scale = _attention_softmax_scale(cfg)
     ck = jax._src.ad_checkpoint.checkpoint_name
 
     with jax.named_scope("mla_attention"):
@@ -537,7 +558,7 @@ def mla_attention(x, params, positions, cfg: ModelConfig, use_cp: bool | None = 
                 q_full = jnp.concatenate([q_nope, q_rope], axis=-1)
                 k_full = jnp.concatenate([k_nope, k_rope], axis=-1)
 
-                scale = 1.0 / math.sqrt(qk_dim)
+                scale = softmax_scale  # captured from outer scope (cfg-driven)
 
                 # Splash Attention: Q(S_local) × K(S_full) with offset causal mask.
                 # CausalMask(shape=(S_local, S_full), offset=ep_rank*S_local)
@@ -609,7 +630,7 @@ def mla_attention(x, params, positions, cfg: ModelConfig, use_cp: bool | None = 
             q = jnp.concatenate([q_nope, q_rope], axis=-1)
             k = jnp.concatenate([k_nope, k_rope], axis=-1)
 
-        scale = 1.0 / math.sqrt(qk_dim)
+        scale = softmax_scale
 
         # Attention compute
         with jax.named_scope("attn_compute"):
