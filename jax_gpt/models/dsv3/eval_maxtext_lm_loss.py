@@ -41,15 +41,18 @@ from .load_maxtext_ckpt import load_maxtext_dsv3
 #    through the heart of the city, dividing it into two banks: the Right
 #    Bank and the Left Bank, each with its own distinct character."
 DEFAULT_IDS = [
-    671, 79666, 2154, 51725, 278, 51119, 7812, 13382, 278, 439, 870, 744,
-    261, 67576, 29207, 7825, 2251, 1303, 521, 24351, 7395, 14, 15483, 36545,
-    40280, 41069, 5497, 32357, 55295, 79666, 14, 994, 3527, 316, 1631, 29616,
-    2410, 27604, 1831, 22144, 17473, 1805, 39, 4280, 317, 54, 1344, 55295, 46,
-    34983, 266, 47, 50587, 40280, 1805, 6343, 266, 6897, 691, 38499, 29569,
-    14170, 4374, 560, 102293, 15721, 121935, 6051, 263, 37838, 39499, 32842,
-    481, 32244, 1841, 288, 279, 650, 347, 89, 924, 5268, 28, 1805, 16697,
-    39196, 458, 1805, 21242, 39196, 14, 38065, 6135, 1303, 359, 289, 435,
-    6149, 32363, 16,
+    # Re-tokenized 2026-05-02 via HF deepseek-ai/DeepSeek-V3 tokenizer
+    # (tokenizer.encode(text, add_special_tokens=False)). The previous
+    # 100-token list was wrong tokenizer (only token 0 matched correct
+    # encoding) — model saw nonsense tokens, explaining CE≈10 vs MaxText 5.337.
+    671, 6102, 294, 8760, 344, 11111, 16, 8760, 344, 260, 3924, 295,
+    10734, 4174, 3459, 362, 1009, 2783, 14, 5785, 14, 41506, 14, 305,
+    3980, 16, 11111, 14, 270, 6102, 14, 344, 2680, 304, 1623, 2058,
+    2410, 27604, 63554, 2622, 270, 446, 4280, 317, 36788, 14, 270, 125089,
+    13924, 14, 305, 270, 53893, 6897, 691, 54860, 16, 455, 96727, 9875,
+    12122, 1407, 270, 4082, 294, 270, 4593, 14, 26843, 436, 1055, 1234,
+    14664, 28, 270, 15759, 9063, 305, 270, 27925, 9063, 14, 1660, 418,
+    1009, 1956, 8250, 3053, 16,
 ]
 
 
@@ -148,16 +151,17 @@ def main():
                         targets_real, n_chunks, V_CHUNK)
 
     # ── Top-K diagnostics at semantic positions ───────────────────────────
-    # Cheapest "is the model functional at all?" test. With BoS at pos 0:
-    #   pos 1 = "The"      → predict pos 2 = "capital" (79666)
-    #   pos 5 = "is"       → predict pos 6 = "Paris"   (51119)  ★ key one
-    #   pos 8 = "rance"    → predict pos 9 = "is"      (278)
-    #   pos 12 = "ry"      → predict pos 13 = "in"     (261)
-    #   pos 13 = "in"      → predict pos 14 = "Western" (67576)
-    # If model predicts "Paris" with high logit, attention/RoPE/routing all
-    # work; remaining gap is calibration. If garbage, fundamental bug.
-    diag_positions = [1, 5, 8, 12, 13]
-    expected_ids   = [79666, 51119, 278, 261, 67576]
+    # With BoS at pos 0 + correct HF DSv3 tokens:
+    #   pos 1 = "The"      → predict pos 2 = " capital" (6102)
+    #   pos 5 = " is"      → predict pos 6 = " Paris"   (11111)  ★ key one
+    #   pos 6 = " Paris"   → predict pos 7 = "."        (16)
+    #   pos 11 = " in"     → predict pos 12 = " Western" (10734)
+    #   pos 12 = " Western"→ predict pos 13 = " Europe" (4174)
+    # If "Paris" shows up high-rank, attention/RoPE/routing all work and
+    # remaining LM CE gap is calibration. If "Paris" is rank ~thousand,
+    # there is a fundamental forward-pass bug.
+    diag_positions = [1, 5, 6, 11, 12]
+    expected_ids   = [6102, 11111, 16, 10734, 4174]
     print("\n──── Top-K diagnostics ────")
     # x_pred is (1, S-1, D); take diag positions, all of vocab.
     x_diag = x_pred[0, jnp.array(diag_positions), :].astype(jnp.float32)  # (P, D)
