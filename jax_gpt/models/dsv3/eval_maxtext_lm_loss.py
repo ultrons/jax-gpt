@@ -75,6 +75,10 @@ def main():
     # in our pod (PYTHONPATH=/app, but kernel lives at .kernels.fused_moe_bwd).
     cfg.moe_backend = "gmm_ag"
     cfg.gradient_checkpoint = False     # inference only
+    # MaxText-trained DSv3 671B uses routed_scaling_factor=2.5 (its config
+    # configs/models/deepseek3-671b.yml). Without this, MoE outputs are
+    # ~2.5x under-weighted in the residual stream → high LM CE.
+    cfg.routed_scaling_factor = 2.5
 
     shard_cfg = ShardConfig(fsdp=args.fsdp, ep=args.ep, tp=args.tp)
     mesh = shard_cfg.create_mesh()

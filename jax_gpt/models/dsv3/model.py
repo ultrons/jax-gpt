@@ -90,6 +90,12 @@ class ModelConfig:
     # Training
     norm_eps: float = 1e-6
     moe_aux_loss_coeff: float = 1e-4
+    # Routing scale applied to top-K weights after normalization. MaxText DSv3
+    # 671B uses 2.5 (configs/models/deepseek3-671b.yml: routed_scaling_factor).
+    # We default to 1.0 because production training (v304-) was tuned for
+    # implicit-1.0 — the model converges fine without it. Set to 2.5 to match
+    # MaxText behavior when loading their checkpoints.
+    routed_scaling_factor: float = 1.0
     # Backend
     moe_backend: str = "jax"     # "jax" | "fused_ep_moe_v4"
     attn_backend: str = "splash" # "splash" | "jax"
@@ -707,8 +713,10 @@ def moe_routing(x, gate_weight, gate_bias, cfg: ModelConfig):
                 flat_neg_biased, scores.reshape(B * S, E), dimension=1)
             top_k_weights = sorted_scores[:, :cfg.K].reshape(B, S, cfg.K)
 
-        # Normalize weights (sum to 1 per token)
+        # Normalize weights (sum to 1 per token), then DeepSeek-V3 routing scale.
         top_k_weights = top_k_weights / (top_k_weights.sum(axis=-1, keepdims=True) + 1e-9)
+        if cfg.routed_scaling_factor != 1.0:
+            top_k_weights = top_k_weights * jnp.float32(cfg.routed_scaling_factor)
         return top_k_weights, top_k_indices, scores
 
 
