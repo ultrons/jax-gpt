@@ -154,18 +154,56 @@ def _flatten_heads(arr):
     return arr.reshape(*s[:-2], s[-2] * s[-1])
 
 
+# DSv3 671B head dims (hardcoded — this loader is DSv3-671B-specific anyway).
+_D_NOPE = 128
+_D_ROPE = 64
+_R_KV = 512
+
+
+def _interleaved_to_concat_per_head(arr_per_head):
+    """Convert per-head qk dim from MaxText interleaved RoPE layout
+    [r0,i0,r1,i1,...] to our split-half layout [r0,r1,...,i0,i1,...].
+
+    arr_per_head shape: (..., H, qk_dim) where qk_dim = d_nope + d_rope.
+    Only the trailing d_rope dims are permuted; nope dims pass through.
+    """
+    nope = arr_per_head[..., :_D_NOPE]                               # (..., H, d_nope)
+    rope = arr_per_head[..., _D_NOPE:]                               # (..., H, d_rope) interleaved
+    rope_concat = jnp.concatenate([rope[..., 0::2], rope[..., 1::2]], axis=-1)
+    return jnp.concatenate([nope, rope_concat], axis=-1)             # (..., H, qk_dim)
+
+
+def _interleaved_to_concat_kv_a(wkv_a):
+    """Permute wkv_a's trailing d_rope dims (k_rope) from interleaved → concat.
+    wkv_a shape: (..., R_kv + d_rope) — no head dim (k_rope shared across heads).
+    """
+    kv = wkv_a[..., :_R_KV]
+    rope = wkv_a[..., _R_KV:]
+    rope_concat = jnp.concatenate([rope[..., 0::2], rope[..., 1::2]], axis=-1)
+    return jnp.concatenate([kv, rope_concat], axis=-1)
+
+
 def _per_layer_mla(d, mesh: Mesh) -> dict:
-    """Pull MLA tensors (move L axis to 0, flatten heads)."""
+    """Pull MLA tensors (move L axis to 0, flatten heads).
+
+    Critical RoPE-layout fix: MaxText DSv3 MLA trains with interleaved RoPE
+    (rope_interleave=True; layers/attention_mla.py:669, embeddings.py:964).
+    Our model's _apply_rope uses split-half/concatenated layout. So we permute
+    the trailing d_rope=64 dims of wq_b (per head) and wkv_a (no head) from
+    [r0,i0,r1,i1,...] → [r0,r1,...,i0,i1,...] at load time.
+    """
     sa = d["self_attention"]
     pre   = _move_layer_axis_to_front(d["pre_self_attention_layer_norm"]["scale"],  layer_axis=1)
     post  = _move_layer_axis_to_front(d["post_self_attention_layer_norm"]["scale"], layer_axis=1)
     wq_a  = _move_layer_axis_to_front(sa["wq_a"]["kernel"], layer_axis=1)            # (D, L, q_lora) → (L, D, q_lora)
     wq_b  = _move_layer_axis_to_front(sa["wq_b"]["kernel"], layer_axis=1)            # (q_lora, L, H, 192) → (L, q_lora, H, 192)
+    wq_b  = _interleaved_to_concat_per_head(wq_b)                                     # permute rope dims per head
     wq_b  = _flatten_heads(wq_b)                                                      # → (L, q_lora, H*192)
     qn    = _move_layer_axis_to_front(sa["q_norm"]["scale"], layer_axis=1)
-    wkv_a = _move_layer_axis_to_front(sa["wkv_a"]["kernel"], layer_axis=1)
+    wkv_a = _move_layer_axis_to_front(sa["wkv_a"]["kernel"], layer_axis=1)            # (D, L, R_kv+d_rope) → (L, D, 576)
+    wkv_a = _interleaved_to_concat_kv_a(wkv_a)                                        # permute trailing 64 dims
     wkv_b = _move_layer_axis_to_front(sa["wkv_b"]["kernel"], layer_axis=1)
-    wkv_b = _flatten_heads(wkv_b)
+    wkv_b = _flatten_heads(wkv_b)                                                     # wkv_b has no rope dims, no permute
     kvn   = _move_layer_axis_to_front(sa["kv_norm"]["scale"], layer_axis=1)
     out   = _move_layer_axis_to_front(sa["out"]["kernel"], layer_axis=1)              # (H, L, head_dim, D) → (L, H, head_dim, D)
     out   = out.reshape(out.shape[0], out.shape[1] * out.shape[2], out.shape[3])      # (L, H*head_dim, D)
