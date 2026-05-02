@@ -111,7 +111,10 @@ def main():
     print(f"  final_norm shape:  {params['final_norm'].shape}")
 
     # ── Tokens (pre-tokenized; pad to cfg.S) ──────────────────────────────
-    ids = list(DEFAULT_IDS)
+    # Prepend BoS (id=0 in HF DSv3 tokenizer). MaxText trains with BoS at
+    # position 0; without it the model sees "real text" at pos 0 which is
+    # an unusual distribution → first few token CEs are inflated.
+    ids = [0] + list(DEFAULT_IDS)  # BoS = 0
     real_len = len(ids)
     pad_id = 0
     while len(ids) < cfg.S:
