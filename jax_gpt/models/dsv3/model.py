@@ -96,6 +96,12 @@ class ModelConfig:
     # implicit-1.0 — the model converges fine without it. Set to 2.5 to match
     # MaxText behavior when loading their checkpoints.
     routed_scaling_factor: float = 1.0
+    # Group-limited routing (DSv3): split E experts into n_routing_groups,
+    # pick top topk_routing_group groups by per-group top-2 score sum, then
+    # take top-K experts only within selected groups. -1 = disabled (flat
+    # top-K). MaxText DSv3 671B uses (8, 4). Default -1 preserves v304.
+    n_routing_groups: int = -1
+    topk_routing_group: int = -1
     # Backend
     moe_backend: str = "jax"     # "jax" | "fused_ep_moe_v4"
     attn_backend: str = "splash" # "splash" | "jax"
@@ -695,6 +701,24 @@ def moe_routing(x, gate_weight, gate_bias, cfg: ModelConfig):
         with jax.named_scope("top_k"):
             scores = jax.nn.sigmoid(logits.astype(jnp.float32))
             biased = scores + gate_bias.astype(jnp.float32)
+
+            # DSv3 group-limited routing (MaxText: layers/moe.py:expert_group_mask).
+            # Split E into n_routing_groups, pick top topk_routing_group groups
+            # by per-group top-2-sum, mask out experts in unselected groups.
+            if cfg.n_routing_groups > 0:
+                B_, S_, E_ = biased.shape
+                groups = cfg.n_routing_groups
+                epg = E_ // groups
+                topk_g = cfg.topk_routing_group
+                biased_g = biased.reshape(B_, S_, groups, epg)
+                top2_in_group, _ = jax.lax.top_k(biased_g, k=2)
+                group_scores = jnp.sum(top2_in_group, axis=-1)  # (B,S,groups)
+                _, group_idx = jax.lax.top_k(group_scores, k=topk_g)
+                gmask = jax.nn.one_hot(group_idx, num_classes=groups,
+                                       dtype=jnp.float32).sum(axis=-2)  # (B,S,groups)
+                expert_mask = jnp.broadcast_to(
+                    gmask[..., None], (B_, S_, groups, epg)).reshape(B_, S_, E_)
+                biased = jnp.where(expert_mask > 0, biased, jnp.float32(-1e30))
 
             # Sort by descending biased score (sort neg_biased ascending).
             neg_biased = -biased

@@ -79,6 +79,11 @@ def main():
     # configs/models/deepseek3-671b.yml). Without this, MoE outputs are
     # ~2.5x under-weighted in the residual stream → high LM CE.
     cfg.routed_scaling_factor = 2.5
+    # DSv3 671B group-limited routing: 256 experts split into 8 groups, top-4
+    # groups selected per token. Without this, our flat top-K picks different
+    # experts than the model was trained for → very high aux + bad LM CE.
+    cfg.n_routing_groups = 8
+    cfg.topk_routing_group = 4
 
     shard_cfg = ShardConfig(fsdp=args.fsdp, ep=args.ep, tp=args.tp)
     mesh = shard_cfg.create_mesh()
