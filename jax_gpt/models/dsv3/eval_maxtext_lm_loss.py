@@ -147,6 +147,35 @@ def main():
     lm_loss = _vocab_ce(x_pred_real, params["output_head"],
                         targets_real, n_chunks, V_CHUNK)
 
+    # ── Top-K diagnostics at semantic positions ───────────────────────────
+    # Cheapest "is the model functional at all?" test. With BoS at pos 0:
+    #   pos 1 = "The"      → predict pos 2 = "capital" (79666)
+    #   pos 5 = "is"       → predict pos 6 = "Paris"   (51119)  ★ key one
+    #   pos 8 = "rance"    → predict pos 9 = "is"      (278)
+    #   pos 12 = "ry"      → predict pos 13 = "in"     (261)
+    #   pos 13 = "in"      → predict pos 14 = "Western" (67576)
+    # If model predicts "Paris" with high logit, attention/RoPE/routing all
+    # work; remaining gap is calibration. If garbage, fundamental bug.
+    diag_positions = [1, 5, 8, 12, 13]
+    expected_ids   = [79666, 51119, 278, 261, 67576]
+    print("\n──── Top-K diagnostics ────")
+    # x_pred is (1, S-1, D); take diag positions, all of vocab.
+    x_diag = x_pred[0, jnp.array(diag_positions), :].astype(jnp.float32)  # (P, D)
+    logits_diag = (x_diag @ params["output_head"].astype(jnp.float32))    # (P, V)
+    # Top-5 token IDs and their logits per position.
+    top_v, top_i = jax.lax.top_k(logits_diag, k=5)
+    jax.block_until_ready(top_v)
+    for i, (pos, exp_id) in enumerate(zip(diag_positions, expected_ids)):
+        exp_logit = float(logits_diag[i, exp_id])
+        # Rank of expected (count of tokens with strictly higher logit + 1)
+        rank = int(jnp.sum(logits_diag[i] > logits_diag[i, exp_id])) + 1
+        top5 = list(zip([int(x) for x in top_i[i]], [float(x) for x in top_v[i]]))
+        print(f"  pos {pos:>2d} → expected id={exp_id:>6d} "
+              f"(logit={exp_logit:+.3f}, rank={rank}/{cfg.V})")
+        for tid, lg in top5:
+            mark = " ★" if tid == exp_id else ""
+            print(f"      top: id={tid:>6d}  logit={lg:+.3f}{mark}")
+
     jax.block_until_ready(lm_loss)
     print(f"Forward + CE took {time.time() - t0:.1f}s")
 
