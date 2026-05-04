@@ -128,6 +128,10 @@ class ModelConfig:
                                          # (halves the per-layer 7 GB AG allocation)
     moe_no_weight_ag: bool = False       # use colrow+A2A body for tp>1+ep>1, removes
                                          # per-layer weight AllGather (1.4 GB transient)
+    moe_gmm_ag_presort: bool = False     # v2 body: pre-sort tokens by dest_ep BEFORE
+                                         # token AG; replaces big post-AG argsort with
+                                         # smaller local argsort + per-source slicing.
+                                         # n_chunks forced to ep when enabled.
 
     @property
     def L_moe(self) -> int:
@@ -1925,13 +1929,292 @@ def expert_mlp_gmm_ag(x, wi_0, wi_1, wo, top_k_weights, top_k_indices,
     T_local   = B * S // (fsdp_size * max(ep_size, 1))
     max_tpe   = max(1, 2 * T_local * K // cfg.E)
 
-    with jax.named_scope("moe_gmm_ag"):
-        out = _moe_gmm_ag(flat_x, flat_indices, flat_weights,
-                          wi_0, wi_1, wo,
-                          cfg.mesh, K, act_spec, "ep", max_tpe,
-                          cfg.moe_use_sc_scatter, cfg.moe_use_gmm_v2,
-                          cfg.moe_n_chunks, cfg.moe_fp8_weights)
+    if cfg.moe_gmm_ag_presort:
+        with jax.named_scope("moe_gmm_ag_v2_presort"):
+            # n_chunks forced to ep — chunk i corresponds to source-EP-rank i's
+            # contribution after dest-grouped pre-sort.
+            n_chunks_v2 = ep_size
+            out = _moe_gmm_ag_v2(flat_x, flat_indices, flat_weights,
+                                  wi_0, wi_1, wo,
+                                  cfg.mesh, K, act_spec, "ep", max_tpe,
+                                  cfg.moe_use_sc_scatter, cfg.moe_use_gmm_v2,
+                                  n_chunks_v2, cfg.moe_fp8_weights)
+    else:
+        with jax.named_scope("moe_gmm_ag"):
+            out = _moe_gmm_ag(flat_x, flat_indices, flat_weights,
+                              wi_0, wi_1, wo,
+                              cfg.mesh, K, act_spec, "ep", max_tpe,
+                              cfg.moe_use_sc_scatter, cfg.moe_use_gmm_v2,
+                              cfg.moe_n_chunks, cfg.moe_fp8_weights)
     return out.reshape(B, S, D)
+
+
+# ============================================================================
+# v2: pre-sort by dest_ep before AG (experiment, gated by cfg.moe_gmm_ag_presort).
+#
+# Idea: each device pre-sorts its (T_local × K) (token, expert) pairs by
+# destination EP rank (= expert_id // E_local). After AG (chunks = ep),
+# each receiver knows where its destined entries live in each source's
+# contribution — extract via per-source dynamic_slice instead of a global
+# post-AG argsort over (chunk_size × K) ≈ 524k pairs.
+#
+# Trade-off:
+#   + Replaces big TC argsort with small local argsort + per-source slice.
+#   + Same total token-AG volume (no BW reduction).
+#   - Adds tiny extra collective: AG of (ep+1,) boundaries per chunk.
+#   - Static-shape requirement → per-source max alloc = chunk_TK
+#     (worst-case all tokens to one dest); padded with sentinel expert_id.
+# ============================================================================
+
+def _expert_mlp_gmm_ag_body_v2(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
+                                K: int, ep_axis: str, fsdp_axis: str,
+                                n_chunks: int = 4, use_sc_scatter: bool = False,
+                                use_gmm_v2: bool = False,
+                                use_fp8_weights: bool = False):
+    """v2 body: pre-sort tokens by dest_ep locally, then AG.
+
+    See module-level comment for design notes. Functionally equivalent to
+    `_expert_mlp_gmm_ag_body` (v1) — same gate weights, same expert math,
+    same scatter/psum_scatter on the back end. Differs only in HOW the
+    AG'd token-expert pairs are filtered for the local-experts subset.
+    """
+    T, D = flat_x.shape
+    E_local    = wi_0.shape[0]
+    ep_size    = jax.lax.axis_size(ep_axis)
+    my_ep_rank = jax.lax.axis_index(ep_axis)
+    local_start = my_ep_rank * E_local
+
+    if use_fp8_weights:
+        wi_0 = wi_0.astype(jnp.float8_e4m3fn)
+        wi_1 = wi_1.astype(jnp.float8_e4m3fn)
+        wo   = wo.astype(jnp.float8_e4m3fn)
+        wi_0, wi_1, wo = jax.lax.optimization_barrier((wi_0, wi_1, wo))
+
+    with jax.named_scope("weight_allgather_f"):
+        wi_0_f = jax.lax.all_gather(wi_0, fsdp_axis, axis=_moe_wi_ag_axis(), tiled=True)
+        wi_1_f = jax.lax.all_gather(wi_1, fsdp_axis, axis=_moe_wi_ag_axis(), tiled=True)
+        wo_f   = jax.lax.all_gather(wo,   fsdp_axis, axis=_moe_wo_ag_axis(), tiled=True)
+
+    wi_0_t = wi_0_f.transpose(0, 2, 1)
+    wi_1_t = wi_1_f.transpose(0, 2, 1)
+
+    assert T % n_chunks == 0, f"T={T} not divisible by n_chunks={n_chunks}"
+    sz_local = T // n_chunks                  # per-chunk local tokens
+    chunk_TK = sz_local * K                   # per-source per-chunk pairs
+    chunk_size = sz_local * ep_size           # post-AG token count per chunk
+
+    local_inputs = []
+    for c in range(n_chunks):
+        cs = c * sz_local
+        local_inputs.append((
+            jax.lax.dynamic_slice(flat_x,       [cs, 0], [sz_local, D]),
+            jax.lax.dynamic_slice(flat_indices, [cs, 0], [sz_local, K]),
+            jax.lax.dynamic_slice(flat_weights, [cs, 0], [sz_local, K]),
+        ))
+
+    def _process_chunk(c: int, inp):
+        chunk_x_local, chunk_indices_local, chunk_weights_local = inp
+        with jax.named_scope(f"chunk{c}"):
+            # ── PRE-SORT (local, before AG) ────────────────────────────────
+            # Flatten local (sz_local, K) pairs to (chunk_TK,).
+            exp_ids_local   = chunk_indices_local.reshape(-1).astype(jnp.int32)
+            exp_ws_local    = chunk_weights_local.reshape(-1)
+            token_ids_local = jnp.repeat(jnp.arange(sz_local, dtype=jnp.int32), K)
+
+            dest_ep_local = exp_ids_local // E_local       # (chunk_TK,) values 0..ep-1
+
+            with jax.named_scope("local_presort_dest_ep"):
+                argsorted_local = jnp.argsort(dest_ep_local, stable=True)
+                s_eids = exp_ids_local[argsorted_local]
+                s_ws   = exp_ws_local[argsorted_local]
+                s_tids = token_ids_local[argsorted_local]
+                # Boundaries: s_dest is sorted, so searchsorted gives ep+1 offsets.
+                s_dest = dest_ep_local[argsorted_local]
+                boundaries_local = jnp.searchsorted(
+                    s_dest, jnp.arange(ep_size + 1, dtype=jnp.int32))
+
+            # ── AG ────────────────────────────────────────────────────────
+            with jax.named_scope("ep_token_gather"):
+                chunk_x = jax.lax.all_gather(chunk_x_local, ep_axis, axis=0, tiled=True)
+                # AG the small per-source sorted arrays + boundaries.
+                s_eids_full = jax.lax.all_gather(s_eids,           ep_axis, axis=0, tiled=True)
+                s_ws_full   = jax.lax.all_gather(s_ws,             ep_axis, axis=0, tiled=True)
+                s_tids_full = jax.lax.all_gather(s_tids,           ep_axis, axis=0, tiled=True)
+                bounds_full = jax.lax.all_gather(boundaries_local, ep_axis, axis=0, tiled=True)
+            chunk_x, s_eids_full, s_ws_full, s_tids_full, bounds_full = (
+                jax.lax.optimization_barrier(
+                    (chunk_x, s_eids_full, s_ws_full, s_tids_full, bounds_full)))
+
+            # Reshape boundaries: (ep_source, ep+1) — bounds_full[s, r] is the
+            # offset within source s's local sorted block where dest_ep == r begins.
+            bounds_per_source = bounds_full.reshape(ep_size, ep_size + 1)
+
+            # ── Per-source slice for MY dest_ep ────────────────────────────
+            # For each source s, the entries destined for me sit in
+            # s_*_full[s*chunk_TK + bounds[s, my] : s*chunk_TK + bounds[s, my+1]].
+            # Static shape: allocate chunk_TK per source (worst case); pad
+            # entries beyond `n_for_me` with sentinel expert_id = E_local.
+            max_per_source = chunk_TK
+
+            def _slice_one_source(s):
+                base = s * chunk_TK
+                lo   = bounds_per_source[s, my_ep_rank]
+                hi   = bounds_per_source[s, my_ep_rank + 1]
+                n_for_me = hi - lo
+                # dynamic_slice with size=max_per_source; entries past n_for_me
+                # are garbage from the next dest's bucket — mask them.
+                eids_s = jax.lax.dynamic_slice(s_eids_full, [base + lo], [max_per_source])
+                ws_s   = jax.lax.dynamic_slice(s_ws_full,   [base + lo], [max_per_source])
+                tids_s = jax.lax.dynamic_slice(s_tids_full, [base + lo], [max_per_source])
+                valid  = jnp.arange(max_per_source) < n_for_me
+                # Convert to local-expert space; mask invalid as E_local sentinel.
+                local_eids = jnp.where(valid, eids_s - local_start, E_local).astype(jnp.int32)
+                local_ws   = jnp.where(valid, ws_s, jnp.float32(0.0))
+                # token IDs become global within this chunk: source s's local
+                # token i → chunk_x position s * sz_local + i.
+                global_tids = jnp.where(valid, tids_s + s * sz_local, chunk_size).astype(jnp.int32)
+                return local_eids, local_ws, global_tids
+
+            with jax.named_scope("per_source_slice"):
+                per_src_eids, per_src_ws, per_src_tids = jax.vmap(_slice_one_source)(
+                    jnp.arange(ep_size))
+                # Flatten across sources: (ep, max_per_source) → (ep*max_per_source,)
+                cat_eids = per_src_eids.reshape(-1)
+                cat_ws   = per_src_ws.reshape(-1)
+                cat_tids = per_src_tids.reshape(-1)
+
+            # ── Re-sort by local_eid (small range 0..E_local) for ragged_dot ─
+            # Final array size = ep * max_per_source = ep * chunk_TK = chunk_TK_total.
+            # Same as v1's max_local_c. argsort over this size — but values are
+            # only 0..E_local (vs 0..E in v1), so cheaper comparator on TC.
+            with jax.named_scope("local_resort_by_expert"):
+                argsorted_final = jnp.argsort(cat_eids, stable=True)
+                local_eids_c = cat_eids[argsorted_final]
+                local_ws_c   = cat_ws[argsorted_final]
+                local_tids_c = cat_tids[argsorted_final]
+
+            # group_sizes via searchsorted on a small (E_local+1,) vector.
+            ends_c   = jnp.searchsorted(local_eids_c, jnp.arange(1, E_local + 1).astype(jnp.int32))
+            starts_c = jnp.searchsorted(local_eids_c, jnp.arange(E_local).astype(jnp.int32))
+            group_sizes_c = (ends_c - starts_c).astype(jnp.int32)
+
+            # ── ragged_dot (identical to v1) ──────────────────────────────
+            local_x_c = chunk_x[local_tids_c]
+            if use_gmm_v2:
+                from kernels.gmm_v2_train import gmm_v2_train, gmm_v2_fused_silu_train
+                hidden = gmm_v2_fused_silu_train(
+                    local_x_c.astype(wi_0_t.dtype), wi_0_t, wi_1_t,
+                    group_sizes_c, 48 * 1024 * 1024)
+                out_local_c = gmm_v2_train(
+                    hidden.astype(wo_f.dtype), wo_f, group_sizes_c, 0)
+            elif use_fp8_weights:
+                x_bf16 = local_x_c.astype(jnp.bfloat16)
+                gate = jax.nn.silu(jax.lax.ragged_dot(
+                    x_bf16, wi_0_t, group_sizes_c,
+                    preferred_element_type=jnp.bfloat16))
+                up = jax.lax.ragged_dot(
+                    x_bf16, wi_1_t, group_sizes_c,
+                    preferred_element_type=jnp.bfloat16)
+                hidden = (gate * up).astype(jnp.bfloat16)
+                out_local_c = jax.lax.ragged_dot(
+                    hidden, wo_f, group_sizes_c,
+                    preferred_element_type=jnp.bfloat16)
+            else:
+                gate = jax.nn.silu(jax.lax.ragged_dot(
+                    local_x_c.astype(wi_0_t.dtype), wi_0_t, group_sizes_c))
+                up = jax.lax.ragged_dot(
+                    local_x_c.astype(wi_1_t.dtype), wi_1_t, group_sizes_c)
+                hidden = gate * up
+                out_local_c = jax.lax.ragged_dot(
+                    hidden.astype(wo_f.dtype), wo_f, group_sizes_c)
+
+            out_local_c = out_local_c * local_ws_c[:, None].astype(out_local_c.dtype)
+
+            # ── Scatter + psum_scatter (identical to v1) ──────────────────
+            full_out_c = jnp.zeros((chunk_size, D), dtype=flat_x.dtype).at[
+                local_tids_c].add(out_local_c.astype(flat_x.dtype))
+            result_c = jax.lax.psum_scatter(full_out_c, ep_axis,
+                                             scatter_dimension=0, tiled=True)
+        return result_c
+
+    chunks = [_process_chunk(c, local_inputs[c]) for c in range(n_chunks)]
+    return jnp.concatenate(chunks, axis=0)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13, 14))
+def _moe_gmm_ag_v2(fx, fi, fw, w0, w1, wout,
+                   mesh, K: int, act_spec, ep_axis: str, max_tpe: int,
+                   use_sc_scatter: bool = False, use_gmm_v2: bool = False,
+                   n_chunks: int = 4, use_fp8_weights: bool = False):
+    """v2 wrapper: same shard_map / specs as _moe_gmm_ag, body is _v2."""
+    from jax.experimental.shard_map import shard_map
+    ep = mesh.shape.get("ep", 1) if mesh else 1
+    if ep > 1:
+        _act_x  = P(("fsdp", "ep"), None)
+        _act_iw = P(("fsdp", "ep"), None)
+    else:
+        _act_x  = act_spec
+        _act_iw = act_spec
+    _wt_i = _moe_wi_spec()
+    _wt_o = _moe_wo_spec()
+
+    @functools.partial(shard_map, mesh=mesh,
+                       in_specs=(_act_x, _act_iw, _act_iw, _wt_i, _wt_i, _wt_o),
+                       out_specs=_act_x, check_rep=False)
+    def _fn(fx_, fi_, fw_, w0_, w1_, wout_):
+        return _expert_mlp_gmm_ag_body_v2(
+            fx_, w0_, w1_, wout_, fi_, fw_,
+            K, ep_axis, "fsdp",
+            n_chunks=n_chunks,
+            use_sc_scatter=use_sc_scatter,
+            use_gmm_v2=use_gmm_v2,
+            use_fp8_weights=use_fp8_weights)
+    return _fn(fx, fi, fw, w0, w1, wout)
+
+
+def _moe_gmm_ag_v2_fwd(fx, fi, fw, w0, w1, wout,
+                       mesh, K, act_spec, ep_axis, max_tpe, use_sc_scatter,
+                       use_gmm_v2, n_chunks, use_fp8_weights):
+    out = _moe_gmm_ag_v2(fx, fi, fw, w0, w1, wout, mesh, K, act_spec, ep_axis,
+                          max_tpe, use_sc_scatter, use_gmm_v2, n_chunks, use_fp8_weights)
+    return out, (fx, fi, fw, w0, w1, wout)
+
+
+def _moe_gmm_ag_v2_bwd(mesh, K, act_spec, ep_axis, max_tpe, use_sc_scatter,
+                       use_gmm_v2, n_chunks, use_fp8_weights, res, g):
+    from jax.experimental.shard_map import shard_map
+    ep = mesh.shape.get("ep", 1) if mesh else 1
+    if ep > 1:
+        _act_x  = P(("fsdp", "ep"), None)
+        _act_iw = P(("fsdp", "ep"), None)
+    else:
+        _act_x  = act_spec
+        _act_iw = act_spec
+    _wt_i = _moe_wi_spec()
+    _wt_o = _moe_wo_spec()
+
+    fx, fi, fw, w0, w1, wout = res
+
+    def _fwd(fx_, fw_, w0_, w1_, wout_):
+        @functools.partial(shard_map, mesh=mesh,
+                           in_specs=(_act_x, _act_iw, _act_iw, _wt_i, _wt_i, _wt_o),
+                           out_specs=_act_x, check_rep=False)
+        def _fn(fx__, fi__, fw__, w0__, w1__, wout__):
+            return _expert_mlp_gmm_ag_body_v2(
+                fx__, w0__, w1__, wout__, fi__, fw__,
+                K, ep_axis, "fsdp",
+                n_chunks=n_chunks,
+                use_sc_scatter=use_sc_scatter,
+                use_gmm_v2=use_gmm_v2,
+                use_fp8_weights=use_fp8_weights)
+        return _fn(fx_, fi, fw_, w0_, w1_, wout_)
+
+    _, vjp_fn = jax.vjp(_fwd, fx, fw, w0, w1, wout)
+    d_fx, d_fw, d_w0, d_w1, d_wout = vjp_fn(g)
+    return (d_fx, jnp.zeros_like(fi), d_fw, d_w0, d_w1, d_wout)
+
+
+_moe_gmm_ag_v2.defvjp(_moe_gmm_ag_v2_fwd, _moe_gmm_ag_v2_bwd)
 
 
 # ============================================================================

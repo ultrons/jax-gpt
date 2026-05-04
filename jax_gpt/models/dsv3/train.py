@@ -471,6 +471,12 @@ def main():
                              "F-fsdp-sharded throughout — psum on TP after wi, psum on "
                              "FSDP after wo. Removes the per-layer weight AllGather "
                              "transient (~1.4 GB at EP=8/TP=2). Pairs with --moe_backend=gmm.")
+    parser.add_argument("--moe_gmm_ag_presort", action="store_true",
+                        help="Use v2 gmm_ag body that pre-sorts tokens by destination EP "
+                             "rank locally BEFORE the token AllGather. Replaces the global "
+                             "post-AG argsort over (chunk_size × K) with a smaller local "
+                             "argsort + per-source dynamic_slice. n_chunks forced to ep. "
+                             "Default off — preserves v304 behavior.")
     args = parser.parse_args()
 
     cfg = CONFIGS[args.config]()
@@ -505,6 +511,8 @@ def main():
         cfg.moe_fp8_weights = True
     if args.moe_no_weight_ag:
         cfg.moe_no_weight_ag = True
+    if args.moe_gmm_ag_presort:
+        cfg.moe_gmm_ag_presort = True
         from . import model as _model
         _model._MOE_NO_WEIGHT_AG = True
 
