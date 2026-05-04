@@ -1663,9 +1663,13 @@ _sc_combine_with_vjp.defvjp(_sc_combine_fwd, _sc_combine_bwd)
 
 def _maybe_check_finite(label: str, x, c: int, debug_nans: bool) -> None:
     """Print {any_nan, any_inf, max_abs} for `x` via jax.debug.print when
-    debug_nans is True. ordered=True forces print serialization so the log
-    sequence matches code order — useful for finding the first non-finite
-    tensor inside a chunk loop. Safe in shard_map; UNSAFE in pmap.
+    debug_nans is True.
+
+    ordered=True is NOT used: it raises 'OrderedDebugEffect not supported
+    for more than 1 device' under pjit/shard_map on our 64-host setup
+    (v341h discovery). Prints from different layers/chunks will interleave
+    in the kubectl log, but the per-line label encodes (location, chunk)
+    so we can still pinpoint the first non-finite tensor.
     """
     if not debug_nans:
         return
@@ -1675,7 +1679,6 @@ def _maybe_check_finite(label: str, x, c: int, debug_nans: bool) -> None:
         n=jnp.isnan(x).any(),
         i=jnp.isinf(x).any(),
         m=jnp.max(jnp.abs(x.astype(jnp.float32))),
-        ordered=True,
     )
 
 
