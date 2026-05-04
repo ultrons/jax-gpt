@@ -1971,12 +1971,18 @@ def _expert_mlp_gmm_ag_body_v2(flat_x, wi_0, wi_1, wo, flat_indices, flat_weight
                                 n_chunks: int = 4, use_sc_scatter: bool = False,
                                 use_gmm_v2: bool = False,
                                 use_fp8_weights: bool = False):
-    """v2 body: pre-sort tokens by dest_ep locally, then AG.
+    """v2 body: pre-sort by full expert_id locally → AG → ep independent
+    ragged_dots, one per source-chunk.
 
-    See module-level comment for design notes. Functionally equivalent to
-    `_expert_mlp_gmm_ag_body` (v1) — same gate weights, same expert math,
-    same scatter/psum_scatter on the back end. Differs only in HOW the
-    AG'd token-expert pairs are filtered for the local-experts subset.
+    Key insight (vs the broken first attempt that did pre-sort + per-source
+    slice + RE-sort + 1 ragged_dot):
+      - Sort key = full expert_id, which equals dest_ep × E_local + local_exp.
+        So a single sort gives dest_ep-major, local_exp-minor ordering.
+      - After AG: each source's contribution sits in a contiguous block,
+        within which entries are already sorted by local_exp for ALL dest_eps.
+      - For my dest_ep, source s's slice [bounds[s, my_rank] : bounds[s, my_rank+1])
+        is ALREADY sorted by local_exp → ready for ragged_dot, no merge.
+      - Do `ep` independent ragged_dots (one per source chunk), scatter-add.
     """
     T, D = flat_x.shape
     E_local    = wi_0.shape[0]
@@ -1998,147 +2004,115 @@ def _expert_mlp_gmm_ag_body_v2(flat_x, wi_0, wi_1, wo, flat_indices, flat_weight
     wi_0_t = wi_0_f.transpose(0, 2, 1)
     wi_1_t = wi_1_f.transpose(0, 2, 1)
 
-    assert T % n_chunks == 0, f"T={T} not divisible by n_chunks={n_chunks}"
-    sz_local = T // n_chunks                  # per-chunk local tokens
-    chunk_TK = sz_local * K                   # per-source per-chunk pairs
-    chunk_size = sz_local * ep_size           # post-AG token count per chunk
+    # ── PRE-SORT (local, before AG) by FULL expert_id ─────────────────────
+    # Single sort gives dest_ep-major (= expert_id // E_local), local_exp-minor.
+    # So within ANY dest_ep bucket, entries are already sorted by local_exp.
+    TK = T * K
+    exp_ids_local   = flat_indices.reshape(-1).astype(jnp.int32)         # (TK,)
+    exp_ws_local    = flat_weights.reshape(-1)
+    token_ids_local = jnp.repeat(jnp.arange(T, dtype=jnp.int32), K)
 
-    local_inputs = []
-    for c in range(n_chunks):
-        cs = c * sz_local
-        local_inputs.append((
-            jax.lax.dynamic_slice(flat_x,       [cs, 0], [sz_local, D]),
-            jax.lax.dynamic_slice(flat_indices, [cs, 0], [sz_local, K]),
-            jax.lax.dynamic_slice(flat_weights, [cs, 0], [sz_local, K]),
-        ))
+    with jax.named_scope("local_presort_full_eid"):
+        argsorted_local = jnp.argsort(exp_ids_local, stable=True)
+        s_eids = exp_ids_local[argsorted_local]
+        s_ws   = exp_ws_local[argsorted_local]
+        s_tids = token_ids_local[argsorted_local]
+        # (ep+1,) boundaries: bounds[r] = first index with expert_id >= r*E_local.
+        boundaries_local = jnp.searchsorted(
+            s_eids, (jnp.arange(ep_size + 1, dtype=jnp.int32) * E_local))
 
-    def _process_chunk(c: int, inp):
-        chunk_x_local, chunk_indices_local, chunk_weights_local = inp
-        with jax.named_scope(f"chunk{c}"):
-            # ── PRE-SORT (local, before AG) ────────────────────────────────
-            # Flatten local (sz_local, K) pairs to (chunk_TK,).
-            exp_ids_local   = chunk_indices_local.reshape(-1).astype(jnp.int32)
-            exp_ws_local    = chunk_weights_local.reshape(-1)
-            token_ids_local = jnp.repeat(jnp.arange(sz_local, dtype=jnp.int32), K)
+    # ── Token AG (one big AG; XLA chunks/pipelines as it sees fit) ───────
+    with jax.named_scope("ep_token_gather"):
+        full_x      = jax.lax.all_gather(flat_x, ep_axis, axis=0, tiled=True)  # (T*ep, D)
+        s_eids_full = jax.lax.all_gather(s_eids,           ep_axis, axis=0, tiled=True)  # (TK*ep,)
+        s_ws_full   = jax.lax.all_gather(s_ws,             ep_axis, axis=0, tiled=True)
+        s_tids_full = jax.lax.all_gather(s_tids,           ep_axis, axis=0, tiled=True)
+        bounds_full = jax.lax.all_gather(boundaries_local, ep_axis, axis=0, tiled=True)  # (ep*(ep+1),)
+    full_x, s_eids_full, s_ws_full, s_tids_full, bounds_full = (
+        jax.lax.optimization_barrier(
+            (full_x, s_eids_full, s_ws_full, s_tids_full, bounds_full)))
 
-            dest_ep_local = exp_ids_local // E_local       # (chunk_TK,) values 0..ep-1
+    # bounds_per_source[s, r] = offset within source s's local sorted block
+    # where expert_id >= r*E_local first appears.
+    bounds_per_source = bounds_full.reshape(ep_size, ep_size + 1)
 
-            with jax.named_scope("local_presort_dest_ep"):
-                argsorted_local = jnp.argsort(dest_ep_local, stable=True)
-                s_eids = exp_ids_local[argsorted_local]
-                s_ws   = exp_ws_local[argsorted_local]
-                s_tids = token_ids_local[argsorted_local]
-                # Boundaries: s_dest is sorted, so searchsorted gives ep+1 offsets.
-                s_dest = dest_ep_local[argsorted_local]
-                boundaries_local = jnp.searchsorted(
-                    s_dest, jnp.arange(ep_size + 1, dtype=jnp.int32))
+    # ── ep independent ragged_dots, one per source-chunk ──────────────────
+    # Each source's contribution to MY local experts is a CONTIGUOUS slice
+    # of source s's pre-sorted block, ALREADY sorted by local_exp. No merge.
+    # n_chunks param is honored as the unroll count; for v2, expected = ep_size.
+    if n_chunks != ep_size:
+        # v2 only meaningfully chunks on source EP rank.
+        n_chunks = ep_size
+    # Per-source max slice (worst case all of source's K-pairs route to one
+    # dest; in practice ≈ TK/ep). Use TK as safe upper bound.
+    max_per_source = TK
 
-            # ── AG ────────────────────────────────────────────────────────
-            with jax.named_scope("ep_token_gather"):
-                chunk_x = jax.lax.all_gather(chunk_x_local, ep_axis, axis=0, tiled=True)
-                # AG the small per-source sorted arrays + boundaries.
-                s_eids_full = jax.lax.all_gather(s_eids,           ep_axis, axis=0, tiled=True)
-                s_ws_full   = jax.lax.all_gather(s_ws,             ep_axis, axis=0, tiled=True)
-                s_tids_full = jax.lax.all_gather(s_tids,           ep_axis, axis=0, tiled=True)
-                bounds_full = jax.lax.all_gather(boundaries_local, ep_axis, axis=0, tiled=True)
-            chunk_x, s_eids_full, s_ws_full, s_tids_full, bounds_full = (
-                jax.lax.optimization_barrier(
-                    (chunk_x, s_eids_full, s_ws_full, s_tids_full, bounds_full)))
+    out_acc = jnp.zeros((T * ep_size, D), dtype=flat_x.dtype)
 
-            # Reshape boundaries: (ep_source, ep+1) — bounds_full[s, r] is the
-            # offset within source s's local sorted block where dest_ep == r begins.
-            bounds_per_source = bounds_full.reshape(ep_size, ep_size + 1)
+    for s in range(ep_size):
+        with jax.named_scope(f"source_chunk_{s}"):
+            base     = s * TK
+            lo       = bounds_per_source[s, my_ep_rank]
+            hi       = bounds_per_source[s, my_ep_rank + 1]
+            n_for_me = hi - lo
 
-            # ── Per-source slice for MY dest_ep ────────────────────────────
-            # For each source s, the entries destined for me sit in
-            # s_*_full[s*chunk_TK + bounds[s, my] : s*chunk_TK + bounds[s, my+1]].
-            # Static shape: allocate chunk_TK per source (worst case); pad
-            # entries beyond `n_for_me` with sentinel expert_id = E_local.
-            max_per_source = chunk_TK
+            # Static dynamic_slice — pad past n_for_me with sentinel (expert 0,
+            # token 0, weight 0). NaN-safe: padded compute is real but zero-weighted.
+            eids_s = jax.lax.dynamic_slice(s_eids_full, [base + lo], [max_per_source])
+            ws_s   = jax.lax.dynamic_slice(s_ws_full,   [base + lo], [max_per_source])
+            tids_s = jax.lax.dynamic_slice(s_tids_full, [base + lo], [max_per_source])
+            valid  = jnp.arange(max_per_source) < n_for_me
 
-            def _slice_one_source(s):
-                base = s * chunk_TK
-                lo   = bounds_per_source[s, my_ep_rank]
-                hi   = bounds_per_source[s, my_ep_rank + 1]
-                n_for_me = hi - lo
-                # dynamic_slice with size=max_per_source; entries past n_for_me
-                # are garbage from the next dest's bucket — mask them.
-                eids_s = jax.lax.dynamic_slice(s_eids_full, [base + lo], [max_per_source])
-                ws_s   = jax.lax.dynamic_slice(s_ws_full,   [base + lo], [max_per_source])
-                tids_s = jax.lax.dynamic_slice(s_tids_full, [base + lo], [max_per_source])
-                valid  = jnp.arange(max_per_source) < n_for_me
-                # Convert to local-expert space; mask invalid as E_local sentinel.
-                local_eids = jnp.where(valid, eids_s - local_start, E_local).astype(jnp.int32)
-                local_ws   = jnp.where(valid, ws_s, jnp.float32(0.0))
-                # token IDs become global within this chunk: source s's local
-                # token i → chunk_x position s * sz_local + i.
-                global_tids = jnp.where(valid, tids_s + s * sz_local, chunk_size).astype(jnp.int32)
-                return local_eids, local_ws, global_tids
+            # Local-expert space: subtract local_start. Padded → expert 0 (valid).
+            local_eids_s = jnp.where(valid, eids_s - local_start, jnp.int32(0)).astype(jnp.int32)
+            # Weight 0 for padded → contribution masked.
+            local_ws_s   = jnp.where(valid, ws_s, jnp.float32(0.0))
+            # Token IDs are GLOBAL within full_x: source s's local token i → s*T + i.
+            # Padded → token 0 of source 0 (valid index, weight is 0 so contribution is 0).
+            global_tids_s = jnp.where(valid, tids_s + s * T, jnp.int32(0)).astype(jnp.int32)
 
-            with jax.named_scope("per_source_slice"):
-                per_src_eids, per_src_ws, per_src_tids = jax.vmap(_slice_one_source)(
-                    jnp.arange(ep_size))
-                # Flatten across sources: (ep, max_per_source) → (ep*max_per_source,)
-                cat_eids = per_src_eids.reshape(-1)
-                cat_ws   = per_src_ws.reshape(-1)
-                cat_tids = per_src_tids.reshape(-1)
+            # group_sizes for THIS source's slice. Already sorted by local_exp.
+            # Searchsorted on small (E_local+1,) vector — cheap.
+            ends_s   = jnp.searchsorted(local_eids_s, jnp.arange(1, E_local + 1).astype(jnp.int32))
+            starts_s = jnp.searchsorted(local_eids_s, jnp.arange(E_local).astype(jnp.int32))
+            group_sizes_s = (ends_s - starts_s).astype(jnp.int32)
 
-            # ── Re-sort by local_eid (small range 0..E_local) for ragged_dot ─
-            # Final array size = ep * max_per_source = ep * chunk_TK = chunk_TK_total.
-            # Same as v1's max_local_c. argsort over this size — but values are
-            # only 0..E_local (vs 0..E in v1), so cheaper comparator on TC.
-            with jax.named_scope("local_resort_by_expert"):
-                argsorted_final = jnp.argsort(cat_eids, stable=True)
-                local_eids_c = cat_eids[argsorted_final]
-                local_ws_c   = cat_ws[argsorted_final]
-                local_tids_c = cat_tids[argsorted_final]
+            # Gather token vectors for this source's contribution.
+            local_x_s = full_x[global_tids_s]
 
-            # group_sizes via searchsorted on a small (E_local+1,) vector.
-            ends_c   = jnp.searchsorted(local_eids_c, jnp.arange(1, E_local + 1).astype(jnp.int32))
-            starts_c = jnp.searchsorted(local_eids_c, jnp.arange(E_local).astype(jnp.int32))
-            group_sizes_c = (ends_c - starts_c).astype(jnp.int32)
-
-            # ── ragged_dot (identical to v1) ──────────────────────────────
-            local_x_c = chunk_x[local_tids_c]
+            # ragged_dot (per-source).
             if use_gmm_v2:
                 from kernels.gmm_v2_train import gmm_v2_train, gmm_v2_fused_silu_train
                 hidden = gmm_v2_fused_silu_train(
-                    local_x_c.astype(wi_0_t.dtype), wi_0_t, wi_1_t,
-                    group_sizes_c, 48 * 1024 * 1024)
-                out_local_c = gmm_v2_train(
-                    hidden.astype(wo_f.dtype), wo_f, group_sizes_c, 0)
+                    local_x_s.astype(wi_0_t.dtype), wi_0_t, wi_1_t,
+                    group_sizes_s, 48 * 1024 * 1024)
+                out_s = gmm_v2_train(
+                    hidden.astype(wo_f.dtype), wo_f, group_sizes_s, 0)
             elif use_fp8_weights:
-                x_bf16 = local_x_c.astype(jnp.bfloat16)
+                x_bf16 = local_x_s.astype(jnp.bfloat16)
                 gate = jax.nn.silu(jax.lax.ragged_dot(
-                    x_bf16, wi_0_t, group_sizes_c,
-                    preferred_element_type=jnp.bfloat16))
+                    x_bf16, wi_0_t, group_sizes_s, preferred_element_type=jnp.bfloat16))
                 up = jax.lax.ragged_dot(
-                    x_bf16, wi_1_t, group_sizes_c,
-                    preferred_element_type=jnp.bfloat16)
+                    x_bf16, wi_1_t, group_sizes_s, preferred_element_type=jnp.bfloat16)
                 hidden = (gate * up).astype(jnp.bfloat16)
-                out_local_c = jax.lax.ragged_dot(
-                    hidden, wo_f, group_sizes_c,
-                    preferred_element_type=jnp.bfloat16)
+                out_s = jax.lax.ragged_dot(
+                    hidden, wo_f, group_sizes_s, preferred_element_type=jnp.bfloat16)
             else:
                 gate = jax.nn.silu(jax.lax.ragged_dot(
-                    local_x_c.astype(wi_0_t.dtype), wi_0_t, group_sizes_c))
+                    local_x_s.astype(wi_0_t.dtype), wi_0_t, group_sizes_s))
                 up = jax.lax.ragged_dot(
-                    local_x_c.astype(wi_1_t.dtype), wi_1_t, group_sizes_c)
+                    local_x_s.astype(wi_1_t.dtype), wi_1_t, group_sizes_s)
                 hidden = gate * up
-                out_local_c = jax.lax.ragged_dot(
-                    hidden.astype(wo_f.dtype), wo_f, group_sizes_c)
+                out_s = jax.lax.ragged_dot(
+                    hidden.astype(wo_f.dtype), wo_f, group_sizes_s)
 
-            out_local_c = out_local_c * local_ws_c[:, None].astype(out_local_c.dtype)
+            out_s = out_s * local_ws_s[:, None].astype(out_s.dtype)
 
-            # ── Scatter + psum_scatter (identical to v1) ──────────────────
-            full_out_c = jnp.zeros((chunk_size, D), dtype=flat_x.dtype).at[
-                local_tids_c].add(out_local_c.astype(flat_x.dtype))
-            result_c = jax.lax.psum_scatter(full_out_c, ep_axis,
-                                             scatter_dimension=0, tiled=True)
-        return result_c
+            # Scatter-add this source's partial output into the per-token accumulator.
+            out_acc = out_acc.at[global_tids_s].add(out_s.astype(flat_x.dtype))
 
-    chunks = [_process_chunk(c, local_inputs[c]) for c in range(n_chunks)]
-    return jnp.concatenate(chunks, axis=0)
+    # Final psum_scatter across EP (combines ep partial sums into per-token result).
+    return jax.lax.psum_scatter(out_acc, ep_axis, scatter_dimension=0, tiled=True)
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13, 14))
