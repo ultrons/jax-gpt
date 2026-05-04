@@ -1,0 +1,15 @@
+# Don't include large reference materials in the Docker context — they'd
+# poison the cde tag computation (any change → new tag → image-not-found
+# until rebuild) without being used by the trainer container.
+*.pdf
+*.png
+*.pptx
+docs/
+research/
+notebooks/
+k8s/
+manifests/
+.git/
+.pytest_cache/
+__pycache__/
+*.pyc

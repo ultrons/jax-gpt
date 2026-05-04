@@ -73,3 +73,11 @@ service-account*.json
 *.bak
 *.orig
 .python-version
+
+# Reference materials (PDFs, screenshots, slide decks) — keep on disk as
+# untracked references but DON'T let them poison the cde tag hash. cde
+# computes the image tag from the working tree state; any drop-in PDF
+# (e.g. DSv4 paper, screenshots) would otherwise force a rebuild.
+*.pdf
+*.png
+*.pptx
