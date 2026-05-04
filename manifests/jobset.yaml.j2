@@ -58,18 +58,18 @@ spec:
                  (or any other python -m target). #}
               command: ["python", "-m", "{{ overrides.get('entrypoint_module', 'jax_gpt.models.dsv3.train') }}"]
               args:
+                {%- set _bool_flags = ('gradient_checkpoint', 'no_cp', 'moe_gmm_ag_presort', 'moe_xlayer_prefetch', 'moe_use_sc_scatter', 'moe_use_gmm_v2', 'moe_shard_e_with_fsdp', 'moe_shard_d_with_fsdp', 'moe_fp8_weights', 'moe_no_weight_ag', 'roofline') %}
                 {%- for k, v in overrides.items() %}
-                {%- if k not in ('namespace', 'priority_class', 'gradient_checkpoint', 'no_cp') %}
+                {%- if k not in ('namespace', 'priority_class', 'entrypoint_module', 'mount_weights') and k not in _bool_flags %}
                 - "--{{ k }}={{ v }}"
                 {%- endif %}
                 {%- endfor %}
-                {# Boolean flags rendered as bare --flag #}
-                {%- if overrides.get('gradient_checkpoint', True) %}
-                - "--gradient_checkpoint"
+                {# Boolean store_true flags rendered as bare --flag (or omitted if False) #}
+                {%- for f in _bool_flags %}
+                {%- if overrides.get(f, False) %}
+                - "--{{ f }}"
                 {%- endif %}
-                {%- if overrides.get('no_cp', True) %}
-                - "--no_cp"
-                {%- endif %}
+                {%- endfor %}
                 {# Profile output dir auto-wired from cde profile.base-uri #}
                 {%- for e in env %}
                 {%- if e.name == 'JAX_PROFILER_DIR' %}

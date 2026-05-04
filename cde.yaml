@@ -37,6 +37,11 @@ defaults_overrides:
   dtype: bfloat16
   steps: 5
   grad_clip: 1.0
+  # Boolean store_true flags — must be explicit now that the template
+  # treats unspecified as False (was implicitly True for these two
+  # via the previous overrides.get(..., True) defaults).
+  gradient_checkpoint: true
+  no_cp: true
 
 profile:
   base-uri: gs://max-experiments/dsv3/profiles
