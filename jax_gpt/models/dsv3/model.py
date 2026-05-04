@@ -1851,23 +1851,33 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
             result_c = jax.lax.psum_scatter(full_out_c, ep_axis,
                                              scatter_dimension=0, tiled=True)
             _maybe_check_finite("post_psum_scatter", result_c, c, debug_nans)
-            # v323 removed this barrier for n_chunks=2 perf; v341 found NaN at
-            # n_chunks=4 (same class as v325). Re-add ONLY when n_chunks > 2 —
-            # forces each chunk's psum_scatter output to be sealed before the
-            # downstream concat, preventing XLA from cross-chunk reorders that
-            # corrupt scatter-add ordering at higher chunk counts.
-            if n_chunks > 2:
-                result_c = jax.lax.optimization_barrier(result_c)
         return result_c
 
-    # Sibling chunks: each _process_chunk has its own AG → no cross-chunk
-    # operand. Intra-chunk barriers (around AG and scatter blocks above)
-    # keep each chunk atomic; XLA can schedule the two chunks in parallel
-    # on different engines (SC for AG/scatter, TC for ragged_dots).
-    # NO cross-chunk barrier — that would serialize them (MaxText's
-    # staggered_call pattern is for whole-microbatch serialization, not
-    # within-layer chunking).
-    chunks = [_process_chunk(c, local_inputs[c]) for c in range(n_chunks)]
+    # v341n (Path B): per-chunk serializing barrier between chunk c's output
+    # and chunk c+1's input. This kills cross-chunk async-RS pipelining
+    # (we lose ~50% of the n_chunks=4 perf benefit) but eliminates the
+    # XLA-scheduler-dependent NaN class observed in v341–v341l.
+    #
+    # The bug: at n_chunks > 2, XLA's latency-hiding scheduler pipelines
+    # chunk_c.psum_scatter with chunk_{c+1}.all_gather concurrently (using
+    # the 2 AsyncReduceScatter slots in LIBTPU_INIT_ARGS). At n_chunks=4
+    # this race produces wrong scatter-add ordering → NaN. Forcing a true
+    # data dependency from chunk_c.result_c into chunk_{c+1}.input
+    # serializes the chunk ordering at the HLO level so the scheduler
+    # cannot reorder them, regardless of latency-hiding-scheduler choices.
+    #
+    # This is the v325/v326 lesson applied at chunk granularity.
+    chunks = []
+    prev = None
+    for c in range(n_chunks):
+        x_c, i_c, w_c = local_inputs[c]
+        if prev is not None:
+            # Tie chunk c's input to chunk c-1's output so XLA must order them.
+            x_c, _ = jax.lax.optimization_barrier((x_c, prev))
+        out = _process_chunk(c, (x_c, i_c, w_c))
+        out = jax.lax.optimization_barrier(out)
+        chunks.append(out)
+        prev = out
     return jnp.concatenate(chunks, axis=0)   # (T, D)
 
 
