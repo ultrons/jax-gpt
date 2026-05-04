@@ -18,14 +18,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # JAX with TPU support + profiling + GCS cache deps.
-# jax 0.10.0 + libtpu 0.0.41.dev20260417: fixes host DMA inside lax.scan
-# (device_put to pinned_host for offloaded gradient checkpoints).
+# jax 0.10.0 + libtpu 0.0.41.dev20260504 (latest nightly as of 2026-05-04).
+# Bumped from dev20260417 to pull in 17 days of XLA scheduler/collective
+# fixes — investigating v341 NaN at n_chunks=4 (suspected XLA AG-fusion or
+# latency-hiding-scheduler bug at higher chunk counts).
 RUN pip install --upgrade pip && \
     pip install \
         "jax==0.10.0" "jaxlib==0.10.0" \
         -f https://storage.googleapis.com/jax-releases/libtpu_releases.html && \
     pip install \
-        "https://storage.googleapis.com/libtpu-nightly-releases/wheels/libtpu/libtpu-0.0.41.dev20260417+nightly-cp312-cp312-manylinux_2_31_x86_64.whl" && \
+        "https://storage.googleapis.com/libtpu-nightly-releases/wheels/libtpu/libtpu-0.0.41.dev20260504+nightly-cp312-cp312-manylinux_2_31_x86_64.whl" && \
     pip install \
         "etils[epath]" \
         tensorboard-plugin-profile \
