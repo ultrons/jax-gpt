@@ -86,6 +86,10 @@ spec:
                 value: "1"
               - name: JAX_TRACEBACK_FILTERING
                 value: "off"
+              {%- if overrides.get('jax_debug_nans', False) %}
+              - name: JAX_DEBUG_NANS
+                value: "true"
+              {%- endif %}
               - name: JAX_COMPILATION_CACHE_DIR
                 value: "gs://max-experiments/dsv3/jax-cc/cde-{{ run_id }}"
               - name: TF_CPP_MIN_LOG_LEVEL

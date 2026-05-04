@@ -399,6 +399,17 @@ def run_roofline(cfg: ModelConfig, args):
 # ============================================================================
 
 def main():
+    # JAX numerical-debug flags MUST be set before any JIT compilation.
+    # Read straight from env so users can pass via env injection too.
+    import os as _os
+    if _os.environ.get("JAX_DEBUG_NANS", "").lower() in ("1", "true", "yes"):
+        jax.config.update("jax_debug_nans", True)
+        print("⚠️  jax_debug_nans=True — JIT'd ops will re-execute in de-optimized "
+              "mode on first NaN to pinpoint the producing op. Slow.", flush=True)
+    if _os.environ.get("JAX_DEBUG_INFS", "").lower() in ("1", "true", "yes"):
+        jax.config.update("jax_debug_infs", True)
+        print("⚠️  jax_debug_infs=True", flush=True)
+
     # Multi-host init (no-op on single host)
     jax.distributed.initialize(initialization_timeout=600)  # 10 min for large slices
 
