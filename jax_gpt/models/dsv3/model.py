@@ -156,11 +156,34 @@ def debug_671b_config() -> ModelConfig:
     return mini_config()
 
 
+def full_671b_maxtext_config() -> ModelConfig:
+    """DSv3 671B with all DSv3-specific architectural knobs that MaxText
+    trains with (configs/models/deepseek3-671b.yml). Preserves v304 default
+    of full_671b_config() in every other respect.
+
+    Use this when loading the MaxText DSv3-FSDP checkpoint
+    (gs://mlperf-6-submission/ckpt0424-fsdp/0/items) — its weights were
+    trained against this exact set of architectural choices, and any single
+    mismatch silently corrupts the forward pass.
+    """
+    cfg = full_671b_config()
+    cfg.name = "full_671b_maxtext"
+    cfg.V = 129280                       # MaxText DSv3 vocab (vs our 102400 default)
+    cfg.routed_scaling_factor = 2.5      # post-norm routing weight scale
+    cfg.n_routing_groups = 8             # split 256 experts into 8 groups
+    cfg.topk_routing_group = 4           # select top-4 groups per token
+    cfg.use_yarn_scale = True            # YaRN-modified MLA softmax scale
+    cfg.attn_mscale = 1.0                # mscale=1.0 in MaxText config
+    cfg.rope_factor = 40.0               # YaRN extrapolation factor
+    return cfg
+
+
 # Registry for train.py --config flag
 CONFIGS = {
-    "full":       full_671b_config,
-    "mini":       mini_config,
-    "debug":      debug_671b_config,
+    "full":           full_671b_config,
+    "full_maxtext":   full_671b_maxtext_config,
+    "mini":           mini_config,
+    "debug":          debug_671b_config,
 }
 
 
@@ -410,72 +433,6 @@ def _splash_cp_attention(query, key, value, scale: float,
                                  q_seq_shards=1, block_sizes=block_sizes)
     return jax.vmap(fn)(query * scale, key, value)
 
-
-def _mla_attention_cp_body(x, positions, wq_a, wq_b, q_norm, wkv_a, wkv_b, kv_norm, w_out,
-                           cfg_H, cfg_d_v, cfg_d_nope, cfg_d_rope, cfg_R_kv, cfg_qk_dim,
-                           cfg_norm_eps, ep_axis, cfg_softmax_scale=None):
-    """MLA attention with context parallelism — runs inside shard_map with "ep" axis.
-
-    AllGathers compressed kv_a across EP (288 MB), expands to full K,V locally,
-    computes Q(S_local) × K(S_full) attention, returns (B_local, S_local, D).
-    """
-    B, S_local, D = x.shape
-    H, d_v = cfg_H, cfg_d_v
-    d_nope, d_rope = cfg_d_nope, cfg_d_rope
-    qk_dim = cfg_qk_dim
-
-    h = rms_norm(x, jnp.ones(D, dtype=x.dtype), cfg_norm_eps)  # pre_attn_norm applied outside
-
-    # Q projection — local S_local
-    q_a = h @ wq_a
-    q_a = rms_norm(q_a, q_norm, cfg_norm_eps)
-    q   = (q_a @ wq_b).reshape(B, S_local, H, qk_dim)
-
-    # KV projection — local S_local, then AllGather across EP
-    kv_a = h @ wkv_a                                           # (B, S_local, R_kv+d_rope)
-
-    # ★ CP AllGather: 288 MB on EP axis ★
-    kv_a = jax.lax.all_gather(kv_a, ep_axis, axis=1, tiled=True)  # (B, S_full, R_kv+d_rope)
-    S_full = kv_a.shape[1]
-
-    kv_a_norm = rms_norm(kv_a[..., :cfg_R_kv], kv_norm, cfg_norm_eps)
-    kv   = (kv_a_norm @ wkv_b).reshape(B, S_full, H, d_nope + d_v)
-    k_nope, v = kv[..., :d_nope], kv[..., d_nope:]
-    k_rope = jnp.broadcast_to(
-        kv_a[..., cfg_R_kv:].reshape(B, S_full, 1, d_rope), (B, S_full, H, d_rope))
-
-    # RoPE — Q uses local positions, K uses full positions
-    q_nope, q_rope = q[..., :d_nope], q[..., d_nope:]
-    cos_q, sin_q = _rope_freqs(S_local, d_rope, positions, x.dtype)
-    q_rope = _apply_rope(q_rope, cos_q, sin_q)
-
-    ep_size = jax.lax.axis_size(ep_axis)
-    positions_full = jnp.broadcast_to(jnp.arange(S_full), (B, S_full))
-    cos_k, sin_k = _rope_freqs(S_full, d_rope, positions_full, x.dtype)
-    k_rope = _apply_rope(k_rope, cos_k, sin_k)
-
-    q = jnp.concatenate([q_nope, q_rope], axis=-1)
-    k = jnp.concatenate([k_nope, k_rope], axis=-1)
-
-    scale = cfg_softmax_scale if cfg_softmax_scale is not None else 1.0 / math.sqrt(qk_dim)
-
-    # Attention: Q(S_local) × K(S_full) — asymmetric, JAX matmul
-    q_t = q.transpose(0, 2, 1, 3)   # (B, H, S_local, qk_dim)
-    k_t = k.transpose(0, 2, 1, 3)   # (B, H, S_full, qk_dim)
-    v_t = v.transpose(0, 2, 1, 3)   # (B, H, S_full, d_v)
-
-    attn_w = jnp.einsum("bhsq,bhtq->bhst", q_t, k_t) * scale
-    # Causal mask using global positions
-    q_pos = positions[:, :, None]
-    k_pos = jnp.arange(S_full)[None, None, :]
-    causal = q_pos >= k_pos
-    attn_w = jnp.where(causal[:, None], attn_w, jnp.finfo(q_t.dtype).min)
-    attn_w = jax.nn.softmax(attn_w.astype(jnp.float32), axis=-1).astype(q_t.dtype)
-    attn_out = jnp.einsum("bhst,bhtd->bhsd", attn_w, v_t)
-
-    # Output projection
-    attn_flat = attn_out.transpose(0, 2, 1, 3).reshape(B, S_local, H * d_v)
-    return attn_flat @ w_out
 
 
 def mla_attention(x, params, positions, cfg: ModelConfig, use_cp: bool | None = None):
@@ -785,7 +742,7 @@ def _expert_mlp_ep_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
     flat_indices: (T_fsdp, K)                    global expert IDs
     flat_weights: (T_fsdp, K)                    routing weights
     """
-    from backward_kernel import sc_gather_rows  # noqa: E402
+    from .kernels.fused_moe_bwd.backward_kernel import sc_gather_rows  # noqa: E402
 
     T, D = flat_x.shape
     E_local = wi_0.shape[0]
@@ -2366,7 +2323,7 @@ def _moe_pallas_v4_fwd(fx, fi, fw, fg, w0, w1, wo,
 
 def _moe_pallas_v4_bwd(mesh, K, act_spec, ep_axis, max_tpe, res, g):
     """Backward via fused_ep_moe_bwd_v4 Pallas kernel."""
-    from backward_kernel_v4 import fused_ep_moe_bwd_v4
+    from .kernels.fused_moe_bwd.backward_kernel_v4 import fused_ep_moe_bwd_v4
     from jax.experimental.shard_map import shard_map
 
     fx, fi, fw, fg, w0, w1, wo = res
@@ -3115,6 +3072,70 @@ def forward(params, tokens, cfg: ModelConfig, return_final_x: bool = False):
         logits = x @ params["output_head"]
 
     return logits, total_aux
+
+
+def forward_with_layer_stats(params, tokens, cfg: ModelConfig):
+    """Debug-only forward: runs layers in a Python loop (no scan) and
+    collects per-layer residual-norm + per-MoE-layer aux contribution.
+    SLOWER and consumes more compile time than `forward()`, but lets you
+    diff our forward against a reference (e.g. MaxText) one layer at a
+    time — exactly what was missing during the Tier 3 calibration arc.
+
+    Returns (x_final_normed, layer_stats) where layer_stats is a list of
+    dicts (one per dense + MoE layer), each with:
+      - layer_idx (int, 0..L-1)
+      - kind ('dense' | 'moe')
+      - resid_norm (scalar f32) — L2 norm of x[0, last_real_pos, :]
+      - aux_local (scalar f32, MoE only) — per-layer routing aux loss
+    """
+    B, S = tokens.shape
+    positions = jnp.broadcast_to(jnp.arange(S), (B, S))
+
+    # Re-use the embedding logic from forward() — keep this in sync.
+    with jax.named_scope("embedding"):
+        SC_MAX_V = 65536
+        flat_tok = tokens.reshape(-1)
+        V_total  = params["embed"].shape[0]
+        D_emb    = params["embed"].shape[1]
+        x_flat   = jnp.zeros((flat_tok.shape[0], D_emb), dtype=params["embed"].dtype)
+        v_start  = 0
+        while v_start < V_total:
+            v_end   = min(v_start + SC_MAX_V, V_total)
+            chunk   = params["embed"][v_start:v_end]
+            in_c    = (flat_tok >= v_start) & (flat_tok < v_end)
+            loc_idx = jnp.where(in_c, flat_tok - v_start, 0)
+            x_flat  = x_flat + jnp.where(in_c[:, None], chunk[loc_idx], 0)
+            v_start = v_end
+        x = x_flat.reshape(B, S, D_emb)
+
+    def _resid_norm(x_):
+        # L2 norm of last position of batch row 0, in fp32.
+        return jnp.linalg.norm(x_[0, -1, :].astype(jnp.float32))
+
+    stats: list[dict] = []
+
+    # Dense layers
+    for i in range(cfg.L_dense):
+        layer_p = jax.tree.map(lambda w: w[i], params["dense_layers"])
+        x = _dense_layer_body(x, layer_p, positions, cfg)
+        stats.append({
+            "layer_idx": i, "kind": "dense",
+            "resid_norm": _resid_norm(x),
+        })
+
+    # MoE layers
+    for i in range(cfg.L_moe):
+        layer_p = jax.tree.map(lambda w: w[i], params["moe_layers"])
+        x, aux = _moe_layer_body(x, layer_p, positions, cfg)
+        stats.append({
+            "layer_idx": cfg.L_dense + i, "kind": "moe",
+            "resid_norm": _resid_norm(x),
+            "aux_local": aux.astype(jnp.float32),
+        })
+
+    # Final norm
+    x = rms_norm(x, params["final_norm"], cfg.norm_eps)
+    return x, stats
 
 
 # ============================================================================

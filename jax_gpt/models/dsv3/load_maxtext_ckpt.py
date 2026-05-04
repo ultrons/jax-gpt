@@ -380,4 +380,10 @@ def load_maxtext_dsv3(ckpt_path: str, cfg: ModelConfig, mesh: Mesh) -> dict:
     }
 
     print("  (skipping mtp_block, step — not modeled in our DSv3)")
+
+    # ParamLayout validation — fail fast on shape/sharding drift instead of
+    # waiting 5 min for JIT to crash with `dot_general contracting dims`.
+    from .param_layouts import validate
+    validate(params, cfg, strict=True)
+    print("  ParamLayout: ✓ all shapes and shardings match canonical layout.")
     return params

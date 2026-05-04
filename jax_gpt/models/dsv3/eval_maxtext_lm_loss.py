@@ -26,20 +26,24 @@ import jax
 import jax.numpy as jnp
 
 from .model import (
-    ModelConfig, full_671b_config, ShardConfig, forward,
+    ModelConfig, full_671b_maxtext_config, ShardConfig, forward,
     _vocab_ce,
 )
 from .load_maxtext_ckpt import load_maxtext_dsv3
 
 
-# Pre-tokenized via HF deepseek-ai/DeepSeek-V3 tokenizer.
-# Source text:
-#   "The capital of France is Paris. France is a country in Western Europe
-#    known for its art, culture, cuisine, and history. Paris, the capital,
-#    is home to many world-famous landmarks including the Eiffel Tower, the
-#    Louvre Museum, and the Notre-Dame Cathedral. The Seine River runs
-#    through the heart of the city, dividing it into two banks: the Right
-#    Bank and the Left Bank, each with its own distinct character."
+# Source text used to seed DEFAULT_IDS — kept verbatim for the runtime
+# tokenizer round-trip assertion (verify_tokens). The smoking gun in the
+# t-series was that DEFAULT_IDS were NOT actually produced by the claimed
+# tokenizer; only token 0 matched. Now any drift fails fast at startup.
+SOURCE_TEXT = (
+    "The capital of France is Paris. France is a country in Western Europe "
+    "known for its art, culture, cuisine, and history. Paris, the capital, "
+    "is home to many world-famous landmarks including the Eiffel Tower, "
+    "the Louvre Museum, and the Notre-Dame Cathedral. The Seine River runs "
+    "through the heart of the city, dividing it into two banks: the Right "
+    "Bank and the Left Bank, each with its own distinct character."
+)
 DEFAULT_IDS = [
     # Re-tokenized 2026-05-02 via HF deepseek-ai/DeepSeek-V3 tokenizer
     # (tokenizer.encode(text, add_special_tokens=False)). The previous
@@ -56,10 +60,48 @@ DEFAULT_IDS = [
 ]
 
 
+def verify_default_ids(strict: bool = True) -> None:
+    """Re-tokenize SOURCE_TEXT and assert DEFAULT_IDS matches.
+
+    Catches the bug class where hardcoded token IDs drift from what the
+    tokenizer actually produces (the t8-t14 trap: only the first token
+    matched, model received nonsense, CE was stuck near random).
+
+    Skipped silently if `transformers` isn't installed in the pod.
+    """
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        print("verify_default_ids: transformers not installed; skipping.")
+        return
+    tk = AutoTokenizer.from_pretrained(
+        "deepseek-ai/DeepSeek-V3", trust_remote_code=True)
+    actual = tk.encode(SOURCE_TEXT, add_special_tokens=False)
+    if actual == DEFAULT_IDS:
+        print(f"verify_default_ids: ✓ {len(actual)} tokens match HF DSv3 tokenizer.")
+        return
+    # Find first divergence for diagnostic
+    n = min(len(actual), len(DEFAULT_IDS))
+    first_diff = next((i for i in range(n) if actual[i] != DEFAULT_IDS[i]), n)
+    msg = (
+        f"DEFAULT_IDS DO NOT MATCH HF DSv3 tokenizer encoding.\n"
+        f"  expected (encode): len={len(actual)}, first 10 = {actual[:10]}\n"
+        f"  got (DEFAULT_IDS):  len={len(DEFAULT_IDS)}, first 10 = {DEFAULT_IDS[:10]}\n"
+        f"  first divergence at index {first_diff}.\n"
+        f"  → re-tokenize SOURCE_TEXT and update DEFAULT_IDS before proceeding."
+    )
+    if strict:
+        raise RuntimeError(msg)
+    print("WARN " + msg)
+
+
 def main():
     import os
     if os.environ.get("MEGASCALE_COORDINATOR_ADDRESS"):
         jax.distributed.initialize()
+    # Tokenizer round-trip guard — fail fast on hallucinated DEFAULT_IDS.
+    if jax.process_index() == 0:
+        verify_default_ids(strict=True)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", default="gs://mlperf-6-submission/ckpt0424-fsdp/0/items")
@@ -70,30 +112,13 @@ def main():
     if unknown:
         print(f"(ignoring inherited training-only flags: {unknown})")
 
-    # MUST set vocab=129280 BEFORE init/load — output_head & embed shapes depend on it.
-    cfg = full_671b_config()
-    cfg.V = 129280                      # MaxText DSv3 vocab
-    # gmm_ag matches v304 training and avoids the _moe_jax_ep code path,
-    # whose `from backward_kernel import sc_gather_rows` (model.py:735) fails
-    # in our pod (PYTHONPATH=/app, but kernel lives at .kernels.fused_moe_bwd).
-    cfg.moe_backend = "gmm_ag"
-    cfg.gradient_checkpoint = False     # inference only
-    # MaxText-trained DSv3 671B uses routed_scaling_factor=2.5 (its config
-    # configs/models/deepseek3-671b.yml). Without this, MoE outputs are
-    # ~2.5x under-weighted in the residual stream → high LM CE.
-    cfg.routed_scaling_factor = 2.5
-    # DSv3 671B group-limited routing: 256 experts split into 8 groups, top-4
-    # groups selected per token. Without this, our flat top-K picks different
-    # experts than the model was trained for → very high aux + bad LM CE.
-    cfg.n_routing_groups = 8
-    cfg.topk_routing_group = 4
-    # YaRN-modified attention softmax scale (MaxText's MLA: rope_factor=40,
-    # mscale=1.0). Effective scale ≈ 0.1352 vs vanilla 0.0722 → ~1.87x
-    # sharper softmax. The model was trained with this; without it, attention
-    # is too flat → high LM CE.
-    cfg.use_yarn_scale = True
-    cfg.attn_mscale = 1.0
-    cfg.rope_factor = 40.0
+    # All DSv3-MaxText architectural knobs in one place (V=129280,
+    # routed_scaling_factor=2.5, n_routing_groups=8, topk_routing_group=4,
+    # use_yarn_scale=True, attn_mscale=1.0, rope_factor=40). Each is
+    # required to match MaxText's trained behavior — see model.py.
+    cfg = full_671b_maxtext_config()
+    cfg.moe_backend = "gmm_ag"           # avoid _moe_jax_ep import path
+    cfg.gradient_checkpoint = False      # inference only
 
     shard_cfg = ShardConfig(fsdp=args.fsdp, ep=args.ep, tp=args.tp)
     mesh = shard_cfg.create_mesh()
