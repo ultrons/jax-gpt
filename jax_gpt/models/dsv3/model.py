@@ -128,6 +128,10 @@ class ModelConfig:
                                          # (halves the per-layer 7 GB AG allocation)
     moe_no_weight_ag: bool = False       # use colrow+A2A body for tp>1+ep>1, removes
                                          # per-layer weight AllGather (1.4 GB transient)
+    moe_debug_nans: bool = False         # insert breakpoint_if_nonfinite checks at strategic
+                                         # points in _expert_mlp_gmm_ag_body (post-AG, post-sort,
+                                         # post-ragged_dot×3, post-scatter, pre-psum_scatter).
+                                         # Halts in pdb on first NaN. v304 default is OFF.
 
     @property
     def L_moe(self) -> int:
@@ -1657,11 +1661,30 @@ _sc_combine_with_vjp.defvjp(_sc_combine_fwd, _sc_combine_bwd)
 
 
 
+def _maybe_check_finite(label: str, x, c: int, debug_nans: bool) -> None:
+    """Print {any_nan, any_inf, max_abs} for `x` via jax.debug.print when
+    debug_nans is True. ordered=True forces print serialization so the log
+    sequence matches code order — useful for finding the first non-finite
+    tensor inside a chunk loop. Safe in shard_map; UNSAFE in pmap.
+    """
+    if not debug_nans:
+        return
+    jax.debug.print(
+        "[finite-check] " + label + " c={c}: nan={n} inf={i} max_abs={m}",
+        c=c,
+        n=jnp.isnan(x).any(),
+        i=jnp.isinf(x).any(),
+        m=jnp.max(jnp.abs(x.astype(jnp.float32))),
+        ordered=True,
+    )
+
+
 def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
                               K: int, ep_axis: str, fsdp_axis: str,
                               n_chunks: int = 2, use_sc_scatter: bool = False,
                               use_gmm_v2: bool = False,
-                              use_fp8_weights: bool = False):
+                              use_fp8_weights: bool = False,
+                              debug_nans: bool = False):
     """AG-dispatch MoE body with token chunking for compute/comm overlap.
 
     Chunks the post-AG processing into n_chunks token chunks. Per-chunk
@@ -1728,6 +1751,7 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
             # but NaN — XLA reordered AG outputs in a way that broke correctness.
             chunk_x, chunk_indices, chunk_weights = jax.lax.optimization_barrier(
                 (chunk_x, chunk_indices, chunk_weights))
+            _maybe_check_finite("post_token_AG", chunk_x, c, debug_nans)
 
             # Phase 2: sort by expert, slice local block.
             TK_c = chunk_size * K
@@ -1753,6 +1777,8 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
             local_eids_c = jnp.where(valid_c, local_eids_raw_c - local_start, 0).astype(jnp.int32)
             local_ws_c   = jnp.where(valid_c, local_ws_raw_c, 0.0)
             local_x_c    = chunk_x[local_tids_c]
+            _maybe_check_finite("post_sort_local_x", local_x_c, c, debug_nans)
+            _maybe_check_finite("post_sort_local_ws", local_ws_c, c, debug_nans)
 
             ends_c   = jnp.searchsorted(local_eids_c, jnp.arange(1, E_local + 1))
             starts_c = jnp.searchsorted(local_eids_c, jnp.arange(E_local))
@@ -1786,13 +1812,17 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
             else:
                 gate = jax.nn.silu(jax.lax.ragged_dot(
                     local_x_c.astype(wi_0_t.dtype), wi_0_t, group_sizes_c))
+                _maybe_check_finite("post_gate_silu", gate, c, debug_nans)
                 up = jax.lax.ragged_dot(
                     local_x_c.astype(wi_1_t.dtype), wi_1_t, group_sizes_c)
+                _maybe_check_finite("post_up", up, c, debug_nans)
                 hidden = gate * up
                 out_local_c = jax.lax.ragged_dot(
                     hidden.astype(wo_f.dtype), wo_f, group_sizes_c)
+                _maybe_check_finite("post_wo", out_local_c, c, debug_nans)
 
             out_local_c = out_local_c * local_ws_c[:, None].astype(out_local_c.dtype)
+            _maybe_check_finite("post_weight_mask", out_local_c, c, debug_nans)
 
             # Phase 4: scatter back to per-token rows, then psum_scatter across EP.
             # v323: removed optimization_barrier around scatter — same reason as Phase 1.
@@ -1814,8 +1844,10 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
                 # Default — HBM scatter-add. Best perf at our chunk count.
                 full_out_c = jnp.zeros((chunk_size, D), dtype=flat_x.dtype).at[
                     local_tids_c].add(out_local_c.astype(flat_x.dtype))
+            _maybe_check_finite("post_scatter", full_out_c, c, debug_nans)
             result_c = jax.lax.psum_scatter(full_out_c, ep_axis,
                                              scatter_dimension=0, tiled=True)
+            _maybe_check_finite("post_psum_scatter", result_c, c, debug_nans)
             # v323 removed this barrier for n_chunks=2 perf; v341 found NaN at
             # n_chunks=4 (same class as v325). Re-add ONLY when n_chunks > 2 —
             # forces each chunk's psum_scatter output to be sealed before the
@@ -1836,11 +1868,12 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
     return jnp.concatenate(chunks, axis=0)   # (T, D)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13, 14))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
 def _moe_gmm_ag(fx, fi, fw, w0, w1, wout,
                 mesh, K: int, act_spec, ep_axis: str, max_tpe: int,
                 use_sc_scatter: bool = False, use_gmm_v2: bool = False,
-                n_chunks: int = 2, use_fp8_weights: bool = False):
+                n_chunks: int = 2, use_fp8_weights: bool = False,
+                debug_nans: bool = False):
     """AG-dispatch GMM — AllGather tokens on EP + AllGather F on FSDP."""
     from jax.experimental.shard_map import shard_map
     ep = mesh.shape.get("ep", 1) if mesh else 1
@@ -1862,20 +1895,22 @@ def _moe_gmm_ag(fx, fi, fw, w0, w1, wout,
                                        n_chunks=n_chunks,
                                        use_sc_scatter=use_sc_scatter,
                                        use_gmm_v2=use_gmm_v2,
-                                       use_fp8_weights=use_fp8_weights)
+                                       use_fp8_weights=use_fp8_weights,
+                                       debug_nans=debug_nans)
     return _fn(fx, fi, fw, w0, w1, wout)
 
 
 def _moe_gmm_ag_fwd(fx, fi, fw, w0, w1, wout,
                     mesh, K, act_spec, ep_axis, max_tpe, use_sc_scatter, use_gmm_v2,
-                    n_chunks, use_fp8_weights):
+                    n_chunks, use_fp8_weights, debug_nans):
     out = _moe_gmm_ag(fx, fi, fw, w0, w1, wout, mesh, K, act_spec, ep_axis,
-                      max_tpe, use_sc_scatter, use_gmm_v2, n_chunks, use_fp8_weights)
+                      max_tpe, use_sc_scatter, use_gmm_v2, n_chunks, use_fp8_weights,
+                      debug_nans)
     return out, (fx, fi, fw, w0, w1, wout)
 
 
 def _moe_gmm_ag_bwd(mesh, K, act_spec, ep_axis, max_tpe, use_sc_scatter, use_gmm_v2,
-                    n_chunks, use_fp8_weights, res, g):
+                    n_chunks, use_fp8_weights, debug_nans, res, g):
     from jax.experimental.shard_map import shard_map
     ep = mesh.shape.get("ep", 1) if mesh else 1
     if ep > 1:
@@ -1899,7 +1934,8 @@ def _moe_gmm_ag_bwd(mesh, K, act_spec, ep_axis, max_tpe, use_sc_scatter, use_gmm
                                            n_chunks=n_chunks,
                                            use_sc_scatter=use_sc_scatter,
                                            use_gmm_v2=use_gmm_v2,
-                                           use_fp8_weights=use_fp8_weights)
+                                           use_fp8_weights=use_fp8_weights,
+                                           debug_nans=debug_nans)
         return _fn(fx_, fi, fw_, w0_, w1_, wout_)
 
     _, vjp_fn = jax.vjp(_fwd, fx, fw, w0, w1, wout)
@@ -1936,7 +1972,8 @@ def expert_mlp_gmm_ag(x, wi_0, wi_1, wo, top_k_weights, top_k_indices,
                           wi_0, wi_1, wo,
                           cfg.mesh, K, act_spec, "ep", max_tpe,
                           cfg.moe_use_sc_scatter, cfg.moe_use_gmm_v2,
-                          cfg.moe_n_chunks, cfg.moe_fp8_weights)
+                          cfg.moe_n_chunks, cfg.moe_fp8_weights,
+                          cfg.moe_debug_nans)
     return out.reshape(B, S, D)
 
 

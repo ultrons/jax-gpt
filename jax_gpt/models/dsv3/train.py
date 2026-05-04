@@ -482,6 +482,12 @@ def main():
                              "F-fsdp-sharded throughout — psum on TP after wi, psum on "
                              "FSDP after wo. Removes the per-layer weight AllGather "
                              "transient (~1.4 GB at EP=8/TP=2). Pairs with --moe_backend=gmm.")
+    parser.add_argument("--moe_debug_nans", action="store_true",
+                        help="Insert jax.debug.print finite-checks at strategic points "
+                             "in the gmm_ag MoE body (post-AG, post-sort, post-ragged_dot×3, "
+                             "post-scatter, post-psum_scatter). Logs NaN/Inf/max-abs per "
+                             "chunk with ordered=True so the first non-finite tensor is "
+                             "easy to find in kubectl logs. Slow due to host-device sync.")
     args = parser.parse_args()
 
     cfg = CONFIGS[args.config]()
@@ -516,6 +522,8 @@ def main():
         cfg.moe_fp8_weights = True
     if args.moe_no_weight_ag:
         cfg.moe_no_weight_ag = True
+    if args.moe_debug_nans:
+        cfg.moe_debug_nans = True
         from . import model as _model
         _model._MOE_NO_WEIGHT_AG = True
 

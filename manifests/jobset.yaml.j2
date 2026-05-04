@@ -58,9 +58,11 @@ spec:
                  (or any other python -m target). #}
               command: ["python", "-m", "{{ overrides.get('entrypoint_module', 'jax_gpt.models.dsv3.train') }}"]
               args:
-                {%- set _bool_flags = ('gradient_checkpoint', 'no_cp', 'moe_xlayer_prefetch', 'moe_use_sc_scatter', 'moe_use_gmm_v2', 'moe_shard_e_with_fsdp', 'moe_shard_d_with_fsdp', 'moe_fp8_weights', 'moe_no_weight_ag', 'roofline') %}
+                {%- set _bool_flags = ('gradient_checkpoint', 'no_cp', 'moe_xlayer_prefetch', 'moe_use_sc_scatter', 'moe_use_gmm_v2', 'moe_shard_e_with_fsdp', 'moe_shard_d_with_fsdp', 'moe_fp8_weights', 'moe_no_weight_ag', 'moe_debug_nans', 'roofline') %}
+                {# Keys consumed by template/env path only — never rendered as CLI args. #}
+                {%- set _env_only = ('namespace', 'priority_class', 'entrypoint_module', 'mount_weights', 'jax_debug_nans', 'jax_debug_infs') %}
                 {%- for k, v in overrides.items() %}
-                {%- if k not in ('namespace', 'priority_class', 'entrypoint_module', 'mount_weights') and k not in _bool_flags %}
+                {%- if k not in _env_only and k not in _bool_flags %}
                 - "--{{ k }}={{ v }}"
                 {%- endif %}
                 {%- endfor %}
