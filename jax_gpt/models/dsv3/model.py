@@ -1816,7 +1816,13 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
                     local_tids_c].add(out_local_c.astype(flat_x.dtype))
             result_c = jax.lax.psum_scatter(full_out_c, ep_axis,
                                              scatter_dimension=0, tiled=True)
-            # v323: removed final optimization_barrier
+            # v323 removed this barrier for n_chunks=2 perf; v341 found NaN at
+            # n_chunks=4 (same class as v325). Re-add ONLY when n_chunks > 2 —
+            # forces each chunk's psum_scatter output to be sealed before the
+            # downstream concat, preventing XLA from cross-chunk reorders that
+            # corrupt scatter-add ordering at higher chunk counts.
+            if n_chunks > 2:
+                result_c = jax.lax.optimization_barrier(result_c)
         return result_c
 
     # Sibling chunks: each _process_chunk has its own AG → no cross-chunk
