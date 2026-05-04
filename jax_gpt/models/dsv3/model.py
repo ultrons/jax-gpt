@@ -1927,6 +1927,8 @@ def _moe_gmm_ag_bwd(mesh, K, act_spec, ep_axis, max_tpe, use_sc_scatter, use_gmm
 
     fx, fi, fw, w0, w1, wout = res
 
+    _maybe_check_finite("bwd_in_g", g, 0, debug_nans)
+
     def _fwd(fx_, fw_, w0_, w1_, wout_):
         @functools.partial(shard_map, mesh=mesh,
                            in_specs=(_act_x, _act_iw, _act_iw, _wt_i, _wt_i, _wt_o),
@@ -1943,6 +1945,13 @@ def _moe_gmm_ag_bwd(mesh, K, act_spec, ep_axis, max_tpe, use_sc_scatter, use_gmm
 
     _, vjp_fn = jax.vjp(_fwd, fx, fw, w0, w1, wout)
     d_fx, d_fw, d_w0, d_w1, d_wout = vjp_fn(g)
+
+    _maybe_check_finite("bwd_out_d_fx",   d_fx,   0, debug_nans)
+    _maybe_check_finite("bwd_out_d_fw",   d_fw,   0, debug_nans)
+    _maybe_check_finite("bwd_out_d_w0",   d_w0,   0, debug_nans)
+    _maybe_check_finite("bwd_out_d_w1",   d_w1,   0, debug_nans)
+    _maybe_check_finite("bwd_out_d_wout", d_wout, 0, debug_nans)
+
     return (d_fx, jnp.zeros_like(fi), d_fw, d_w0, d_w1, d_wout)
 
 
