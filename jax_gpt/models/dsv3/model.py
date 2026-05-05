@@ -3279,6 +3279,17 @@ def _vocab_ce_bwd(n_chunks, V_CHUNK, residuals, g):
     D = x_pred.shape[-1]
     scale = g / jnp.asarray(B_l * S_l, jnp.float32)   # grad of mean: 1/N
 
+    # In-graph diagnostics for bwd-NaN bisection. Always-on, cheap (scalar
+    # reductions). Output appears as `[vce-bwd]` lines in stdout.
+    jax.debug.print(
+        "[vce-bwd] inputs: x_pred nan={a} max={b} | LSE nan={c} max={d} min={e} | g={g}",
+        a=jnp.isnan(x_pred).any(),
+        b=jnp.max(jnp.abs(x_pred.astype(jnp.float32))),
+        c=jnp.isnan(log_sum_exp).any(),
+        d=jnp.max(log_sum_exp),
+        e=jnp.min(log_sum_exp),
+        g=g)
+
     def _bwd_body(carry, v_idx):
         d_x, d_w = carry
         vs  = v_idx * V_CHUNK
@@ -3302,6 +3313,14 @@ def _vocab_ce_bwd(n_chunks, V_CHUNK, residuals, g):
     d_w0 = jnp.zeros_like(output_head).astype(jnp.float32)
     (d_x_pred_f32, d_w_f32), _ = jax.lax.scan(
         _bwd_body, (d_x0, d_w0), jnp.arange(n_chunks, dtype=jnp.int32))
+
+    jax.debug.print(
+        "[vce-bwd] outputs: d_x nan={a} max={b} | d_w nan={c} max={d}",
+        a=jnp.isnan(d_x_pred_f32).any(),
+        b=jnp.max(jnp.abs(d_x_pred_f32)),
+        c=jnp.isnan(d_w_f32).any(),
+        d=jnp.max(jnp.abs(d_w_f32)))
+
     return d_x_pred_f32.astype(x_pred.dtype), d_w_f32.astype(output_head.dtype), None
 
 
