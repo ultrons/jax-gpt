@@ -166,6 +166,13 @@ recommended next human action. Then stop.
 
 ## 5. Filing tool-bug issues
 
+The canonical issue body template lives at `autoperf/ISSUE_TEMPLATE.md`.
+Each tool repo also has a `.github/ISSUE_TEMPLATE/autoperf-blocking.md` that
+`gh issue create --template autoperf-blocking` will pre-populate. Use either;
+the schema is the same.
+
+
+
 If a tool fails in a structured way (perfsim mispredicts a leaf you
 microbenched, cde lacks a flag you need, xla-shell can't bucket a fusion
 name), file an issue rather than working around it:
