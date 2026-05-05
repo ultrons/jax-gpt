@@ -30,6 +30,15 @@ make sensible experiments without re-discovering known-broken paths.
 - Mesh assignment used by v304: `X=4 Y=8 Z=8 C=2` → `EP=X(4), FSDP=Y·Z·C(128), TP=—`
 - 512 devices total (256 chips × 2 cores)
 
+**perfsim repo path** (canonical): `~/ml-experiments-perfsim/`. Host
+convention is to set up `~/perfsim` → `~/ml-experiments-perfsim` as a
+symlink (`ln -sfn ~/ml-experiments-perfsim ~/perfsim` once per machine).
+AGENT.md files use the symlinked path `~/perfsim/perfsim/...` for
+readability; fall back to the canonical path on machines without the
+symlink. Known duplicate: `~/ml-experiments/perfsim/` is a separate
+git checkout of currently-identical perfsim content — treat
+`~/ml-experiments-perfsim/` as authoritative for autoperf purposes.
+
 **Cluster context**: `gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-rbq`
 - Namespace: `poc-dev`
 - Priority class: `poc-dev-priority`

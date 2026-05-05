@@ -19,6 +19,24 @@ profiles/<run-id>/   pulled cluster profile (gitignored)
 
 That's the whole repo. The agent IS the orchestrator. There is no Python loop.
 
+## One-time host setup
+
+The AGENT.md files reference perfsim via `~/perfsim/perfsim/docs/...`.
+Since the ultrons/perfsim repo clones to `~/ml-experiments-perfsim/` by
+convention (legacy directory name), a symlink is required:
+
+```bash
+ln -sfn ~/ml-experiments-perfsim ~/perfsim
+```
+
+If you skip this, the agent's path references won't resolve. On a fresh
+machine, do this once before starting any session.
+
+(There's also a third copy of perfsim under `~/ml-experiments/perfsim/`
+in a separate git repo — currently bit-identical to the canonical copy,
+but they may drift. Treat `~/ml-experiments-perfsim/` as authoritative;
+file a perfsim-side issue if the duplication isn't intentional.)
+
 ## How a human kicks it off
 
 In a long-running Claude Code session in this repo:
