@@ -232,6 +232,35 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
                     jax.tree.map(lambda x: x / n_accum, final["aux"]),
                     jax.tree.map(lambda g: g / n_accum, final["grads"]))
 
+        # Shared grad-clip helper. Applies on BOTH optimizer paths so AdamW
+        # gets the same clipping as SGD (was missing on AdamW path).
+        def _maybe_clip_grads(grads):
+            if args.grad_clip is None:
+                return grads
+            grad_norm = jnp.sqrt(sum(
+                jnp.sum(g.astype(jnp.float32) ** 2)
+                for g in jax.tree.leaves(grads)))
+            jax.debug.print("grad_norm: {x}", x=grad_norm)
+            # Per-top-level-key NaN check to localize the source sub-tree.
+            # Set BWD_GRAD_FINITE_CHECK=1 to enable.
+            if os.environ.get("BWD_GRAD_FINITE_CHECK", "").lower() in ("1", "true", "yes"):
+                if isinstance(grads, dict):
+                    for _k in sorted(grads.keys()):
+                        _sub_leaves = jax.tree.leaves(grads[_k])
+                        _any_nan = jnp.any(jnp.stack([
+                            jnp.any(jnp.isnan(_l.astype(jnp.float32)))
+                            for _l in _sub_leaves
+                        ]))
+                        _max_abs = jnp.max(jnp.stack([
+                            jnp.max(jnp.abs(_l.astype(jnp.float32)))
+                            for _l in _sub_leaves
+                        ]))
+                        jax.debug.print(
+                            "[grad-check] " + _k + ": nan={n} max_abs={m}",
+                            n=_any_nan, m=_max_abs)
+            scale = jnp.minimum(1.0, args.grad_clip / (grad_norm + 1e-6))
+            return jax.tree.map(lambda g: g * scale, grads)
+
         if args.optimizer == "adamw":
             @jax.jit
             def train_step(params, tokens, opt_state):
@@ -240,6 +269,7 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
                 else:
                     (loss, aux), grads = jax.value_and_grad(
                         compute_loss, has_aux=True)(params, tokens, cfg)
+                grads = _maybe_clip_grads(grads)
                 params, opt_state = adam_step(
                     params, grads, opt_state, lr=args.lr)
                 return params, loss, aux, opt_state
@@ -251,30 +281,7 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
                 else:
                     (loss, aux), grads = jax.value_and_grad(
                         compute_loss, has_aux=True)(params, tokens, cfg)
-                if args.grad_clip is not None:
-                    grad_norm = jnp.sqrt(sum(
-                        jnp.sum(g.astype(jnp.float32) ** 2)
-                        for g in jax.tree.leaves(grads)))
-                    jax.debug.print("grad_norm: {x}", x=grad_norm)
-                    # Per-top-level-key NaN check to localize the source sub-tree.
-                    # Set BWD_GRAD_FINITE_CHECK=1 to enable.
-                    if os.environ.get("BWD_GRAD_FINITE_CHECK", "").lower() in ("1", "true", "yes"):
-                        if isinstance(grads, dict):
-                            for _k in sorted(grads.keys()):
-                                _sub_leaves = jax.tree.leaves(grads[_k])
-                                _any_nan = jnp.any(jnp.stack([
-                                    jnp.any(jnp.isnan(_l.astype(jnp.float32)))
-                                    for _l in _sub_leaves
-                                ]))
-                                _max_abs = jnp.max(jnp.stack([
-                                    jnp.max(jnp.abs(_l.astype(jnp.float32)))
-                                    for _l in _sub_leaves
-                                ]))
-                                jax.debug.print(
-                                    "[grad-check] " + _k + ": nan={n} max_abs={m}",
-                                    n=_any_nan, m=_max_abs)
-                    scale = jnp.minimum(1.0, args.grad_clip / (grad_norm + 1e-6))
-                    grads = jax.tree.map(lambda g: g * scale, grads)
+                grads = _maybe_clip_grads(grads)
                 params = jax.tree.map(
                     lambda p, g: (p.astype(jnp.float32) - args.lr * g.astype(jnp.float32)).astype(p.dtype),
                     params, grads)
