@@ -1860,32 +1860,15 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
                 result_c = jax.lax.optimization_barrier(result_c)
         return result_c
 
-    # Bug 3 fix attempt: replace Python loop with jax.lax.scan. The unrolled
-    # Python loop at n_chunks=4 produces NaN cotangents in the auto-vjp
-    # (see task #44). Hypothesis: scan compresses the graph so auto-vjp
-    # generates a bounded-size bwd that doesn't trigger the n_chunks=4
-    # XLA-scheduler-dependent NaN. At n_chunks=2, both versions should be
-    # equivalent (perf-wise; scan-vjp may add some overhead).
-    if n_chunks == 1:
-        return _process_chunk(0, local_inputs[0])
-
-    # Stack per-chunk inputs into leading-n_chunks-dim arrays for scan.
-    x_stack = jnp.stack([li[0] for li in local_inputs])    # (n_chunks, sz_local, D)
-    i_stack = jnp.stack([li[1] for li in local_inputs])    # (n_chunks, sz_local, K)
-    w_stack = jnp.stack([li[2] for li in local_inputs])    # (n_chunks, sz_local, K)
-
-    def _scan_body(carry, scan_in):
-        x_c, i_c, w_c = scan_in
-        # `c` was only used for named_scope and finite-check labels. Drop the
-        # int arg and pass 0; per-chunk granularity in debug labels isn't
-        # essential at default debug_nans=False.
-        out_c = _process_chunk(0, (x_c, i_c, w_c))
-        return carry, out_c
-
-    _, results = jax.lax.scan(_scan_body, None, (x_stack, i_stack, w_stack))
-    # results shape: (n_chunks, chunk_size_per_dev, D). Concatenate by
-    # reshape (chunks contiguous on axis 0).
-    return results.reshape(-1, results.shape[-1])  # (T, D)
+    # Sibling chunks: each _process_chunk has its own AG → no cross-chunk
+    # operand. Intra-chunk barriers (around AG and scatter blocks above)
+    # keep each chunk atomic; XLA can schedule the two chunks in parallel
+    # on different engines (SC for AG/scatter, TC for ragged_dots).
+    # NO cross-chunk barrier — that would serialize them (MaxText's
+    # staggered_call pattern is for whole-microbatch serialization, not
+    # within-layer chunking).
+    chunks = [_process_chunk(c, local_inputs[c]) for c in range(n_chunks)]
+    return jnp.concatenate(chunks, axis=0)   # (T, D)
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
