@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 import time
 
 import jax
@@ -247,6 +248,23 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
                         jnp.sum(g.astype(jnp.float32) ** 2)
                         for g in jax.tree.leaves(grads)))
                     jax.debug.print("grad_norm: {x}", x=grad_norm)
+                    # Per-top-level-key NaN check to localize the source sub-tree.
+                    # Set BWD_GRAD_FINITE_CHECK=1 to enable.
+                    if os.environ.get("BWD_GRAD_FINITE_CHECK", "").lower() in ("1", "true", "yes"):
+                        if isinstance(grads, dict):
+                            for _k in sorted(grads.keys()):
+                                _sub_leaves = jax.tree.leaves(grads[_k])
+                                _any_nan = jnp.any(jnp.stack([
+                                    jnp.any(jnp.isnan(_l.astype(jnp.float32)))
+                                    for _l in _sub_leaves
+                                ]))
+                                _max_abs = jnp.max(jnp.stack([
+                                    jnp.max(jnp.abs(_l.astype(jnp.float32)))
+                                    for _l in _sub_leaves
+                                ]))
+                                jax.debug.print(
+                                    "[grad-check] " + _k + ": nan={n} max_abs={m}",
+                                    n=_any_nan, m=_max_abs)
                     scale = jnp.minimum(1.0, args.grad_clip / (grad_norm + 1e-6))
                     grads = jax.tree.map(lambda g: g * scale, grads)
                 params = jax.tree.map(
