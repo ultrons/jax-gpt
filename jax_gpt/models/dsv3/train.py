@@ -196,25 +196,36 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
         # compute_loss now returns (total, {'lm_loss', 'aux_loss'}) — pass
         # has_aux=True through value_and_grad and propagate the aux dict so
         # train_step reports LM and MoE-balance terms separately.
+        # Option-A fix: Python for-loop grad_accum (NOT jax.lax.scan).
+        # Bisection (mini-vce vs mini-rmonly) showed jax.lax.scan(_accum_body)
+        # combined with value_and_grad-inside-body + jax.checkpoint inside
+        # compute_loss produces NaN gradients at random init. Replacing the
+        # scan with a Python for-loop runs each micro-batch's vjp+remat as a
+        # standalone JAX computation — sidesteps the scan-vjp+remat interaction.
+        # Cost: 8× trace size at compile (n_accum unrolled), one-time per shape.
+        def _grad_accum_python_loop(params_, tokens_):
+            micros = tokens_.reshape(n_accum, B // n_accum, cfg.S)
+            zero_grads = jax.tree.map(jnp.zeros_like, params_)
+            acc_grads = zero_grads
+            acc_loss = jnp.float32(0.0)
+            acc_aux = {"lm_loss": jnp.float32(0.0), "aux_loss": jnp.float32(0.0)}
+            for i in range(n_accum):
+                micro_tokens = micros[i]
+                (loss_i, aux_i), grads_i = jax.value_and_grad(
+                    compute_loss, has_aux=True)(params_, micro_tokens, cfg)
+                acc_grads = jax.tree.map(lambda a, g: a + g, acc_grads, grads_i)
+                acc_loss = acc_loss + loss_i
+                acc_aux = jax.tree.map(lambda a, x: a + x, acc_aux, aux_i)
+            grads_ = jax.tree.map(lambda g: g / n_accum, acc_grads)
+            loss_ = acc_loss / n_accum
+            aux_ = jax.tree.map(lambda x: x / n_accum, acc_aux)
+            return loss_, aux_, grads_
+
         if args.optimizer == "adamw":
             @jax.jit
             def train_step(params, tokens, opt_state):
                 if n_accum > 1:
-                    micros = tokens.reshape(n_accum, B // n_accum, cfg.S)
-                    def _accum_body(carry, micro_tokens):
-                        acc_grads, acc_loss, acc_aux = carry
-                        (loss, aux), grads = jax.value_and_grad(
-                            compute_loss, has_aux=True)(params, micro_tokens, cfg)
-                        acc_grads = jax.tree.map(lambda a, g: a + g, acc_grads, grads)
-                        acc_aux = jax.tree.map(lambda a, x: a + x, acc_aux, aux)
-                        return (acc_grads, acc_loss + loss, acc_aux), None
-                    zero_grads = jax.tree.map(jnp.zeros_like, params)
-                    zero_aux = {"lm_loss": jnp.float32(0.0), "aux_loss": jnp.float32(0.0)}
-                    (grads, total_loss, total_aux), _ = jax.lax.scan(
-                        _accum_body, (zero_grads, jnp.float32(0.0), zero_aux), micros)
-                    grads = jax.tree.map(lambda g: g / n_accum, grads)
-                    loss = total_loss / n_accum
-                    aux = jax.tree.map(lambda x: x / n_accum, total_aux)
+                    loss, aux, grads = _grad_accum_python_loop(params, tokens)
                 else:
                     (loss, aux), grads = jax.value_and_grad(
                         compute_loss, has_aux=True)(params, tokens, cfg)
@@ -225,21 +236,7 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
             @jax.jit
             def train_step(params, tokens):
                 if n_accum > 1:
-                    micros = tokens.reshape(n_accum, B // n_accum, cfg.S)
-                    def _accum_body(carry, micro_tokens):
-                        acc_grads, acc_loss, acc_aux = carry
-                        (loss, aux), grads = jax.value_and_grad(
-                            compute_loss, has_aux=True)(params, micro_tokens, cfg)
-                        acc_grads = jax.tree.map(lambda a, g: a + g, acc_grads, grads)
-                        acc_aux = jax.tree.map(lambda a, x: a + x, acc_aux, aux)
-                        return (acc_grads, acc_loss + loss, acc_aux), None
-                    zero_grads = jax.tree.map(jnp.zeros_like, params)
-                    zero_aux = {"lm_loss": jnp.float32(0.0), "aux_loss": jnp.float32(0.0)}
-                    (grads, total_loss, total_aux), _ = jax.lax.scan(
-                        _accum_body, (zero_grads, jnp.float32(0.0), zero_aux), micros)
-                    grads = jax.tree.map(lambda g: g / n_accum, grads)
-                    loss = total_loss / n_accum
-                    aux = jax.tree.map(lambda x: x / n_accum, total_aux)
+                    loss, aux, grads = _grad_accum_python_loop(params, tokens)
                 else:
                     (loss, aux), grads = jax.value_and_grad(
                         compute_loss, has_aux=True)(params, tokens, cfg)
