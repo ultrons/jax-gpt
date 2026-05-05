@@ -196,40 +196,47 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
         # compute_loss now returns (total, {'lm_loss', 'aux_loss'}) — pass
         # has_aux=True through value_and_grad and propagate the aux dict so
         # train_step reports LM and MoE-balance terms separately.
-        # Option D: pull value_and_grad OUTSIDE the scan. Scan body is now
-        # pure forward (with jax.checkpoint at compute_loss boundary), so the
-        # vjp through the scan is JAX's standard scan-vjp pattern — no inner
-        # value_and_grad call inside the scan body to corrupt residuals.
-        #
-        # Bisection (mini-vce, mini-rmonly, mini-pyacc) confirmed:
-        # - mini + remat + jax.lax.scan(value_and_grad inside body) → NaN
-        # - mini + remat + Python for-loop grad_accum → finite (Option A)
-        # Option A doesn't scale (8× unroll for L=61 = unaffordable compile),
-        # so this is the structural fix.
-        def _scan_loss_aux(params_, micros):
-            """Forward-only scan: sum loss & aux across micro-batches.
-            jax.checkpoint at the compute_loss boundary keeps per-iter
-            residual = just `micro` (and constant `params`); recompute
-            compute_loss in bwd."""
-            def _body(carry, micro):
-                acc_loss, acc_aux = carry
-                # Single jax.checkpoint at the compute_loss boundary —
-                # NOT per-layer (that's separately controlled by
-                # cfg.gradient_checkpoint inside compute_loss → forward).
-                loss_i, aux_i = compute_loss(params_, micro, cfg)
-                return (acc_loss + loss_i, jax.tree.map(jnp.add, acc_aux, aux_i)), None
-            init_carry = (jnp.float32(0.0),
-                          {"lm_loss": jnp.float32(0.0), "aux_loss": jnp.float32(0.0)})
-            (total_loss, total_aux), _ = jax.lax.scan(_body, init_carry, micros)
-            return total_loss / n_accum, jax.tree.map(lambda x: x / n_accum, total_aux)
+        # MaxText-style grad_accum: params threaded through scan CARRY, not
+        # captured via closure. value_and_grad with explicit argnums.
+        # See maxtext/utils/gradient_accumulation.py:25 for the reference
+        # pattern. Working hypothesis: closure-capturing sharded params
+        # confuses scan-vjp's residual-stacking, leading to NaN cotangents.
+        # Putting params in the carry forces JAX to thread them explicitly.
+        def _accum_body(carry, micro_tokens):
+            acc_grads = carry["grads"]
+            acc_loss = carry["loss"]
+            acc_aux = carry["aux"]
+            params_ = carry["params"]
+            # value_and_grad with explicit argnums=0 (mirrors MaxText argnums=4)
+            (loss_i, aux_i), grads_i = jax.value_and_grad(
+                compute_loss, has_aux=True, argnums=0)(params_, micro_tokens, cfg)
+            new_carry = {
+                "params": params_,  # unchanged across iters
+                "grads": jax.tree.map(jnp.add, acc_grads, grads_i),
+                "loss": acc_loss + loss_i,
+                "aux": jax.tree.map(jnp.add, acc_aux, aux_i),
+            }
+            return new_carry, None
+
+        def _grad_accum_scan(params, tokens):
+            micros = tokens.reshape(n_accum, B // n_accum, cfg.S)
+            init = {
+                "params": params,
+                "grads": jax.tree.map(jnp.zeros_like, params),
+                "loss": jnp.float32(0.0),
+                "aux": {"lm_loss": jnp.float32(0.0),
+                        "aux_loss": jnp.float32(0.0)},
+            }
+            final, _ = jax.lax.scan(_accum_body, init, micros, length=n_accum)
+            return (final["loss"] / n_accum,
+                    jax.tree.map(lambda x: x / n_accum, final["aux"]),
+                    jax.tree.map(lambda g: g / n_accum, final["grads"]))
 
         if args.optimizer == "adamw":
             @jax.jit
             def train_step(params, tokens, opt_state):
                 if n_accum > 1:
-                    micros = tokens.reshape(n_accum, B // n_accum, cfg.S)
-                    (loss, aux), grads = jax.value_and_grad(
-                        _scan_loss_aux, has_aux=True)(params, micros)
+                    loss, aux, grads = _grad_accum_scan(params, tokens)
                 else:
                     (loss, aux), grads = jax.value_and_grad(
                         compute_loss, has_aux=True)(params, tokens, cfg)
@@ -240,9 +247,7 @@ def train(cfg: ModelConfig, shard_cfg: ShardConfig, args):
             @jax.jit
             def train_step(params, tokens):
                 if n_accum > 1:
-                    micros = tokens.reshape(n_accum, B // n_accum, cfg.S)
-                    (loss, aux), grads = jax.value_and_grad(
-                        _scan_loss_aux, has_aux=True)(params, micros)
+                    loss, aux, grads = _grad_accum_scan(params, tokens)
                 else:
                     (loss, aux), grads = jax.value_and_grad(
                         compute_loss, has_aux=True)(params, tokens, cfg)
