@@ -1,0 +1,11 @@
+# Runtime state — per-workload, machine-local
+state/
+*.log
+*.pyc
+__pycache__/
+
+# Pulled profiles (reachable from cde profile path)
+profiles/
+
+# Headroom reports + JSONs (regeneratable)
+reports/

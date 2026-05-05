@@ -1,0 +1,37 @@
+# Workload: DSv3 671B training, MINI config (L=2: 1 dense + 1 MoE).
+#
+# Useful for fast iteration cycles (~145s compile vs ~225s for full).
+# Bug 4 workaround: gbs >= 1024 (PDBS >= 2). Don't set gbs=512.
+
+model: dsv3_671b_mini
+hardware: v7x_4x8x8
+regime: training
+parallelism:
+  dp: 1
+  fsdp: 128
+  ep: 4
+  tp: 1
+batch: 4096
+ctx: 4096
+prompt: 0
+weight_dtype: bf16
+kv_dtype: bf16
+
+cluster_context: gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-rbq
+
+cde_overrides:
+  config: mini
+  moe_backend: gmm_ag
+  attn_backend: splash
+  optimizer: sgd
+  fsdp: 128
+  ep: 4
+  tp: 1
+  gbs: 4096
+  grad_accum: 1
+  moe_n_chunks: 2
+  steps: 3
+  grad_clip: 1.0
+  dtype: bfloat16
+  gradient_checkpoint: true
+  no_cp: true

@@ -1,0 +1,39 @@
+# Workload: DSv3 671B training, full config, current production baseline.
+#
+# Image cde-9ea30df (libtpu dev20260417 reverted) is the known-good baseline as
+# of 2026-05-05. Initial loss = 415.491 (lm=12.037 + aux=403.45). Step 1+ finite.
+
+model: dsv3_671b
+hardware: v7x_4x8x8
+regime: training
+parallelism:
+  dp: 1
+  fsdp: 128
+  ep: 4
+  tp: 1
+batch: 4096          # global batch size (sequences)
+ctx: 4096            # sequence length
+prompt: 0            # not applicable for training
+weight_dtype: bf16
+kv_dtype: bf16
+
+cluster_context: gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-rbq
+
+# All --set overrides for cde run.
+# Bug 2/3/4 workarounds baked in: ga=1, n_chunks=2, gbs=4096 (PDBS=8).
+cde_overrides:
+  config: full
+  moe_backend: gmm_ag
+  attn_backend: splash
+  optimizer: sgd
+  fsdp: 128
+  ep: 4
+  tp: 1
+  gbs: 4096
+  grad_accum: 1
+  moe_n_chunks: 2
+  steps: 5
+  grad_clip: 1.0
+  dtype: bfloat16
+  gradient_checkpoint: true
+  no_cp: true
