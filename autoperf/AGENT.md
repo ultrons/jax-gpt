@@ -118,9 +118,19 @@ running these steps in sequence:
 10. **Pull the profile.** `cde profile path <run_id>` returns gs:// URI;
     `gsutil -m cp -r <uri>/* autoperf/profiles/<run_id>/`.
 
-11. **Generate headroom report.** Invoke
-    `python -m perfsim.inference.scripts.headroom_report --xplane autoperf/profiles/<run_id>/<find xplane.pb dir> ... --output autoperf/reports/<workload>_iter<N>.md`
-    with all model/hw/parallelism args from the workload yaml.
+11. **Generate headroom report.** Use `--format json` (NOT markdown — the
+    JSON schema is stable; markdown is pretty-print, not a contract):
+    ```bash
+    python -m perfsim.inference.scripts.headroom_report \
+        --xplane autoperf/profiles/<run_id>/<xplane-dir> \
+        --model <key> --hardware <key> --tp <X> --ep <Y> --dp <Z> \
+        --batch <B> --ctx <C> --prompt <P> \
+        --weight-dtype <dt> --kv-dtype <dt> \
+        --format json --output autoperf/reports/<workload>_iter<N>.json
+    ```
+    All model/hw/parallelism args come from the workload yaml. Schema
+    fields you'll read: `meta`, `n_passes`, `leaves[]`, `top3[]`. See §X
+    'Working with perfsim' below for parsing rules.
 
 12. **Compare to prior iteration.** Did the metric improve, regress, or stay
     neutral? Append a one-line entry to `autoperf/diary/<workload>.log`:
@@ -222,6 +232,73 @@ After filing (or after attaching to an existing issue), append to `autoperf/BLOC
 (`open` → `resolved` in the table), then `git -C <local-tool-path> pull` to
 get the fix into your local tool install, then redo the change that was
 blocked.
+
+---
+
+## 5b. Working with perfsim — calibration anchor
+
+Per the perfsim agent's briefing. Read `~/perfsim/perfsim/docs/perfsim-protocol.md`
+once before starting; it documents what perfsim's input contract IS,
+which is the only way to distinguish "perfsim is wrong" from "I called
+it wrong."
+
+**Repo + post-fix sync.** perfsim repo: `~/perfsim/` (symlink →
+`~/ml-experiments-perfsim/`). Branch: `main`. After the perfsim agent
+closes any of your filed issues, ALWAYS `git -C ~/perfsim pull` before
+re-running `headroom_report` — the fix may have changed presets,
+formulas, or the heuristic table.
+
+**Headroom JSON parsing contract.**
+- Use `--format json` (NOT markdown). Schema is stable
+  (`schema_version: 1`); fields: `meta`, `n_passes`, `leaves[]`, `top3[]`.
+- Don't grep markdown — it's pretty-print, not a contract.
+- For closing-comment evidence after a fix, use `--only-leaf <name>` to
+  get just the leaf you're discussing (clean evidence, no full table dump).
+
+**Top-leaf rule.** Rank by `headroom_total_ms`, NOT
+`ratio_meas_over_pred`. A 50× ratio at 0.1 ms is not your target; a 2×
+ratio at 100 ms is.
+
+**Common arithmetic mistake.** Headroom = `measured − predicted_ceiling`,
+NOT `measured − microbench_ceiling`. The microbench is what FEEDS
+perfsim's curve; perfsim's `predicted` is already derived from it. Don't
+double-count.
+
+**When to file vs. fix yourself — protocol-violation triage.**
+- If you get a perfsim result that looks wrong, FIRST re-read the issue
+  body against `docs/perfsim-protocol.md` §1-4 (input contract).
+- If you missed `--tp`, used an unregistered preset, or violated any
+  contract clause, the perfsim agent will close as
+  `wontfix-protocol-violation`. Save them the round trip — fix on your
+  side first.
+- If you've verified your input is contract-compliant and the prediction
+  is still wrong, file at `ultrons/perfsim` with label
+  `autoperf-blocking`. Use the issue template at
+  `~/perfsim/.github/ISSUE_TEMPLATE/autoperf-blocking.md`. Fill EVERY
+  field — especially: model preset key, hw preset key, profile path,
+  copy-pasteable repro, and a single-sentence Definition-of-Done with a
+  numeric threshold (e.g., "leaf X reports predicted_us between A and B").
+
+**Cross-repo routing — file at the right repo:**
+
+| symptom | file at |
+|---|---|
+| Wrong perfsim prediction (calibrated input → wrong output) | `ultrons/perfsim` |
+| xplane bucketing wrong / fusion records mis-mapped | `ultrons/xla-shell` |
+| `cde` job manager / profile-pull broken | `ultrons/cde` |
+| Tax mis-fit (perfsim tax produced obviously-wrong number) | `ultrons/perfsim` (will be redirected to xla-shell if root cause is mis-bucketing) |
+
+**Ratchet the corpus when you confirm an improvement.** After a
+confirmed perf gain (one full iteration where measured beat the prior
+best AND held for at least one repeat measurement), file an issue
+against `ultrons/perfsim` titled `ratchet corpus tolerance for <model>
+<regime>`. That's how the validation corpus gets tightened over time.
+
+**iter_log.md.** Maintain `~/jax-gpt/autoperf/iter_log.md` with one
+section per iteration containing: iteration number, commit SHA, change
+description, top-leaf before/after with `headroom_total_ms`, decision
+for next iteration. The perfsim agent reads this when an issue
+references "iteration N" — make it referenceable.
 
 ---
 
