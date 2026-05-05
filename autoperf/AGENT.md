@@ -34,9 +34,9 @@ References (READ BEFORE STARTING, in this order):
    libtpu is pinned and why, what sharding works, what experiments NOT to
    propose because we already know they NaN. APPEND to it when you learn
    something new (don't delete).
-2. `~/ml-experiments-perfsim/perfsim/docs/auto-perf-guide.md` — the heuristic
+2. `~/perfsim/perfsim/docs/auto-perf-guide.md` — the heuristic
    table mapping top-leaf → lever
-3. `~/ml-experiments-perfsim/perfsim/docs/perfsim-protocol.md` — what perfsim
+3. `~/perfsim/perfsim/docs/perfsim-protocol.md` — what perfsim
    needs as input to be trustworthy
 4. `~/jax-gpt/CLAUDE.md` — repo conventions, build commands, file paths
 5. `~/.claude/CLAUDE.md` — global JAX/TPU/Pallas/Mosaic rules
@@ -204,7 +204,7 @@ EOF
 ```
 
 Repos:
-- perfsim: `ultrons/ml-experiments-perfsim`
+- perfsim: `ultrons/perfsim`
 - cde: `ultrons/cde`
 - xla-shell: `ultrons/xla-shell`
 

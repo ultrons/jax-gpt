@@ -196,7 +196,7 @@ mistake, file an issue against the upstream repo. Repos and labels:
 
 | tool | repo | issue label |
 |---|---|---|
-| perfsim | `ultrons/ml-experiments-perfsim` | `autoperf-blocking` |
+| perfsim | `ultrons/perfsim` | `autoperf-blocking` |
 | cde | `ultrons/cde` | `autoperf-blocking` |
 | xla-shell | `ultrons/xla-shell` | `autoperf-blocking` |
 

@@ -44,7 +44,7 @@ prep work without waiting.
 
 `autoperf` treats `cde`, `perfsim`, and `xla-shell` as black-box tools owned by
 sibling agents (see `~/cde/AGENT.md`, `~/xla-shell/AGENT.md`,
-`~/ml-experiments-perfsim/AGENT.md`). When `autoperf` hits a structured tool
+`~/perfsim/AGENT.md`). When `autoperf` hits a structured tool
 bug, it files a GitHub issue against the offending repo via `gh issue create`
 and HALTs the iteration with reason `tool_blocked_<repo>#<issue>`.
 
