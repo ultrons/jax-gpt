@@ -27,7 +27,7 @@ RUN pip install --upgrade pip && \
         "jax==0.10.0" "jaxlib==0.10.0" \
         -f https://storage.googleapis.com/jax-releases/libtpu_releases.html && \
     pip install \
-        "https://storage.googleapis.com/libtpu-nightly-releases/wheels/libtpu/libtpu-0.0.41.dev20260504+nightly-cp312-cp312-manylinux_2_31_x86_64.whl" && \
+        "https://storage.googleapis.com/libtpu-nightly-releases/wheels/libtpu/libtpu-0.0.41.dev20260417+nightly-cp312-cp312-manylinux_2_31_x86_64.whl" && \
     pip install \
         "etils[epath]" \
         tensorboard-plugin-profile \
