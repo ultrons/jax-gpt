@@ -51,7 +51,14 @@ spec:
               effect: "NoSchedule"
             containers:
             - name: trainer
+              {# image_override: pass --set image_override=<tag> to use an existing
+                 registry tag instead of cde's computed tag. Useful for A/B against
+                 older builds without rebuilding (e.g., bisecting). #}
+              {%- if overrides.get('image_override') %}
+              image: gcr.io/tpu-vm-gke-testing/jax-gpt-dsv3:{{ overrides['image_override'] }}
+              {%- else %}
               image: {{ image }}
+              {%- endif %}
               imagePullPolicy: Always
               {# Default entrypoint = the dsv3 trainer; override per-run via
                  --set entrypoint_module=jax_gpt.models.dsv3.eval_lm_loss
@@ -60,7 +67,7 @@ spec:
               args:
                 {%- set _bool_flags = ('gradient_checkpoint', 'no_cp', 'moe_xlayer_prefetch', 'moe_use_sc_scatter', 'moe_use_gmm_v2', 'moe_shard_e_with_fsdp', 'moe_shard_d_with_fsdp', 'moe_fp8_weights', 'moe_no_weight_ag', 'moe_debug_nans', 'roofline') %}
                 {# Keys consumed by template/env path only — never rendered as CLI args. #}
-                {%- set _env_only = ('namespace', 'priority_class', 'entrypoint_module', 'mount_weights', 'jax_debug_nans', 'jax_debug_infs') %}
+                {%- set _env_only = ('namespace', 'priority_class', 'entrypoint_module', 'mount_weights', 'jax_debug_nans', 'jax_debug_infs', 'image_override') %}
                 {%- for k, v in overrides.items() %}
                 {%- if k not in _env_only and k not in _bool_flags %}
                 - "--{{ k }}={{ v }}"

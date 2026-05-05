@@ -437,6 +437,10 @@ def main():
     parser.add_argument("--grad_accum", type=int, default=1,
                         help="Gradient accumulation micro-batches (GBS must be divisible)")
     parser.add_argument("--aux_loss_weight", type=float, default=None)
+    parser.add_argument("--moe_aux_loss_coeff", type=float, default=None,
+                        help="Override cfg.moe_aux_loss_coeff (DSv3 default: 1e-4). "
+                             "Pass 0 to disable the load-balance aux loss for "
+                             "bwd-NaN bisection.")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile_dir", default="/tmp/mini_dsv3_profile")
     parser.add_argument("--profile_skip", type=int, default=2,
@@ -500,6 +504,8 @@ def main():
         cfg.dtype = args.dtype
     if args.aux_loss_weight is not None:
         cfg.aux_loss_weight = args.aux_loss_weight
+    if args.moe_aux_loss_coeff is not None:
+        cfg.moe_aux_loss_coeff = args.moe_aux_loss_coeff
     if args.gradient_checkpoint:
         cfg.gradient_checkpoint = True
     if args.no_cp:
