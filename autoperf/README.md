@@ -1,59 +1,65 @@
-## autoperf — auto-optimization agent harness
+# autoperf — agent-driven perf optimization
 
-Long-running orchestrator that drives a perfsim-guided perf-optimization loop
-over one workload at a time. Each iteration applies ONE code change, builds,
-launches via `cde` with profiling on, waits for completion, pulls the profile,
-runs `perfsim.headroom_report`, and picks the next change from the heuristic
-table in `~/ml-experiments-perfsim/perfsim/docs/auto-perf-guide.md`.
+A long-running LLM session optimizes one workload at a time on TPU v7x by
+iterating: apply ONE change → build → run with profile → measure → next change.
+Stop when top-leaf headroom is below 0.5 ms total or when the agent halts
+(novel failure, exhausted levers, etc).
 
-### Layout
+## Files
 
 ```
-bin/                  shell + python utilities (one job each)
-  cde-wait.sh         poll cde status until terminal state, exit 0/1
-  headroom_to_json.py wrap headroom_report → top-N JSON
-  budget_check.py     hard cap on jobs/day + compile minutes
-  iter.sh             one-iteration glue: build → launch → wait → pull → report
-
-orchestrator/
-  autoperf.py         main loop: spawns claude per iter, manages state
-  state.py            iter counter, diary, exhausted-levers tracking
-
-agent/
-  iter_prompt.md      template for per-iter Claude prompt
-  halt_prompt.md      structured halt-signal contract
-
-workloads/
-  *.yaml              workload spec: model, hw, parallelism, regime, baseline cmd
-
-state/                gitignored; per-workload runtime state
-diary/                commit-tracked iteration diaries (audit trail)
+AGENT.md             the harness — system prompt the LLM reads at start
+README.md            this file
+workloads/*.yaml     per-workload spec (model, hw, parallelism, cde overrides)
+BLOCKED.md           ledger of GitHub issues blocking iteration progress
+diary/<wl>.log       one line per iteration (commit-tracked audit trail)
+reports/<wl>_iter<N>.{md,json}  per-iter headroom report (gitignored)
+profiles/<run-id>/   pulled cluster profile (gitignored)
 ```
 
-### Quick start
+That's the whole repo. The agent IS the orchestrator. There is no Python loop.
 
-```bash
-# Dry-run (proposes changes but doesn't apply or launch)
-python orchestrator/autoperf.py --workload workloads/qwen35_decode.yaml --dry-run --iters 1
+## How a human kicks it off
 
-# Real run, 12 iterations max, hard budget cap
-python orchestrator/autoperf.py --workload workloads/qwen35_decode.yaml --iters 12
+In a long-running Claude Code session in this repo:
+
+```
+Read autoperf/AGENT.md and run as the autoperf agent on
+workload autoperf/workloads/dsv3_train_full.yaml.
 ```
 
-### Stop conditions (hard-coded; don't override unless documented)
+The agent then reads AGENT.md, the workload yaml, and starts iterating per
+the steps in §3 of AGENT.md. Same instruction works in any LLM with shell
+access (Gemini CLI, codex, etc).
 
-1. Top-leaf headroom < 0.5 ms total (nothing left to harvest).
-2. 3 iterations in a row regress the metric (digging a hole).
-3. Daily budget cap hit (default: 12 cluster jobs/day).
-4. Claude signals `HALT` in iter prompt (novel situation, needs human).
-5. Predicted ≈ measured for all leaves > 5% step share (workload at ceiling).
+## Concurrency model
 
-### Audit trail
+`AGENT.md` has the agent enforce **max-parallel = 2 cluster jobs** by polling
+`cde history --status running | wc -l` before launching anything. No worker
+pool, no Python threading — the agent is single-threaded by nature, but lets
+2 jobs run concurrently by launching one and continuing to the next iteration's
+prep work without waiting.
 
-Every iteration produces:
-- A commit on `auto-perf/<workload>` branch with the change.
-- A diary entry in `diary/<workload>/iter<N>.md`.
-- An updated state JSON in `state/<workload>.json`.
+## Tool ecosystem
 
-Resume any sprint by re-invoking with the same workload — orchestrator picks
-up from the saved state.
+`autoperf` treats `cde`, `perfsim`, and `xla-shell` as black-box tools owned by
+sibling agents (see `~/cde/AGENT.md`, `~/xla-shell/AGENT.md`,
+`~/ml-experiments-perfsim/AGENT.md`). When `autoperf` hits a structured tool
+bug, it files a GitHub issue against the offending repo via `gh issue create`
+and HALTs the iteration with reason `tool_blocked_<repo>#<issue>`.
+
+The corresponding tool agent picks up the issue, fixes it, comments + closes.
+On the next iteration, autoperf checks `gh issue view <repo>#<issue>` — if
+closed, pulls the fixed tool's repo and retries the previously-blocked change.
+
+## Stop conditions (autoperf self-enforces)
+
+- top-leaf headroom < 0.5 ms total
+- 3 consecutive regressions
+- all leaves > 5% step-share at predicted ceiling
+- training broke (NaN, OOM, no metric progress) — auto-revert + halt
+- cluster unhealthy (3 evictions in a row)
+- novel failure → file issue, halt with reason `tool_blocked_...`
+
+Each halt writes `autoperf/HALT.md` with diagnosis + recommended next human
+action.
