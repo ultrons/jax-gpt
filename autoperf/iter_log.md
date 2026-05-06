@@ -37,4 +37,33 @@ one.
     collective; XLA may take longer to schedule. If compile exceeds
     20 min, halt as a hang.
 - **Decision**: launch.
-- **Result**: TBD.
+- **Result**: **FAILED at compile (no training step ran).** `cde run dsv3train-pf-i0`
+  → `Finished=True (Failed)` after first attempt; reason `ReachedMaxRestarts`.
+  Init succeeded (all 58 MoE layers initialized; 670B params @ 1341 GB bf16
+  reported); compile started, then libtpu hit a fatal assertion:
+  ```
+  F0506 22:22:28.728338 async_collective_start_emitter.cc:65]
+  Check failed: smem_state_shape.dimensions(0) == num_states (26 vs. 6)
+  ```
+  Stack: `xla::jellyfish::AsyncCollectiveStartEmitter::Emit() →
+  LoweringEmitter::HandleCustomCall → HandleFusion`. This is libtpu
+  internal code-gen for the SparseCore async-collective offload path —
+  the manifest's `--xla_tpu_enable_sparse_core_collective_offload_*`
+  flags route AG/RS through SC, and SC's emitter expected `num_states=6`
+  but got `smem_state_shape[0]=26` at the fsdp=512 mesh geometry.
+  - **Not a jax-gpt source bug** — the same code path compiles fine at
+    v304's ep=4 fsdp=128. The bug is the SC-offload emitter's assumption
+    breaking at the wider mesh shape.
+  - **Not a jaxlib/Python issue** — fatal in-libtpu CHECK, not a Python
+    exception. SIGABRT in the trainer pod.
+  - Cluster cost: ~3 min admission + ~1.5 min compile attempt. ~30 pods
+    initialized, all crashed with the same assertion. No training compute.
+- **Halt reason**: `tool_blocked_libtpu` (compile-side; libtpu is binary
+  pinned at dev20260417, autoperf doesn't own it). Workload yaml is
+  unchanged; revert isn't applicable here.
+- **What this rules out**: `dp=1 fsdp=512 ep=1 tp=1` with the current
+  v304 LIBTPU_INIT_ARGS won't compile. Either (a) disable
+  SC-offload flags for this workload (manifest template edit), or
+  (b) pivot to a different parallelism that doesn't trip the assertion
+  (e.g., v321's `ep=1 fsdp=256 tp=2`, or `dp=2 fsdp=256 ep=1 tp=1`).
+- **Iter-0 retry strategy**: needs human direction (see HALT.md).

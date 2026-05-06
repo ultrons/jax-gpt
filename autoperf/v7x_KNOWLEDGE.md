@@ -168,6 +168,31 @@ until the corresponding bug is closed. The workload yamls bake these in.
 - `n_chunks=4` triggers Bug 3 (bwd NaN). Don't propose without resolving the bug.
 - `n_chunks=8` untested as of 2026-05-05.
 
+### `fsdp=512 + SC-offload flags` → libtpu CHECK fail (autoperf purefsdp iter-0, 2026-05-06)
+- Pure-FSDP attempt: `dp=1 fsdp=512 ep=1 tp=1` on v7x_4x8x8, full + ga=1
+  + n_chunks=2 + gbs=4096, with the standard v304 LIBTPU_INIT_ARGS.
+- Compile crashes with:
+  ```
+  F0506 ... async_collective_start_emitter.cc:65]
+  Check failed: smem_state_shape.dimensions(0) == num_states (26 vs. 6)
+  ```
+  Stack: `AsyncCollectiveStartEmitter::Emit → HandleCustomCall →
+  HandleFusion`. SIGABRT, no Python traceback.
+- Path is libtpu-internal (binary pinned at `dev20260417`); not fixable
+  from jax-gpt source. The SparseCore async-collective offload emitter
+  assumes a narrower mesh than fsdp=512 produces.
+- Workaround candidates (untested, would need a manifest template edit):
+  - Disable `--xla_tpu_enable_sparse_core_collective_offload_*` flags for
+    this workload — likely sidesteps the SC-offload codegen entirely;
+    perf cost unknown.
+  - Switch to `ep=1 fsdp=256 tp=2` (v321 historical config) — narrower
+    FSDP axis may not trip the same assertion.
+- v304's `ep=4 fsdp=128` baseline keeps compiling fine with these flags;
+  the issue is mesh-geometry-specific, not flag-broken-everywhere.
+- **Implication**: pure-FSDP at fsdp=512 isn't viable on the current
+  libtpu pin without a manifest-side flag change. The dsv3_train_purefsdp
+  workload track is parked at HALT pending direction.
+
 ### `--moe_xlayer_prefetch` broken at ep=4 fsdp=128 (autoperf iter1, 2026-05-06)
 - `cfg.moe_xlayer_prefetch=True` (cross-layer FSDP weight AG prefetch via
   3-tuple scan carry, `model.py:3061-3094`) fails to compile at
