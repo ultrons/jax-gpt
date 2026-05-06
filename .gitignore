@@ -23,6 +23,9 @@ dist/
 # Log files
 *.log
 
+# autoperf-pulled profiles (large xplanes, gs:// mirror is canonical; AGENT.md §7)
+autoperf/profiles/
+
 # macOS / Windows
 .DS_Store
 Thumbs.db
