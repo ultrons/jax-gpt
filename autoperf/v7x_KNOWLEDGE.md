@@ -230,3 +230,46 @@ include a copy-pasteable repro and "definition of done" criterion.
 When a tool agent (cde/perfsim/xla-shell) closes one of your blocking issues,
 update the corresponding Bug row above (status `active` → `fixed in <repo>#<pr>`)
 and the stack-pin section if the fix changes a version requirement.
+
+---
+
+## 9. Architectural future: A2A (Agent2Agent) migration considerations
+
+The current 4-agent system uses **GitHub issues as the message bus**
+(autoperf files; cde/perfsim/xla-shell maintainer agents fix + close).
+This is intentional — GH issues give us free durable audit trail, async
+delivery (agents don't need to be live simultaneously), and LLM-agnostic
+operation (any model with `gh` CLI works).
+
+**Google's A2A protocol** (announced 2025) is the structured alternative:
+HTTP + JSON-RPC 2.0 + SSE, Agent Cards at `/.well-known/agent.json`,
+Task lifecycle states, multi-turn negotiation. SDKs in Python/JS/Java/Go.
+
+**When to consider migrating** (not now; future-self read):
+1. **High-frequency interactive debugging** — if autoperf and a tool
+   agent need to bounce hypotheses in seconds rather than at iteration
+   boundaries (today: minutes/hours).
+2. **Auto-delegation chains** — perfsim agent's "tax mis-fit → file at
+   xla-shell" pattern is currently manual cross-ref + close-as-duplicate.
+   A2A's `forwardTo` would automate this and wire the response back to
+   the original issue's filer (autoperf).
+3. **Third-party agent integration** — if a vLLM-side or training-stability
+   monitor wants to consume autoperf's "is this leaf a known top-leaf"
+   query, A2A is the clean interface.
+
+**What would need to change for migration** (rough scope):
+- Each maintainer agent runs as a long-lived A2A server, not a one-shot
+  Claude Code session. (Hosting concern: 4× always-on LLM cost.)
+- Agent Cards published per repo describing skills (e.g., perfsim's
+  `diagnose_mispredict`, `extend_microbench_grid`, `add_preset`).
+- autoperf becomes an A2A client that routes Tasks to the right agent
+  instead of running `gh issue create`.
+- We lose GH-issue audit trail unless we double-write (issues + A2A
+  Tasks). A2A doesn't have native persistence.
+
+**Recommendation**: stay on GH issues until specific friction surfaces.
+The protocol overhead, hosting cost, and lost durability aren't worth it
+for an intermittent perf-optimization loop. Revisit if any of (1)/(2)/(3)
+above become a recurring need. If revisiting, the GH-issue protocol we
+have now translates 1:1 to A2A Task semantics — the migration is pattern-
+preserving, just more infrastructure.
