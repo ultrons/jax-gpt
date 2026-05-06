@@ -168,18 +168,29 @@ until the corresponding bug is closed. The workload yamls bake these in.
 - `n_chunks=4` triggers Bug 3 (bwd NaN). Don't propose without resolving the bug.
 - `n_chunks=8` untested as of 2026-05-05.
 
-### TP is hardcoded to align with v7x cores axis: TP ∈ {1, 2} only (autoperf purefsdp iter-0c, 2026-05-06)
-- `jax_gpt/models/dsv3/model.py:247` (`ShardConfig.create_mesh`) raises
-  `ValueError: tp=N requested but cores axis nc=2 doesn't match.
-  Implement multi-axis TP placement if needed.` for any TP ≠ 1 and TP ≠ 2.
-- TP=4 / TP=8 / etc. would need a non-trivial source change to support
-  multi-axis TP placement (TP spanning multiple physical mesh axes, not
-  just the cores axis). Not in autoperf's per-iter scope.
-- Implication for autoperf: parallelism design space at the TP knob is
-  binary — either tp=1 or tp=2. Combined with the EP and FSDP knobs
-  this is much narrower than the "any TP" the heuristic table assumes.
-  Levers that target TP_AR_* are limited to swapping between these
-  two values.
+### TP placement on v7x: single-axis only (multi-axis NOT supported)
+**(updated 2026-05-06; supersedes the earlier "TP ∈ {1, 2} only" entry)**
+- `ShardConfig.create_mesh` (`jax_gpt/models/dsv3/model.py:230-303`)
+  places TP on a single physical axis whose size matches `self.tp`.
+  Cores axis (C) is preferred when `nc == tp` because TP-AR on D2D
+  shared-HBM (7.3 TB/s) is faster than TP-AR on ICI. Falls back to any
+  matching X/Y/Z axis.
+- On v7x_4x8x8 the supported TP values are: `{1, 2, 4, 8}` — match
+  C(2), X(4), Y(8), Z(8). On other slice shapes the set is whatever
+  axis sizes happen to be present.
+- TP > nc lands on ICI, not D2D. The lever is functional but the
+  TP_AR_* leaf will be a much larger top-leaf candidate at TP-on-X
+  than at TP-on-cores. Worth measuring before assuming the geometry
+  is profitable.
+- **Multi-axis TP placement** (TP that doesn't match any single axis,
+  e.g. tp=12 spanning Y(4)·Z(3)) is still not implemented. The
+  ValueError that says "Implement multi-axis TP placement if needed"
+  fires only for that genuine case; single-axis TP on a non-cores
+  axis works since the 2026-05-06 patch.
+- The original error message ("TP must equal cores axis") was a code
+  shortcut, not a hardware constraint. autoperf agents proposing
+  TP-on-X / TP-on-Y experiments are valid; they just need the
+  TP-on-ICI cost in the diary as a known caveat.
 
 ### `ep=1` at `gbs=4096` doesn't fit compile-time HBM (autoperf purefsdp iter-0b, 2026-05-06)
 - Geometry tested: `dp=1 fsdp=256 ep=1 tp=2` (v321 historical config)

@@ -228,7 +228,11 @@ class ShardConfig:
         nx, ny, nz, nc = grid.shape
 
         # Topology-aware mapping policy:
-        #   * TP (intra-chip) → cores axis (C) when tp == nc
+        #   * TP → a single physical axis whose size matches self.tp.
+        #     Cores axis (C) preferred when nc == tp (TP-AR on D2D shared-HBM
+        #     is faster than on ICI). Falls back to any matching X/Y/Z axis.
+        #     Multi-axis TP placement (TP spanning multiple physical axes) is
+        #     not supported.
         #   * EP (critical path, A2A or AG dispatch) → smallest physical axes
         #     whose product equals self.ep — keeps EP on a tight torus
         #   * FSDP → all remaining axes
@@ -239,15 +243,28 @@ class ShardConfig:
         #   4×4×16, ep=16, fsdp=16, tp=2 → TP=C (2), EP=X·Y (4·4), FSDP=Z (16)
         #   4×8×8,  ep=4,  fsdp=128, tp=1 → EP=X (4), FSDP=Y·Z·C (8·8·2)
         #   4×8×8,  ep=8,  fsdp=64,  tp=1 → EP=X·Y2(?) — error if not factorable
+        #   4×8×8,  ep=1,  fsdp=128, tp=4 → TP=X (4), FSDP=Y·Z·C (8·8·2),
+        #                                   TP-AR on ICI (slower than C)
         physical = [("X", nx), ("Y", ny), ("Z", nz), ("C", nc)]
 
-        # Reserve cores axis for TP if requested and matches.
-        tp_takes_cores = self.tp > 1 and nc == self.tp
-        if self.tp > 1 and not tp_takes_cores:
-            raise ValueError(
-                f"tp={self.tp} requested but cores axis nc={nc} doesn't match. "
-                f"Implement multi-axis TP placement if needed.")
-        ep_pool = [p for p in physical if not (tp_takes_cores and p[0] == "C")]
+        # Reserve a single physical axis for TP if requested.
+        tp_axis_name = None
+        if self.tp > 1:
+            if nc == self.tp:
+                tp_axis_name = "C"  # preferred: D2D shared-HBM, fastest TP-AR
+            else:
+                for name, sz in physical:
+                    if name == "C":
+                        continue  # already handled above
+                    if sz == self.tp:
+                        tp_axis_name = name
+                        break
+                if tp_axis_name is None:
+                    raise ValueError(
+                        f"tp={self.tp} doesn't match any single physical axis size "
+                        f"{[(n, s) for n, s in physical]}. Multi-axis TP placement "
+                        f"(TP spanning multiple physical axes) is not implemented.")
+        ep_pool = [p for p in physical if p[0] != tp_axis_name]
 
         # Pick EP axes: prefer a single physical axis whose size matches self.ep
         # exactly (e.g. EP=8 → Y(8) on 4×8×8). Fall back to greedy contiguous
@@ -283,7 +300,7 @@ class ShardConfig:
         # Order on the input grid is [X=0, Y=1, Z=2, C=3].
         ep_idxs   = [a[2] for a in ep_axes]
         fsdp_idxs = [a[2] for a in fsdp_axes]
-        tp_idxs   = [3] if tp_takes_cores else []
+        tp_idxs   = [idx_map[tp_axis_name]] if tp_axis_name else []
         # New axis order: ep first, then fsdp, then tp.
         perm = ep_idxs + fsdp_idxs + tp_idxs
         mesh_grid = grid.transpose(perm)
@@ -291,7 +308,7 @@ class ShardConfig:
 
         ep_desc   = "·".join(f"{a[0]}({a[1]})" for a in ep_axes)
         fsdp_desc = "·".join(f"{a[0]}({a[1]})" for a in fsdp_axes)
-        tp_desc   = f"C({nc})" if tp_takes_cores else "—"
+        tp_desc   = f"{tp_axis_name}({self.tp})" if tp_axis_name else "—"
         type_desc = "Explicit" if self.explicit_axes else "Auto"
         print(f"[mesh] X={nx} Y={ny} Z={nz} C={nc} → "
               f"EP={ep_desc} | FSDP={fsdp_desc} | TP={tp_desc} ({type_desc})")

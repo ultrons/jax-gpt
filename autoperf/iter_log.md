@@ -181,6 +181,47 @@ TP_AR after attn/MoE).
   (implement multi-axis TP placement), comparable in scope to fixing
   the moe_xlayer_prefetch bwd-transpose bug on the dsv3_train_full
   track. Both are jax-gpt-side surgery; neither is a per-leaf lever.
-- **Empirical conclusion across all 3 attempts**: no-EP at gbs=4096
-  on v7x_4x8x8 is not viable in this codebase. The track is exhausted.
-  See HALT.md for the recommended next step.
+- **Conclusion superseded**: see iter 0 attempt 4. The "TP > 2 not
+  supported" maxim was over-broad; on closer reading the constraint was
+  "TP must equal cores axis", which is fixable with a small patch to
+  `create_mesh` (extending the single-axis-match logic that EP already
+  has, to TP).
+
+---
+
+## iter 0 (attempt 4) — patch `create_mesh` to allow TP-on-X, retry
+
+User pointed out the iter-0c failure was an implementation choice in
+`ShardConfig.create_mesh` (TP hardcoded to cores axis), not a fundamental
+limitation. The constraint at `model.py:245-249` was a missing single-axis
+match for TP — EP already had it (lines 258-262), TP didn't.
+
+**Patch** (`model.py:230-303`): replaced the `tp_takes_cores` hardcode with
+single-axis TP placement: prefer cores when `nc == tp` (preserves all
+existing v304 / v321 behavior), else scan X/Y/Z for any axis whose size
+matches `self.tp`. Multi-axis TP placement is still not implemented (would
+need TP spanning multiple physical axes — not what we need here).
+
+Sanity-check traces on v7x_4x8x8: `tp=1 → None`, `tp=2 → C`,
+`tp=4 → X`, `tp=8 → Y`. No regressions for v304 (tp=1) or v321
+(tp=2). For the present workload, `tp=4 → X` puts TP on the X(4) axis
+of the physical mesh.
+
+- **Workload**: `autoperf/workloads/dsv3_train_purefsdp.yaml` unchanged
+  from attempt 3 (still `dp=1 fsdp=128 ep=1 tp=4`).
+- **HBM expectation**: same as attempt 3's analysis — per-device profile
+  matches v304 by construction (AG transient 1.79 GiB/chunk, PDBS=32,
+  weights 88 MiB/device).
+- **TP perf caveat**: TP-AR now lands on ICI (X axis) instead of D2D
+  (cores). v7x_KNOWLEDGE.md §1 says w-axis ICI is 7-13× faster than
+  others for D2D, but TP-AR happens after every attn AND every MoE
+  block × 61 layers × fwd+bwd. Off-chip TP-AR will show up as a much
+  larger TP_AR_* leaf than ep=4 baseline's (which had no TP). This is
+  the empirical question: whether saving EP_AG_dispatch (~25 ms/step)
+  beats paying TP_AR on ICI.
+- **Risk**: TP=4 has not been tested at this code revision. The
+  program binary at TP=4 sharding may differ in size; expert sharding
+  patterns may interact differently. Watch for compile errors or NaN
+  signals.
+- **Decision**: launch.
+- **Result**: TBD.
