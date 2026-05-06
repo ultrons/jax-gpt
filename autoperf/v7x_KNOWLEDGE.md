@@ -168,6 +168,27 @@ until the corresponding bug is closed. The workload yamls bake these in.
 - `n_chunks=4` triggers Bug 3 (bwd NaN). Don't propose without resolving the bug.
 - `n_chunks=8` untested as of 2026-05-05.
 
+### `--moe_xlayer_prefetch` broken at ep=4 fsdp=128 (autoperf iter1, 2026-05-06)
+- `cfg.moe_xlayer_prefetch=True` (cross-layer FSDP weight AG prefetch via
+  3-tuple scan carry, `model.py:3061-3094`) fails to compile at
+  `full + ga=1 + n_chunks=2 + gbs=4096` on `fsdp=128 ep=4 tp=1` v7x_4x8x8.
+- Error: `ValueError: all_gather_reduced only accepts inputs that are
+  varying. Got bf16[64,16,7168]` during bwd-transpose abstract eval of
+  `_ag_one_moe_layer`. Stack: `train_step → value_and_grad → _vjp →
+  linearize → _all_gather_is_async → all_gather_reduced → abstract_eval`.
+- Cause: the `pcast/reduced` AG primitive's bwd transpose requires the
+  input to be sharded ("varying") along the gather axis. The prefetch
+  carry threads a gathered weight tile `[E_local=64, F_local=16, D=7168]`
+  into a position where its bwd cotangent appears replicated under
+  jax/jaxlib 0.10.0. **Untested at ep=1 fsdp=512** (different shape:
+  `[E_local=256, F_local=4, D=7168]`); the bug may not reproduce.
+- **Don't propose `moe_xlayer_prefetch=True` at the v304 ep=4 sharding**
+  until the underlying jax-gpt bug is fixed. It's the heuristic-table
+  lever for `FSDP_AG`; alternative levers (Router, Norms) should be
+  preferred until the fix lands.
+- Default (`moe_xlayer_prefetch=False`) compiles and trains cleanly —
+  that's the v304-postrefactor baseline.
+
 ---
 
 ## 6. cde / kubectl operational knowledge

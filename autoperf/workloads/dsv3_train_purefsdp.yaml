@@ -1,0 +1,62 @@
+# Workload: DSv3 671B training, pure-FSDP parallelism (no EP, no TP).
+#
+# Sister track to dsv3_train_full.yaml. Same model/hardware/batch; only
+# parallelism strategy differs. Established as a separate workload at
+# the user's request after dsv3_train_full hit a `moe_xlayer_prefetch`
+# bug at compile (the canonical FSDP_AG lever for ep=4) and the ep=4
+# headroom report's structural argument was acknowledged but the human
+# elected to verify pure FSDP empirically rather than concede the
+# leaf-level math.
+#
+# "Pure FSDP" means: dp=1, fsdp=512, ep=1, tp=1 — all 512 v7x devices
+# (256 chips × 2 cores) doing FSDP on the full model. No expert
+# parallelism, no tensor parallelism. Every device runs every expert.
+#
+# Per-device economics vs v304 baseline (ep=4 fsdp=128):
+#   PDBS:       8 (vs 32) — 4× fewer sequences/device per step
+#   Expert AG:  256 experts gathered (vs 64)         — 4× volume
+#   AG reach:   FSDP=512 (vs 128) — wider all-gather mesh
+#   EP comm:    none (vs ep=4 token AG ~25 ms exposed)
+#   FSDP comm:  expected ≥ 4× larger than ep=4 — see iter-0 report
+#
+# Prior pure-FSDP attempts in the gs:// profile tree predate
+# v304-postrefactor's other improvements (gmm_v2, einsum deltanet, the
+# auxar global-psum fix), so their numbers don't apply. iter-0 is a
+# fresh measurement against current code.
+
+model: dsv3_671b
+hardware: v7x_4x8x8
+regime: training
+parallelism:
+  dp: 1
+  fsdp: 512
+  ep: 1
+  tp: 1
+batch: 4096          # global batch size (sequences)
+ctx: 4096            # sequence length
+prompt: 0            # not applicable for training
+weight_dtype: bf16
+kv_dtype: bf16
+
+cluster_context: gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-rbq
+
+# Bug 2/3/4 workarounds carry over from dsv3_train_full:
+#   ga=1     → Bug 2 (scan+remat+vjp NaN) — locked
+#   n_chunks=2 → Bug 3 (n_chunks=4 bwd NaN) — locked
+#   gbs=4096   → Bug 4 (PDBS=1 NaN); at fsdp=512, gbs=4096 → PDBS=8, well above floor
+cde_overrides:
+  config: full
+  moe_backend: gmm_ag
+  attn_backend: splash
+  optimizer: sgd
+  fsdp: 512
+  ep: 1
+  tp: 1
+  gbs: 4096
+  grad_accum: 1
+  moe_n_chunks: 2
+  steps: 5
+  grad_clip: 1.0
+  dtype: bfloat16
+  gradient_checkpoint: true
+  no_cp: true
