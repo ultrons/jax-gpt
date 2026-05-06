@@ -158,4 +158,29 @@ TP_AR after attn/MoE).
   program binary may be different size at TP=4 sharding. SC-offload
   flags should still apply (fsdp=128 axis is the same as v304).
 - **Decision**: launch.
-- **Result**: TBD.
+- **Result**: **FAILED in Python init (before compile, before cluster
+  admission overhead).** `cde run dsv3train-pf-i0c` → trainer pod
+  hit a `ValueError` immediately:
+  ```
+  ValueError: tp=4 requested but cores axis nc=2 doesn't match.
+  Implement multi-axis TP placement if needed.
+  ```
+  Source: `jax_gpt/models/dsv3/model.py:247` in
+  `ShardConfig.create_mesh`. The mesh constructor has a hardcoded
+  invariant: TP must equal the v7x cores-per-chip axis (`nc=2`). TP=4
+  would need "multi-axis TP placement" (not implemented). So
+  effectively, **TP ∈ {1, 2} in this codebase**, full stop.
+  - Cluster cost: trivial — error in Python init, no compile, no
+    significant admission overhead.
+  - This is now the third failure on the no-EP track and the second
+    consecutive structural one. Combined with attempt 2's HBM OOM, it
+    means: at TP ≤ 2, no-EP doesn't fit at gbs=4096, and TP ≥ 4 isn't
+    code-supported. The space is exhausted from the autoperf side.
+- **Halt reason**: `code_constraint` (jax-gpt source doesn't support
+  the required TP). Workaround would be a non-trivial source change
+  (implement multi-axis TP placement), comparable in scope to fixing
+  the moe_xlayer_prefetch bwd-transpose bug on the dsv3_train_full
+  track. Both are jax-gpt-side surgery; neither is a per-leaf lever.
+- **Empirical conclusion across all 3 attempts**: no-EP at gbs=4096
+  on v7x_4x8x8 is not viable in this codebase. The track is exhausted.
+  See HALT.md for the recommended next step.

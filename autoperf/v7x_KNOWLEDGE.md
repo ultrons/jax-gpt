@@ -168,6 +168,19 @@ until the corresponding bug is closed. The workload yamls bake these in.
 - `n_chunks=4` triggers Bug 3 (bwd NaN). Don't propose without resolving the bug.
 - `n_chunks=8` untested as of 2026-05-05.
 
+### TP is hardcoded to align with v7x cores axis: TP ∈ {1, 2} only (autoperf purefsdp iter-0c, 2026-05-06)
+- `jax_gpt/models/dsv3/model.py:247` (`ShardConfig.create_mesh`) raises
+  `ValueError: tp=N requested but cores axis nc=2 doesn't match.
+  Implement multi-axis TP placement if needed.` for any TP ≠ 1 and TP ≠ 2.
+- TP=4 / TP=8 / etc. would need a non-trivial source change to support
+  multi-axis TP placement (TP spanning multiple physical mesh axes, not
+  just the cores axis). Not in autoperf's per-iter scope.
+- Implication for autoperf: parallelism design space at the TP knob is
+  binary — either tp=1 or tp=2. Combined with the EP and FSDP knobs
+  this is much narrower than the "any TP" the heuristic table assumes.
+  Levers that target TP_AR_* are limited to swapping between these
+  two values.
+
 ### `ep=1` at `gbs=4096` doesn't fit compile-time HBM (autoperf purefsdp iter-0b, 2026-05-06)
 - Geometry tested: `dp=1 fsdp=256 ep=1 tp=2` (v321 historical config)
   on v7x_4x8x8 with full + ga=1 + n_chunks=2 + gbs=4096.
