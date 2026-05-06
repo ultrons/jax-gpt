@@ -97,11 +97,13 @@ running these steps in sequence:
    imports still work. If broken, revert and HALT (don't burn cluster on broken
    code).
 
-6. **Commit.** Format:
+6. **Commit + push.** Commit format:
    ```
    autoperf-iter<N>: <one-line change> on <workload>
    ```
-   Don't push (push at end-of-day or when explicitly asked).
+   Then immediately `git push origin autoperf/<workload-name>`. Frequent
+   pushes give a durable audit trail and let the human review progress
+   remotely. (See §4 for branch rules — never push to main or prefetch.)
 
 7. **Check parallelism budget.** Run `cde history --status running | wc -l`.
    If ≥ 2 running, wait by polling `cde status <oldest-running-tag>` every 60s
@@ -162,8 +164,23 @@ recommended next human action. Then stop.
   changes for; halt only on the conditions in step 13.
 - **Cluster has 512 chips total.** Don't submit jobs larger than 512 chips.
   All current workloads use full slice (256 chips × 2 cores = 512 devices).
-- **Never push to remote without an explicit ask.** Commits are local until
-  human reviews.
+- **Push to `autoperf/<workload-name>` branch frequently.** After each
+  iteration's commit, `git push origin autoperf/<workload-name>`. Frequent
+  pushes give a durable audit trail (machine reboot doesn't lose work),
+  let the human review progress remotely, and put failed-experiment
+  commits in history where future sessions can learn from them. **Reverted
+  commits stay in history — that's the feature, not a bug.**
+- **Never push to `main`, `prefetch`, or any other shared branch.** Push
+  ONLY to `autoperf/<workload-name>`. The human cherry-picks/squash-merges
+  good results to a shared branch; never you.
+- **Never force-push. Never push tags. Never modify branch protection.**
+  These are human-only operations.
+- **First push for a new workload**: create the branch first.
+  ```bash
+  git checkout -b autoperf/<workload-name>
+  git push -u origin autoperf/<workload-name>
+  ```
+  Subsequent iterations: `git push` (already tracking).
 - **Never `kubectl delete` jobsets you didn't create** in this session.
 - **Never widen perfsim tolerances to make tests pass.** That's a perfsim
   agent's call, not yours.
