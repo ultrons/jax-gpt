@@ -1,69 +1,86 @@
 # HALT — autoperf agent
 
 **Workload**: `autoperf/workloads/dsv3_train_full.yaml`
-**Last iteration**: 1 (halted at orient/sanity-check, before any cluster
-launch — no profile, no diary entry, no measurement-side work performed)
+**Last iteration**: 1 (compile-failed; reverted)
 **Branch**: `autoperf/dsv3_train_full`
 **Halted at**: 2026-05-06
-**Reason**: `tool_blocked_perfsim#1` — perfsim's `headroom_report.py` does
-not support training-regime workloads. Three concrete gaps documented in
-[ultrons/perfsim#1](https://github.com/ultrons/perfsim/issues/1):
+**Reason**: `broke_training` per AGENT.md §13. iter-1 lever
+(`moe_xlayer_prefetch=True`) failed at compile with
+```
+ValueError: all_gather_reduced only accepts inputs that are varying.
+Got bf16[64,16,7168]
+```
+in the bwd transpose of `_ag_one_moe_layer` via `_moe_scan_fn_pf`
+(`model.py:3079`). Pure Python tracing exception — no NaN, no OOM, no
+hardware failure. Cluster cost: ~7 min (admission + compile attempt + 64-pod
+failure propagation); zero training compute.
 
-1. `headroom_report.py:_predict_per_leaf` only calls
-   `inference.simulator.run_decode`. No training-regime path is wired up,
-   even though `perfsim.simulator.run` + `TrainingConfig`/`ParallelismConfig`
-   exist in the core library.
-2. `LEAF_PATTERNS` are vLLM-named (`VllmSharedFusedMoE`,
-   `VllmRowParallelLinear`, `QKVParallelLinear`, `compute_logits_func`).
-   The jax-gpt training stack uses different op names — only `jit(gmm_v2)`
-   would match. The bucketer would silently drop most training-stack ops.
-3. Workload yaml's `model: dsv3_671b` is not in `perfsim.specs.model.MODEL_PRESETS`.
-   The closest match is `deepseek_v3` (61L, 256E, k=8, hidden=7168 — same
-   shape as DSv3 671B). Need either a preset alias or a workload-yaml
-   correction.
-
-## Why halt rather than launch
-
-Step 11 of `autoperf/AGENT.md` §3 is the headroom report — that's how
-each iteration picks the next lever. With the headroom step broken for
-this workload, a cluster run (5 training steps × full 4×8×8 v7x slice =
-512 devices) would produce a profile we couldn't rank, so launching
-would burn cluster cycles for no decision input. AGENT.md §1 explicit
-principle: "Halt when uncertain. Lost cluster cycles cost real money."
+Full diagnostic in `autoperf/iter_log.md` iter-1 entry. Anti-hallucination
+note appended to `v7x_KNOWLEDGE.md` §5 ("`--moe_xlayer_prefetch` broken at
+production scale") so future agents don't repeat the experiment until the
+underlying jax-gpt bug is fixed.
 
 ## Recommended next human action
 
-1. **If the perfsim agent fixes #1 quickly** (likely path — the changes are
-   bounded: route `headroom_report` through training simulator, generalize
-   `LEAF_PATTERNS`, add the preset alias):
-   - `git -C ~/perfsim pull` to pick up the fix
-   - mark `BLOCKED.md` row `open` → `resolved`
-   - re-run iter 1 from step 1 of `AGENT.md` §3 — first cluster job will
-     reproduce the v304-postrefactor baseline (full + ga=1 + n_chunks=2 +
-     gbs=4096) and the headroom report will tell us where to start
-2. **If the issue is going to take longer**: human can either (a) run the
-   `dsv3_train_mini.yaml` workload through the existing inference-style
-   path if a calibration anchor is needed, or (b) wait. There's no other
-   training workload defined that would not hit the same gaps.
+This is a fork-in-the-road decision; the autoperf agent halts because §13
+calls for it, but the next iteration is well-scoped:
 
-## What was done in this iter-1 session
+1. **Continue the loop on the next-best lever (cheap, immediate)**:
+   iter-2's top-headroom leaf is `Router` (+88 ms/step exposed on
+   v304 baseline). Per `auto-perf-guide.md` training-subsection lever for
+   `Router`: "gate-logits dot_general (`bsd,de->bse`) tile choice; avoid
+   scatter on the TC path." Concretely: re-tile the Router GEMM, or
+   verify it isn't dispatching to the SC scatter path for top-k.
+   Implementation lives at `model.py:moe_routing/gate_logits/`. ~1 cluster
+   cycle to test.
 
-- Read the four required references (`AGENT.md`, `v7x_KNOWLEDGE.md`,
-  `auto-perf-guide.md`, `perfsim-protocol.md`).
-- Verified perfsim presets and core APIs (`MODEL_PRESETS`, `HW_PRESETS`,
-  `simulator.run`, `TrainingConfig`, `ParallelismConfig`).
-- Read `~/perfsim/perfsim/FEEDBACK_TO_JAX_GPT_TRAINING.md` (perfsim agent's
-  prior reply to a v304 calibration round; confirms perfsim-side training
-  fixes have already landed on `auto_perf` — but the headroom-report
-  wrapper is still inference-only).
-- Reaped 31 stale `running` rows in `cde history` (hangover from prior
-  bisection sessions; only `v341b-nchunks4-barrier` was actually still
-  running). Free parallelism budget now: 1/2 slots used.
-- Created branch `autoperf/dsv3_train_full`, pushed initial state.
-- Filed [ultrons/perfsim#1](https://github.com/ultrons/perfsim/issues/1)
-  with three gaps bundled, copy-pasteable repro, and a definition-of-done
-  with three sub-criteria.
-- Updated `autoperf/BLOCKED.md` with the issue row.
+2. **Fix the jax-gpt `moe_xlayer_prefetch` bug (correct, scoped)**:
+   The bwd transpose's sharding constraint mismatch is in jax-gpt source,
+   not autoperf scope. A small jax-gpt-side change (e.g., adding an
+   explicit shard_map wrapper around `_ag_one_moe_layer` in the prefetch
+   path, or pinning the carry's PartitionSpec) likely fixes it. Once
+   fixed, `FSDP_AG` (top headroom +264 ms/step) becomes addressable
+   again. This is the largest single lever on this workload but is gated
+   on the bug.
 
-No source files in `jax_gpt/` were touched. No cluster job submitted. No
-git history rewritten.
+3. **Both, in order**: option 2 first (unlocks the +264 ms lever), then
+   resume autoperf at iter-2 with `moe_xlayer_prefetch=True` retried.
+   Skip option 1.
+
+The autoperf agent's natural choice (if instructed to keep going without
+human intervention) would be **option 1** — keep the loop moving on the
+next-best lever. But if the user prefers to chase the larger headroom,
+option 2 is the bigger win.
+
+## Open follow-ups (parallel)
+
+- `ultrons/perfsim#3` (filed 2026-05-06, OPEN, non-blocking): fit
+  `gemm_eff` for `dsv3_671b` training-regime corpus entry. Without it,
+  compute leaves stay masked at headroom=0; iter-2's lever pick on
+  `Router` doesn't depend on this, but iter-3+ may.
+
+## Cluster state at halt
+
+- `dsv3train-i1` JobSet: `Finished=True (Failed)`, all 64 pods exited.
+- `cde history --status running`: only `v341b-nchunks4-barrier`
+  (unrelated, pre-autoperf bisection job). Parallelism budget free for
+  next launch.
+- Logs preserved at `/tmp/dsv3train-i1.log`.
+
+## What was reverted
+
+- `autoperf/workloads/dsv3_train_full.yaml`: removed
+  `moe_xlayer_prefetch: true` and accompanying comments from
+  `cde_overrides` block. Single line + 6 comment lines. Restored to
+  pre-iter-1 baseline.
+
+## What was kept (audit trail)
+
+- iter-1 commit (`449a8e2`) stays in branch history — reverted commits
+  stay in history per AGENT.md §4 push rules.
+- `autoperf/iter_log.md` iter-1 section retains full diagnostic.
+- `v7x_KNOWLEDGE.md` §5 has the new "broken at production scale" entry
+  so the experiment isn't repeated.
+- `autoperf/BLOCKED.md`: perfsim#1 = `resolved`, perfsim#3 = `open`.
+- `autoperf/reports/dsv3_train_full_iter0.json` = baseline headroom
+  report; reusable by iter-2.

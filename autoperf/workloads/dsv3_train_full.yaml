@@ -37,11 +37,3 @@ cde_overrides:
   dtype: bfloat16
   gradient_checkpoint: true
   no_cp: true
-  # iter1 lever: enable cross-layer FSDP weight AG prefetch (gmm_ag only).
-  # Baseline (v304-cde-repro) had FSDP_AG measured=264 ms/step, predicted=0
-  # (top headroom). Heuristic table FSDP_AG row → prefetch_layers ≥ 1.
-  # Implementation: model.py:3061 _moe_scan_fn_pf, 3-tuple carry threads the
-  # next layer's gathered weights through scan; XLA can schedule the AG
-  # concurrently with current-layer compute. Pcast/reduced bwd semantics
-  # avoid the v294-class 109 GB carry-grad stash.
-  moe_xlayer_prefetch: true
