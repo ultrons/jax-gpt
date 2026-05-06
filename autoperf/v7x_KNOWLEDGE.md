@@ -168,6 +168,28 @@ until the corresponding bug is closed. The workload yamls bake these in.
 - `n_chunks=4` triggers Bug 3 (bwd NaN). Don't propose without resolving the bug.
 - `n_chunks=8` untested as of 2026-05-05.
 
+### `ep=1` at `gbs=4096` doesn't fit compile-time HBM (autoperf purefsdp iter-0b, 2026-05-06)
+- Geometry tested: `dp=1 fsdp=256 ep=1 tp=2` (v321 historical config)
+  on v7x_4x8x8 with full + ga=1 + n_chunks=2 + gbs=4096.
+- Crashes at compile with:
+  ```
+  JaxRuntimeError: CompileTimeHbmOom: Used 126.45G of 94.75G hbm.
+  Exceeded hbm capacity by 31.70G.
+  ```
+- Cause: ep=1 means every device handles all 256 experts' AG transient
+  per layer (~3.56 GiB/chunk vs v304's 1.78 GiB/chunk at ep=4). With
+  61 layers + activations at PDBS=16 + program binary, compile-time
+  peak crosses the 94.75 GB conservative HBM limit.
+- The `v262`/`v263`/`v272` historical fsdp=256+tp=2 profiles in gs://
+  ran at **gbs=2048** (PDBS=8 — half the activation memory). They fit;
+  ours at gbs=4096 doesn't. v321 likely also pre-dates the gbs=4096
+  baseline.
+- **Implication**: `ep=1` parallelism choices are constrained on v7x_4x8x8
+  at gbs=4096. EP=4 in v304 baseline isn't a free choice — it's forced
+  by HBM. To validate "no-EP" empirically would require either lowering
+  gbs (changes the workload definition) or further reducing per-device
+  HBM via TP=4 (untested) / fp8 weights / shard-D-with-fsdp.
+
 ### `fsdp=512 + SC-offload flags` → libtpu CHECK fail (autoperf purefsdp iter-0, 2026-05-06)
 - Pure-FSDP attempt: `dp=1 fsdp=512 ep=1 tp=1` on v7x_4x8x8, full + ga=1
   + n_chunks=2 + gbs=4096, with the standard v304 LIBTPU_INIT_ARGS.

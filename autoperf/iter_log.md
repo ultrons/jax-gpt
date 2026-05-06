@@ -98,4 +98,38 @@ predate v304-postrefactor's improvements.
     re-compile (Docker layers identical); JAX cache may not transfer if
     sharding differs.
 - **Decision**: launch.
-- **Result**: TBD.
+- **Result**: **FAILED at compile (no training step ran).**
+  `cde run dsv3train-pf-i0b` → `Finished=True (Failed)`. Init succeeded
+  (all 58 MoE layers, 670B params reported); compile started, then JAX
+  raised `CompileTimeHbmOom`:
+  ```
+  JaxRuntimeError: RESOURCE_EXHAUSTED: E1000: CompileTimeHbmOom:
+  XLA:TPU compile permanent error. Ran out of memory in memory space
+  hbm. Used 126.45G of 94.75G hbm. Exceeded hbm capacity by 31.70G.
+  ```
+  Compile-time conservative HBM limit is 94.75 GB (v7x_KNOWLEDGE.md §1);
+  we needed 126.45 GB — **+32 GB over budget**.
+  - **Why this fails vs v304** (which fits at the same gbs=4096):
+    - v304: ep=4 → 64 experts AGed per FSDP shard; per-chunk transient
+      ~1.78 GiB.
+    - iter-0b: ep=1 → all 256 experts AGed; per-chunk transient ~3.56 GiB
+      (4× larger). With 61 layers + activations + program binary, the
+      total compile-time peak crosses the 94.75 GB conservative limit.
+    - The historical v262/v263/v272 (`fsdp=256 tp=2`) runs that fit DID
+      run at **gbs=2048** (PDBS=8) — half the activation memory of our
+      gbs=4096 (PDBS=16). v321 likely the same. Apples-to-oranges
+      comparison; their compile-time HBM was lower.
+  - **Empirical conclusion**: ep=1 at gbs=4096 on v7x_4x8x8 doesn't fit
+    in compile-time HBM at this code revision. The structural argument
+    that EP relieves HBM pressure (ep=4 → 4× smaller AG transient) is
+    confirmed empirically.
+- **Halt reason**: `compile_oom` (resource exhaustion, not a tooling bug).
+  The no-EP track can't establish a baseline at gbs=4096 in this geometry.
+- **Iter-0 retry strategy**: needs human direction. Options:
+  - Pivot to ep=1 fsdp=128 tp=4 (more TP cuts AG transient further; same
+    devices). Untested at this code revision; HBM math unverified.
+  - Lower gbs to 2048 for the no-EP track (validates non-EP empirically
+    but loses apples-to-apples vs v304's gbs=4096).
+  - Concede the structural argument; resume dsv3_train_full track with
+    iter-2 lever pick (Router or Norms), or fix the moe_xlayer_prefetch
+    bwd-transpose bug to unlock the +264 ms FSDP_AG lever.
