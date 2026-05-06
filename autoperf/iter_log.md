@@ -133,3 +133,29 @@ predate v304-postrefactor's improvements.
   - Concede the structural argument; resume dsv3_train_full track with
     iter-2 lever pick (Router or Norms), or fix the moe_xlayer_prefetch
     bwd-transpose bug to unlock the +264 ms FSDP_AG lever.
+
+---
+
+## iter 0 (attempt 3) — pivot to ep=1 fsdp=128 tp=4
+
+User chose HALT.md option 2 from attempt 2's compile OOM. TP=4 splits
+the F dim 4 ways, dropping per-device AG transient to ~1.79 GiB/chunk
+— matching v304's 1.78 GiB/chunk exactly. PDBS = 4096/128 = 32, also
+matching v304. The per-device HBM profile should be near-identical
+to v304; only the comm pattern differs (no EP_AG_dispatch, but a new
+TP_AR after attn/MoE).
+
+- **Workload**: `autoperf/workloads/dsv3_train_purefsdp.yaml` updated
+  to `dp=1 fsdp=128 ep=1 tp=4`.
+- **HBM expectation**:
+  - AG transient/chunk: 256 experts × F/4=512 × D=7168 × 2 = 1.79 GiB
+    (matches v304 exactly).
+  - Activations/layer: PDBS=32 × seq=4096 × D=7168 × 2 = 1.88 GiB
+    (matches v304 exactly).
+  - Per-device weights: 256 × 2048 × 7168 × 3 × 2 / (128 × 4) = 88 MiB
+    (matches v304).
+- **Risk**: TP=4 has not been tested at this code revision. The
+  program binary may be different size at TP=4 sharding. SC-offload
+  flags should still apply (fsdp=128 axis is the same as v304).
+- **Decision**: launch.
+- **Result**: TBD.

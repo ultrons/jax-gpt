@@ -7,39 +7,46 @@
 # structural argument was acknowledged but the human elected to verify
 # the no-EP regime empirically.
 #
-# Original intent was "pure FSDP" (`fsdp=512 ep=1 tp=1`). iter-0 attempt 1
-# crashed at compile with a libtpu CHECK in the SparseCore async-collective
-# offload path — the assertion is fsdp=512-mesh-specific (see
-# v7x_KNOWLEDGE.md §5 "fsdp=512 + SC-offload flags → libtpu CHECK fail").
-# Per HALT.md option 2, pivoted to the v321 historical geometry —
-# `dp=1, fsdp=256, ep=1, tp=2`. This is a known-compilable shape (the
-# `v321-colrow-ep1-fsdp256-tp2-4x8x8` and `v262/v263/v272` profiles in
-# gs://max-experiments/dsv3/profiles/ all use this geometry).
+# History of attempts at this no-EP workload:
+#   attempt 1 (`fsdp=512 ep=1 tp=1`): libtpu SC-offload CHECK fail at
+#     fsdp=512-mesh geometry (see v7x_KNOWLEDGE.md §5).
+#   attempt 2 (`fsdp=256 ep=1 tp=2`): compile-time HBM OOM; 256 experts
+#     AGed × per-chunk transient = 4× v304's at ep=4. +32 GB over the
+#     94.75 GB conservative compile-time HBM limit.
+#   attempt 3 (CURRENT, `fsdp=128 ep=1 tp=4`): TP=4 splits the F dim
+#     4 ways, so per-device AG transient drops to ~1.79 GiB/chunk —
+#     matching v304's 1.78 GiB/chunk exactly. PDBS = gbs/fsdp = 4096/128 =
+#     32, also matching v304. Per-device weight + activation footprint
+#     should be near-identical to v304; the difference is TP=4 introduces
+#     a TP_AR comm leaf that v304 (tp=1) doesn't have, while saving the
+#     EP_AG_dispatch leaf that v304 has at ep=4.
 #
 # Branch name `autoperf/dsv3_train_purefsdp` is retained for continuity;
 # "no-EP" describes the actual workload.
 #
-# Per-device economics vs v304 baseline (ep=4 fsdp=128):
-#   PDBS:       16 (vs 32) — 2× fewer sequences/device per step (gbs/fsdp = 4096/256)
-#   Expert AG:  256 experts gathered (vs 64)         — 4× volume
-#   AG reach:   FSDP=256 (vs 128) — 2× wider AG mesh
+# Per-device economics vs v304 baseline (ep=4 fsdp=128 tp=1):
+#   PDBS:       32 (matches v304)
+#   Expert AG:  256 experts × F/4 = 1.79 GiB/chunk (matches v304's 1.78)
+#   AG reach:   FSDP=128 (matches v304)
 #   EP comm:    none (vs ep=4 token AG ~25 ms exposed)
-#   TP comm:    new — TP=2 introduces TP_AR (all-reduce after attn/MoE)
-#   FSDP comm:  expected ~2× larger than ep=4 — see iter-0 report
+#   TP comm:    new — TP=4 introduces TP_AR after attn/MoE (4× larger
+#               than what v321's TP=2 would have)
 #
-# Prior fsdp=256+tp=2 attempts predate v304-postrefactor's other
-# improvements (gmm_v2, einsum deltanet, the auxar global-psum fix),
-# so their numbers don't apply. iter-0 is a fresh measurement against
-# current code.
+# This is the cleanest possible no-EP comparison to v304 by HBM profile.
+# If it compiles, iter-0 baseline TPS becomes the "no-EP at gbs=4096"
+# datapoint and iter-1 picks the first leaf-driven lever from there.
+# If it doesn't compile (third compile-side failure on this track),
+# the empirical conclusion is even stronger: no-EP isn't viable at
+# gbs=4096 on this hardware.
 
 model: dsv3_671b
 hardware: v7x_4x8x8
 regime: training
 parallelism:
   dp: 1
-  fsdp: 256
+  fsdp: 128
   ep: 1
-  tp: 2
+  tp: 4
 batch: 4096          # global batch size (sequences)
 ctx: 4096            # sequence length
 prompt: 0            # not applicable for training
@@ -57,9 +64,9 @@ cde_overrides:
   moe_backend: gmm_ag
   attn_backend: splash
   optimizer: sgd
-  fsdp: 256
+  fsdp: 128
   ep: 1
-  tp: 2
+  tp: 4
   gbs: 4096
   grad_accum: 1
   moe_n_chunks: 2
