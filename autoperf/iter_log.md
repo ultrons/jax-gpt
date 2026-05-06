@@ -66,4 +66,36 @@ one.
   SC-offload flags for this workload (manifest template edit), or
   (b) pivot to a different parallelism that doesn't trip the assertion
   (e.g., v321's `ep=1 fsdp=256 tp=2`, or `dp=2 fsdp=256 ep=1 tp=1`).
-- **Iter-0 retry strategy**: needs human direction (see HALT.md).
+- **Iter-0 retry strategy**: human chose HALT.md option 2 (pivot to
+  v321 geometry `ep=1 fsdp=256 tp=2`). See iter-0 attempt 2 below.
+
+---
+
+## iter 0 (attempt 2) — pivot to ep=1 fsdp=256 tp=2
+
+Following HALT.md option 2 from attempt 1's libtpu compile fail. Same
+"no EP" intent, different geometry. v321 / v262 / v263 / v272 historical
+runs in `gs://max-experiments/dsv3/profiles/` all used this geometry and
+have real xplanes — empirically known to compile, even if the TPS numbers
+predate v304-postrefactor's improvements.
+
+- **Workload**: `autoperf/workloads/dsv3_train_purefsdp.yaml` updated to
+  `dp=1 fsdp=256 ep=1 tp=2`. Branch name kept as `autoperf/dsv3_train_purefsdp`.
+- **Image**: TBD on `cde build`.
+- **Per-device economics**:
+  - PDBS = gbs/fsdp = 4096/256 = **16** (vs v304's 32, vs attempt-1's 8)
+  - Expert AG: 256 experts gathered, mesh fsdp=256 (vs attempt-1's 512)
+  - TP comm is new: TP=2 introduces TP_AR after attn/MoE blocks
+- **Pre-launch risks**:
+  - **HBM**: TP=2 splits weights across 2 cores; per-device weight
+    footprint similar to v304 (~44 MiB per expert). Expert AG transient
+    is the same total volume as attempt-1 (256 × F × D × 2 = 7.13 GiB),
+    just gathered over 256 instead of 512 — could be larger per-device
+    receive buffer.
+  - **TP_AR overhead**: with TP=2, each layer's attention and MoE have a
+    TP all-reduce. This is a NEW comm leaf vs v304 (which has tp=1).
+  - **Compile time**: pivoting from attempt-1 with same image is fast
+    re-compile (Docker layers identical); JAX cache may not transfer if
+    sharding differs.
+- **Decision**: launch.
+- **Result**: TBD.

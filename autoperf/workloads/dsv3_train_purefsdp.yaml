@@ -1,37 +1,45 @@
-# Workload: DSv3 671B training, pure-FSDP parallelism (no EP, no TP).
+# Workload: DSv3 671B training, no-EP parallelism (FSDP+TP, no expert parallel).
 #
 # Sister track to dsv3_train_full.yaml. Same model/hardware/batch; only
-# parallelism strategy differs. Established as a separate workload at
-# the user's request after dsv3_train_full hit a `moe_xlayer_prefetch`
-# bug at compile (the canonical FSDP_AG lever for ep=4) and the ep=4
-# headroom report's structural argument was acknowledged but the human
-# elected to verify pure FSDP empirically rather than concede the
-# leaf-level math.
+# parallelism strategy differs. Established at the user's request after
+# dsv3_train_full hit a `moe_xlayer_prefetch` bug at compile (the
+# canonical FSDP_AG lever for ep=4) and the ep=4 headroom report's
+# structural argument was acknowledged but the human elected to verify
+# the no-EP regime empirically.
 #
-# "Pure FSDP" means: dp=1, fsdp=512, ep=1, tp=1 — all 512 v7x devices
-# (256 chips × 2 cores) doing FSDP on the full model. No expert
-# parallelism, no tensor parallelism. Every device runs every expert.
+# Original intent was "pure FSDP" (`fsdp=512 ep=1 tp=1`). iter-0 attempt 1
+# crashed at compile with a libtpu CHECK in the SparseCore async-collective
+# offload path — the assertion is fsdp=512-mesh-specific (see
+# v7x_KNOWLEDGE.md §5 "fsdp=512 + SC-offload flags → libtpu CHECK fail").
+# Per HALT.md option 2, pivoted to the v321 historical geometry —
+# `dp=1, fsdp=256, ep=1, tp=2`. This is a known-compilable shape (the
+# `v321-colrow-ep1-fsdp256-tp2-4x8x8` and `v262/v263/v272` profiles in
+# gs://max-experiments/dsv3/profiles/ all use this geometry).
+#
+# Branch name `autoperf/dsv3_train_purefsdp` is retained for continuity;
+# "no-EP" describes the actual workload.
 #
 # Per-device economics vs v304 baseline (ep=4 fsdp=128):
-#   PDBS:       8 (vs 32) — 4× fewer sequences/device per step
+#   PDBS:       16 (vs 32) — 2× fewer sequences/device per step (gbs/fsdp = 4096/256)
 #   Expert AG:  256 experts gathered (vs 64)         — 4× volume
-#   AG reach:   FSDP=512 (vs 128) — wider all-gather mesh
+#   AG reach:   FSDP=256 (vs 128) — 2× wider AG mesh
 #   EP comm:    none (vs ep=4 token AG ~25 ms exposed)
-#   FSDP comm:  expected ≥ 4× larger than ep=4 — see iter-0 report
+#   TP comm:    new — TP=2 introduces TP_AR (all-reduce after attn/MoE)
+#   FSDP comm:  expected ~2× larger than ep=4 — see iter-0 report
 #
-# Prior pure-FSDP attempts in the gs:// profile tree predate
-# v304-postrefactor's other improvements (gmm_v2, einsum deltanet, the
-# auxar global-psum fix), so their numbers don't apply. iter-0 is a
-# fresh measurement against current code.
+# Prior fsdp=256+tp=2 attempts predate v304-postrefactor's other
+# improvements (gmm_v2, einsum deltanet, the auxar global-psum fix),
+# so their numbers don't apply. iter-0 is a fresh measurement against
+# current code.
 
 model: dsv3_671b
 hardware: v7x_4x8x8
 regime: training
 parallelism:
   dp: 1
-  fsdp: 512
+  fsdp: 256
   ep: 1
-  tp: 1
+  tp: 2
 batch: 4096          # global batch size (sequences)
 ctx: 4096            # sequence length
 prompt: 0            # not applicable for training
@@ -43,15 +51,15 @@ cluster_context: gke_cloud-tpu-multipod-dev_us-central1_bodaborg-super-rbq
 # Bug 2/3/4 workarounds carry over from dsv3_train_full:
 #   ga=1     → Bug 2 (scan+remat+vjp NaN) — locked
 #   n_chunks=2 → Bug 3 (n_chunks=4 bwd NaN) — locked
-#   gbs=4096   → Bug 4 (PDBS=1 NaN); at fsdp=512, gbs=4096 → PDBS=8, well above floor
+#   gbs=4096   → Bug 4 (PDBS=1 NaN); at fsdp=256, gbs=4096 → PDBS=16, well above floor
 cde_overrides:
   config: full
   moe_backend: gmm_ag
   attn_backend: splash
   optimizer: sgd
-  fsdp: 512
+  fsdp: 256
   ep: 1
-  tp: 1
+  tp: 2
   gbs: 4096
   grad_accum: 1
   moe_n_chunks: 2
