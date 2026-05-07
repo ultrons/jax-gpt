@@ -30,9 +30,7 @@ autoperf/profiles/
 .DS_Store
 Thumbs.db
 
-# Internal AI assistant / agent settings (per-user; never tracked).
-# CLAUDE.md is intentionally tracked when present (project guidance file);
-# .claude/ holds per-user state and must NOT travel via git.
+# Per-user AI assistant / agent settings — never tracked.
 .claude/
 .aider*
 .cursor/
