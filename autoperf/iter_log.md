@@ -300,3 +300,59 @@ bug hadn't fired.
   cloud.google.com/gke-tpu-accelerator,topology` with `kubectl get pods
   -A -o json | jq '.spec.nodeSelector "tpu7x"'` to see which nodes are
   occupied before submitting.
+
+### iter-3 RESUMED (2026-05-07 evening) — bench actually completed
+
+The HALT was premature. The original JobSet (submit 06:27Z) sat in the Kueue
+queue at medium priority and was admitted ~50 min later when one of the
+medium pods released; bench completed at 07:56Z. I'd missed the success
+because I was off pivoting to `tpu7x-inference-cluster` (which turned out to
+be broken — see below). Recovered the data from `kubectl logs` of the
+Completed pod 12h after-the-fact.
+
+**Pivots attempted while the original job was actually running**:
+1. **`tpu7x-inference-cluster` (`cloud-tpu-multipod-dev` project)** — resized
+   `tpu7x-np` from 0 to 1; instance stuck `PENDING/CREATING` for >1 hour with
+   `CONDITION_NOT_MET: Reservation 'cloudtpu-20251017124413-573252602' is
+   incorrect for the requested resources.` Cluster has been broken for days
+   (unrelated `vllm-tpu` pod Pending 4d19h on the same cause). Resized back
+   to 0; cluster unusable until owner fixes the stale reservation pinning.
+2. **No JobSet CRD on this cluster** — discovered mid-pivot. Converted yaml
+   to plain `batch/v1 Job`; kept the multipod-variant yaml at
+   `~/perfsim/benchmarks/k8s/perfsim-bf16-microbench-multipod.yaml` for
+   future use if the reservation gets fixed.
+
+**Results recovered**: 35 workloads measured, all `effective_dtype: bf16`,
+cv_pct < 1% on most rows. JSON + log uploaded manually to
+`gs://max-experiments/autoperf/microbench/v7x_4x8x8_bf16_2026-05-07/`. Local
+copy at `autoperf/microbench-results/v7x_4x8x8_bf16_2026-05-07/`.
+
+**v304 anchor outcome**: spec target eff=0.244 (xplane-derived per #10 first
+comment); microbench measured **0.6226** at the same shape. Re-normalizing
+the anchor to per-core peak (the maintainer used per-chip 2307 TFLOPS as
+denominator; bench is single-core 1153.5 TFLOPS) cuts the gap to 0.488 vs
+0.622 (1.27×). The remaining ~30% reflects in-training overhead the
+standalone microbench doesn't capture — router dispatch, neighbor-activation
+HBM contention, scheduler-induced overlap inefficiency. **Curve-fitter
+recommendation**: fit `gemm_eff_curve_bf16` to the microbench; treat the
+in-training overhead as a separate calibration term in the MoE leaf.
+
+**Operational gotcha discovered for future calibration runs**: image
+`Dockerfile.tpu` doesn't install `gsutil`/`gcloud storage`, so the wrapper
+script's GCS upload was a no-op. Recovery via `kubectl logs` worked because
+the script also emits the JSON marker-delimited to stdout. Follow-up on
+perfsim side: image-fix to install `google-cloud-cli` so future runs
+self-publish. NOT done in iter-3 (out of scope; surfaced in #10 comment).
+
+**PR #23 + #10 commented**:
+- ultrons/perfsim#23 — bench_runner grouped-MM extension + workload JSON +
+  k8s yaml. Open, not merged. Reviewer should validate FLOPs accounting and
+  whether to extend the curve schema for `n_groups` discriminator.
+- ultrons/perfsim#10 — measurements posted, status flipped from
+  needs-info → ready for curve fit. Closing autoperf-side task.
+
+**Decision for iter-4**: once perfsim agent fits the curve and lands an
+update on `autoperf-loop`, regenerate iter-2 headroom on the v304 xplane to
+refresh the trust table. Most likely top-leaf is still **Expert_gmm** (top-3
+#1 post-PR#22) — but the new curve may shift other leaves. iter-4 picks the
+greedy lever from the refreshed trusted set.

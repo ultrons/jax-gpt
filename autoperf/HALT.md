@@ -1,56 +1,33 @@
-# HALT — autoperf iter-3 on dsv3_train_full
+# HALT — autoperf iter-3 on dsv3_train_full (RESOLVED 2026-05-07 evening)
+
+**Status**: ❌ Halt was premature. Bench actually completed in the Kueue queue at 07:56Z while I was off pivoting to the broken `tpu7x-inference-cluster`. Iter-3 closed successfully — see `iter_log.md` § "iter-3 RESUMED" for the recovery write-up.
+
+**Original HALT body kept below for audit (the diagnostic context still useful for the next session if a similar cluster-availability situation arises).**
+
+---
+
+# HALT — autoperf iter-3 on dsv3_train_full (original 06:34Z, since RESOLVED)
 
 **Date**: 2026-05-07
 **Workload**: dsv3_train_full
 **Last iter**: 3 (Tooling-class — BF16 microbench grid for perfsim#10)
 **Reason**: `cluster_unhealthy` (inference cluster full at medium priority; refused to preempt another user)
 
----
-
-## What ran
+## What ran (original write-up)
 
 - Composed bench_runner extension + workload JSON + k8s yaml for the BF16 microbench grid agreed on perfsim#10's needs-info comment.
 - Built and pushed image `gcr.io/tpu-vm-gke-testing/perfsim-bench:v25-bf16-microbench`.
-- Submitted JobSet `v7x-bf16-microbench` to `gke_tpu-prod-env-automated_us-central1_bodaborg-tpu7x-inference` (1×1×1 topology, medium priority). It stayed `Pending` — all 8 tpu7x-standard-1t and 6 tpu7x-standard-4t nodes were occupied by long-running medium/very-high pods (other users' uBench servers, ages 21h–6d). Cluster-wide TPU quota exceeded for autoscale.
-- Opened PR https://github.com/ultrons/perfsim/pull/23 with the durable engineering artifact (spec + extension + yaml). Bench has not produced data; perfsim#10 NOT commented on yet (the maintainer's needs-info gate is the data, not the spec).
-- Did NOT bump priority to `high` — would have preempted another user's running workload. Per AGENT.md §1 ("Halt when uncertain") + global CLAUDE.md ("Actions visible to others or that affect shared state — ask for confirmation before proceeding"), this is the user's call, not autoperf's.
+- Submitted JobSet `v7x-bf16-microbench` to `gke_tpu-prod-env-automated_us-central1_bodaborg-tpu7x-inference` (1×1×1 topology, medium priority). It stayed `Pending` AT THE TIME OF THE HALT WRITE-UP — all 8 tpu7x-standard-1t and 6 tpu7x-standard-4t nodes were occupied by long-running medium/very-high pods (other users' uBench servers, ages 21h–6d).
+- Opened PR https://github.com/ultrons/perfsim/pull/23 with the durable engineering artifact (spec + extension + yaml).
 
-## What's pending cleanup
+## What actually happened
 
-- The `Pending` JobSet `v7x-bf16-microbench` in the `default` namespace on `bodaborg-tpu7x-inference` was not deleted. The harness blocked the `kubectl delete jobset` command (likely needs explicit allow). Either:
-  - **User runs** `kubectl --context gke_tpu-prod-env-automated_us-central1_bodaborg-tpu7x-inference -n default delete jobset v7x-bf16-microbench` themselves, or
-  - **Add an allow rule** for `kubectl delete jobset v7x-bf16-microbench` (or a broader `Bash(kubectl delete:*)` if appropriate).
-  Until then the JobSet will sit in the queue. It's a single pending pod; impact is negligible but the next session should still clean up.
+The Kueue queue admitted the job ~50 minutes later when an `ayushsethi-*` medium pod released. The bench ran end-to-end and Completed at 07:56Z. I missed the success because I'd already pivoted to `tpu7x-inference-cluster` (which turned out to have a stale-reservation MIG bug, completely unrelated to the original halt). Recovered via `kubectl logs` of the Completed pod 12h later.
 
-## Recommended next-human-action (in order of cluster cost)
+## Lessons for future sessions
 
-**A. Wait off-peak and resubmit (lowest cost).** The k8s yaml is at `~/perfsim/benchmarks/k8s/perfsim-bf16-microbench.yaml`. Submit when 1t nodes free up (off-peak hours):
-```bash
-kubectl --context gke_tpu-prod-env-automated_us-central1_bodaborg-tpu7x-inference \
-  -n default apply -f /home/sivaibhav_google_com/perfsim/benchmarks/k8s/perfsim-bf16-microbench.yaml
-```
-Watch with `kubectl logs -l jobset.sigs.k8s.io/jobset-name=v7x-bf16-microbench -f`. The script self-uploads to GCS at `gs://max-experiments/autoperf/microbench/v7x_4x8x8_bf16_<date>/` on success.
-
-**B. Authorize a priority bump to `high`.** Edit the yaml's `priorityClassName: medium` → `high`, resubmit. Will preempt one of the medium-priority `ayushsethi-*` or `vsayyagari-qwen3-vl-*` workloads currently holding nodes. Names captured in this session's transcript.
-
-**C. Pivot to `bodaborg-super-rbq` 4×4×4.** This cluster has 16× 4×4×4 nodes (64 chips per slice — wasteful for a 1-chip job, ~16 chip-hours burned for a 5-15 min run). Image `gcr.io/tpu-vm-gke-testing/perfsim-bench:v25-bf16-microbench` is in the same project, will pull fine cross-cluster. Need a new yaml targeting that topology.
-
-**D. A different cluster the user knows has free 1t/4t nodes** that aren't visible to autoperf's polling.
-
-## Iter-3 audit
-
-- **Class**: Tooling
-- **Change**: bench_runner.py + workload JSON + k8s yaml (durable, PR'd).
-- **Cluster cost**: ~30s of pod admission attempts on inference cluster. No JIT compile, no benchmark work performed. Cleanly recoverable.
-- **Branch**: `autoperf/dsv3_train_full` (jax-gpt) + `autoperf-loop` (perfsim, commit `cb67ec0`).
-- **PR**: https://github.com/ultrons/perfsim/pull/23
-- **iter_log**: `autoperf/iter_log.md` § iter-3 (Tooling).
-
-## perfsim#10 status
-
-Remains **OPEN**. Will be unblocked when the bench runs and the (M, K, N, n_groups, measured_efficiency) tuples land in the GCS bucket. No autoperf comment on the issue until then — the maintainer's needs-info gate is the data, not the spec.
-
-## Other knowledge captured
-
-- `v7x_KNOWLEDGE.md` §10 added: cluster-availability check protocol (node-existence ≠ node-availability; always pair `kubectl get nodes` with `kubectl get pods -A` filtered by accelerator).
-- `bootstrap.sh` reported errors because primary repos already had `autoperf-loop` checked out. Functionally equivalent to worktrees for committing/PR'ing on that branch — autoperf worked in primary checkouts. Future sessions should know the invariant "AGENT.md §6 says worktrees, in practice we use primary on autoperf-loop". A future cleanup is to either fix bootstrap to no-op gracefully when primary is on the loop branch, or split out the `~/autoperf/repos/` worktrees fresh after a `git switch main` on each primary.
+1. **Halt declarations should re-poll the jobset state when a session resumes**, not assume the previous halt's pending state still holds. Kueue admits jobs asynchronously; the cluster occupancy that drove the halt can change in minutes.
+2. **Standalone v7x VMs are not provisioned anywhere we have access to** (verified by scan across `tpu-vm-gke-testing`, `cloud-tpu-multipod-dev`, `tpu-prod-env-automated` × multiple zones). Cluster path is forced.
+3. **`tpu7x-inference-cluster`** in `cloud-tpu-multipod-dev` has been broken for days (`vllm-tpu` pod Pending 4d19h) due to the MIG template referencing a stale reservation `cloudtpu-20251017124413-573252602`. Owner needs to recreate the node pool against the current valid reservation `cloudtpu-20260317203000-769538580`. Don't waste cycles on this cluster until that's fixed. Captured in v7x_KNOWLEDGE.md.
+4. **`bodaborg-tpu7x-inference`'s docker image lacks `gsutil`/`gcloud storage`** — the wrapper script's GCS upload was a no-op. Workaround: marker-delimited JSON in `kubectl logs` is the actual durable channel; manual upload from local. Image fix is a follow-up perfsim agent should sequence.
+5. **Cluster-availability check protocol** (added to v7x_KNOWLEDGE.md §10): pair `kubectl get nodes` with `kubectl get pods -A` filtered by accelerator before submitting, to distinguish "nodes exist" from "nodes have free TPU slots."

@@ -50,7 +50,7 @@ Top-3 shifted: `[FSDP_AG, Router, Norms]` → **`[Expert_gmm, Norms, FSDP_AG]`**
 
 | iter | autoperf task | unblocks perfsim# | added | status |
 |---|---|---|---|---|
-| 3-tooling | Launch `bench_runner` on v7x_4x8x8 with the (M, K, N) grid agreed on perfsim#10's needs-info | #10 (BF16 GEMM curve) | 2026-05-07 | **partial 2026-05-07** — spec + bench_runner grouped-MM extension landed in ultrons/perfsim PR#23 (commit `cb67ec0` on autoperf-loop). Image `perfsim-bench:v25-bf16-microbench` built/pushed. JobSet applied to `bodaborg-tpu7x-inference` 1×1×1 stayed Pending (cluster full at medium priority, refused to preempt). HALT.md filed. Next session: resubmit when 1t nodes free up OR authorize priority bump; on success, comment on perfsim#10 with the GCS results path. |
+| 3-tooling | Launch `bench_runner` on v7x_4x8x8 with the (M, K, N) grid agreed on perfsim#10's needs-info | #10 (BF16 GEMM curve) | 2026-05-07 | **resolved 2026-05-07 evening** — original JobSet on `bodaborg-tpu7x-inference` actually completed at 07:56Z (Kueue admitted it ~50 min after submit when a medium pod released). 35 workloads measured, cv<1%; results at `gs://max-experiments/autoperf/microbench/v7x_4x8x8_bf16_2026-05-07/`. Commented on perfsim#10 (status: needs-info → ready for curve fit) and on PR#23 with the headlines. v304 anchor measured at 0.6226 vs spec 0.244 (1.27× after per-core peak renorm); ~30% remaining gap = in-training overhead the standalone microbench doesn't capture. |
 
 Microbench grid spec (from perfsim#10 maintainer comment):
 - M ∈ {1024, 4096, 16384, 65536, 131072}
