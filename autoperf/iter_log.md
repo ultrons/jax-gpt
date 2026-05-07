@@ -165,4 +165,27 @@ bug hadn't fired.
     ratio may shift; iter-2's actual measured improvement is what
     matters, not the predicted-side delta.
 - **Decision**: launch.
-- **Result**: TBD.
+- **Result (attempt 1, `dsv3train-i2`, ea60078)**: **FAILED at import**.
+  ```
+  ModuleNotFoundError: No module named 'kernels'
+  ```
+  Triggered by `from kernels.gmm_v2_train import ...` at `model.py:1793`,
+  which only resolves when `jax_gpt/models/dsv3/` itself is on PYTHONPATH.
+  The Dockerfile sets `PYTHONPATH=/app`; trainer is invoked as
+  `python -m jax_gpt.models.dsv3.train`; only `/app` is on path. So the
+  import fails before reaching any compile.
+
+  This is a **real jax-gpt source bug** — the import is wrong as
+  written, not just untested. My local sanity-check passed only because
+  I extended PYTHONPATH manually. Same bug exists at `model.py:1642`
+  (`from kernels.gather_reduce_pallas`) but that's a different code
+  path (gated on `cfg.moe_use_sc_scatter`); not in scope for iter-2.
+
+- **Fix (one-line, same iter)**: `model.py:1793` —
+  `from kernels.gmm_v2_train` → `from .kernels.gmm_v2_train`. Relative
+  import resolves correctly under `python -m`. Sanity-check: `grep -n
+  'from .*kernels.gmm_v2_train'` shows the relative form lands.
+  Cluster cost of attempt 1: ~3 min admission + import-time crash.
+  No training compute.
+
+- **Result (attempt 2, `dsv3train-i2b`)**: TBD.

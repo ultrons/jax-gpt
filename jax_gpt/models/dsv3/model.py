@@ -1790,7 +1790,7 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
             # Phase 3: ragged_dots.
             if use_gmm_v2:
                 # Pallas gmm_v2 with fused gate+up+silu; jax.vjp backward through ragged_dot reference.
-                from kernels.gmm_v2_train import gmm_v2_train, gmm_v2_fused_silu_train
+                from .kernels.gmm_v2_train import gmm_v2_train, gmm_v2_fused_silu_train
                 # Fused gate+up+silu: 3 ragged_dots → 2 gmm_v2 calls.
                 # vmem_limit=48M required for fused at our M=131072, N=2*2048 (default OOMs).
                 hidden = gmm_v2_fused_silu_train(
