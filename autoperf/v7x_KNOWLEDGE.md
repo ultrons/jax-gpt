@@ -141,6 +141,27 @@ until the corresponding bug is closed. The workload yamls bake these in.
 - `--optimizer=sgd --grad_clip=1.0` (AdamW now also gets grad_clip via `_maybe_clip_grads`)
 - Throughput: **1770 TPS/chip @ 28.6% MFU** (v304-postrefactor)
 
+### Adding `--moe_use_gmm_v2` (autoperf iter-2, 2026-05-07): +6.6% TPS
+- Same baseline + `--moe_use_gmm_v2`: **1882 TPS/chip @ 30.5% MFU**
+  (step 34.65 s vs 37.0 s baseline; loss 415.46 vs 415.49 — within bf16
+  tolerance).
+- Routes the 3 ragged-dots/chunk through Pallas `gmm_v2_train` /
+  `gmm_v2_fused_silu_train` (gate+up+silu fused into 2 calls). Bwd via
+  `jax.vjp` on `jax.lax.ragged_dot` reference.
+- Required two fixes that landed alongside the experiment:
+  - perfsim#4 (gmm_ag `batch_sharded_by_ep` wiring) — without it,
+    Expert_gmm's predicted time was 4× too high and the leaf appeared
+    masked (headroom = 0).
+  - jax-gpt `model.py:1793`: `from kernels.gmm_v2_train` →
+    `from .kernels.gmm_v2_train` (relative import). The bare-`kernels`
+    form had been broken whenever `cfg.moe_use_gmm_v2=True` was set.
+- **Bucketer caveat for next iter**: `LEAF_PATTERNS_TRAINING` rule for
+  Expert_gmm matches `ragged-dot`-named fusions; gmm_v2's Pallas
+  custom_call has a different fusion name. So Expert_gmm measured time
+  in any post-gmm_v2 xplane is under-counted; iter-3 either files a
+  perfsim follow-up to extend the pattern, or picks from the
+  remaining (correctly-bucketed) leaves.
+
 ### Aux loss
 - `cfg.moe_aux_loss_coeff = 1e-4` by default
 - Initial aux at random init: `coeff × E (=256) × sum(f·P) ≈ 7` per MoE layer

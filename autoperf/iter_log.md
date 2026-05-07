@@ -188,4 +188,45 @@ bug hadn't fired.
   Cluster cost of attempt 1: ~3 min admission + import-time crash.
   No training compute.
 
-- **Result (attempt 2, `dsv3train-i2b`)**: TBD.
+- **Result (attempt 2, `dsv3train-i2b`, commit f0b34da)**: **SUCCESS — first
+  end-to-end win of the session.** Steady-state numbers (steps 2-4):
+  | metric | v304 baseline | iter-2 | delta |
+  |---|---|---|---|
+  | step time | 37.0 s | 34.65 s | **−2.35 s/step** |
+  | TPS/chip | 1770 | 1882 | **+6.6%** |
+  | MFU | 28.6% | 30.5% | **+1.9 pp** |
+  | step-1 loss | 415.491 | 415.46-415.47 | within bf16 tolerance |
+
+  Cluster cost: ~5 min admission + ~4 min compile + ~2 min steady-state
+  + profile capture. Profile pulled to
+  `autoperf/profiles/dsv3train-i2b/...`.
+  Headroom report saved at
+  `autoperf/reports/dsv3_train_full_iter2.json`.
+
+- **Per-leaf attribution caveat (and the next-iter lever question)**:
+  iter-2 headroom report shows Expert_gmm measured = 15.30M µs/step,
+  basically unchanged from iter-0's 15.34M. But step time dropped by
+  2.35 s. The cause is the bucketer's `LEAF_PATTERNS_TRAINING` rule:
+  Expert_gmm matches fusions containing `ragged-dot`. The gmm_v2
+  Pallas kernel produces a `tpu_custom_call` with a different fusion
+  name, so iter-2's Expert_gmm leaf is under-counting. perfsim#5's
+  defense-in-depth check correctly emitted:
+  ```
+  [info] Expert_gmm: no HLO op matched substring='ragged-dot' field='any'
+  ```
+  iter-2 top-3 from the (partially-stale) report:
+  - Expert_gmm: 25,312 ms HR (16-pass total) — under-counted (see above)
+  - FSDP_AG: 6,221 ms HR (16-pass) = 389 ms/step (got WORSE: was 264 ms)
+  - Router: 3,300 ms HR (16-pass) = 206 ms/step (was 167 ms)
+
+  **FSDP_AG getting worse is interesting**: with the faster expert
+  kernel, the AG-vs-compute overlap window shifted. Schedule-position
+  lever (vs concurrency) is real; the advisor flagged this earlier.
+
+- **Decision for next iter**: pause for human review. Two open questions:
+  1. File perfsim follow-up to extend `LEAF_PATTERNS_TRAINING` to
+     match gmm_v2 fusion names, so iter-3's Expert_gmm bucketing is
+     accurate.
+  2. Pick iter-3 lever despite the stale Expert_gmm bucket — FSDP_AG
+     (now 389 ms/step) or Router (206 ms/step) are usable signals.
+     Either way, fixing the bucketer first means cleaner attribution.
