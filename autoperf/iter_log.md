@@ -230,3 +230,73 @@ bug hadn't fired.
   2. Pick iter-3 lever despite the stale Expert_gmm bucket — FSDP_AG
      (now 389 ms/step) or Router (206 ms/step) are usable signals.
      Either way, fixing the bucketer first means cleaner attribution.
+
+---
+
+## iter 3 — Tooling: BF16 microbench grid for perfsim#10
+
+- **Class**: Tooling.
+- **Goal**: produce empirical (M, K, N, n_groups, measured_efficiency) data for
+  v7x BF16 to populate `HardwareSpec.gemm_eff_curve_bf16`. Today the curve is
+  empty and BF16 falls back to scalar 0.90 — search results on training-side
+  workloads are not trustworthy without this. perfsim#10 is open with status
+  `needs-info` pending these measurements.
+- **Hypothesis (deferred to next iter)**: the curve will reproduce the v304
+  empirical anchor (M=131072, K=2048, N=7168, n_groups=64, eff=0.244) extracted
+  from the v304-cde-repro xplane in perfsim#10's first comment, AND show
+  efficiency drop at small M (latency-bound) and rise at large M (compute-bound)
+  consistent with arithmetic-intensity intuition.
+- **Pre-launch state**:
+  - Bootstrap: `autoperf/bootstrap.sh` reported worktree creation errors
+    because primary `~/perfsim`, `~/cde`, `~/xla-shell` already have
+    `autoperf-loop` checked out (each branch can only be in one worktree).
+    Worked in primary directly — functionally equivalent for committing/PR'ing
+    since the user's `pip install -e` already imports from autoperf-loop.
+  - Step-1 ritual: only open BLOCKED row was perfsim#10 (this iter's target).
+    No open autoperf-loop PRs across any repo.
+- **Change (durable; landed in perfsim PR #23)**:
+  - `perfsim/bench_runner.py`: extend `benchmark_gemm` with optional
+    `n_groups` field (default 1 = dense). When > 1, run `jax.lax.ragged_dot`
+    with G equal-sized groups; total FLOPs `2*M*K*N` unchanged.
+  - `perfsim/inference/configs/v7x_microbench/v7x_4x8x8_bf16_microbench.json`:
+    35-workload grid covering (1) dense at LMHead/Router/QKV across M ∈
+    {1024, 4096, 16384, 65536, 131072}; (2) grouped at QKV-symmetric
+    (K=N=7168) at n_groups ∈ {8, 64}; (3) grouped at Expert_gmm production
+    shapes (gate/up K=2048,N=7168 and down K=7168,N=2048) at n_groups=64.
+  - `perfsim/inference/scripts/run_v7x_bf16_microbench.sh`: wrapper that
+    runs bench_runner, emits marker-delimited JSON, uploads to
+    `gs://max-experiments/autoperf/microbench/v7x_4x8x8_bf16_<date>/`.
+  - `benchmarks/k8s/perfsim-bf16-microbench.yaml`: JobSet for
+    `tpu7x-standard-1t` (1×1×1) on the bodaborg-tpu7x-inference cluster
+    at priority `medium`. Mirrors `qwen3coder-calibration.yaml`.
+  - perfsim autoperf-loop commit: `cb67ec0`.
+- **Build**: image `gcr.io/tpu-vm-gke-testing/perfsim-bench:v25-bf16-microbench`
+  built and pushed.
+- **Result**: **HALT — `cluster_unhealthy`**. JobSet applied to
+  `bodaborg-tpu7x-inference` stayed `Pending`: all 8 1t and 6 4t nodes
+  occupied by long-running medium/very-high pods (other users' uBench
+  servers, ages 21h–6d). Three other medium-priority pods already
+  pending 25-81 min ahead of mine. Cluster-wide TPU quota exceeded for
+  autoscale. Bumping priority to `high` would preempt another user's
+  running workload — refused per AGENT.md §1 ("Halt when uncertain") +
+  global CLAUDE.md ("ask for confirmation before proceeding" on actions
+  affecting shared state). No JIT compile, no benchmark work performed.
+- **PR opened**: https://github.com/ultrons/perfsim/pull/23 with the
+  durable engineering artifact (spec + extension + yaml). The bench will
+  run in a future session once cluster slots free up; perfsim#10 will be
+  commented at that point — not yet, since the maintainer's needs-info
+  gate is the data, not the spec.
+- **Pending cleanup**: the still-Pending JobSet on the inference cluster
+  (`v7x-bf16-microbench`) was not deleted — harness blocks `kubectl
+  delete jobset` without explicit allow. Surfaced to user in HALT.md.
+- **Decision for next iter**: human picks one of the next-actions in
+  HALT.md (wait off-peak, authorize priority bump, pivot to a wasteful
+  4×4×4 slice on `bodaborg-super-rbq`, or a different cluster). After
+  the bench runs and JSON lands in GCS, the perfsim agent ingests +
+  fits the curve in a follow-up commit on `autoperf-loop`; iter-4 is
+  greedy on the new top-leaf.
+- **Lesson for v7x_KNOWLEDGE.md** (added §10): node-existence is not
+  node-availability. Always pair `kubectl get nodes -L
+  cloud.google.com/gke-tpu-accelerator,topology` with `kubectl get pods
+  -A -o json | jq '.spec.nodeSelector "tpu7x"'` to see which nodes are
+  occupied before submitting.

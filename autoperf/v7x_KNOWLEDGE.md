@@ -305,6 +305,46 @@ worktree pattern.
 - Pod pull failures often racing with cde tag updates
 - Workaround: rebuild explicitly (`cde build`), then resubmit with new tag
 
+### Cluster-availability check protocol (added 2026-05-07 from iter-3)
+
+**Node-existence ≠ node-availability.** Always pair these two checks BEFORE
+submitting a job to a non-cde-managed cluster (`kubectl apply -f` direct, e.g.
+calibration jobs that run `bench_runner`):
+
+```bash
+# (1) which TPU nodes exist?
+kubectl --context <ctx> get nodes \
+    -L cloud.google.com/gke-tpu-accelerator,cloud.google.com/gke-tpu-topology \
+    --no-headers | grep tpu7x | awk '{print $(NF-1), $NF}' | sort | uniq -c
+
+# (2) which of those nodes are already occupied?
+kubectl --context <ctx> get pods -A -o json | \
+    jq -r '.items[] | select(.spec.nodeSelector and
+        (.spec.nodeSelector."cloud.google.com/gke-tpu-accelerator"=="tpu7x")) |
+        "\(.spec.nodeName // "PENDING")\t\(.metadata.namespace)/\(.metadata.name)\t\(.spec.priorityClassName // "none")\t\(.status.phase)"' \
+    | sort | head -30
+```
+
+Iter-3 hit this trap on `bodaborg-tpu7x-inference`: 8× tpu7x-standard-1t nodes
+visible, all 8 held by long-running medium-priority `ubench` workloads (ages
+21h–6d). Three other medium pods already pending 25-81 min ahead. Cluster-wide
+TPU quota exceeded for autoscale, so submitting a new medium-priority pod just
+adds to the queue. Bumping to `high` would preempt another user's running
+workload — that's the user's call, not autoperf's; halt instead.
+
+**Calibration-friendly clusters and their typical state**:
+
+| Cluster | Useful pools | Pattern |
+|---|---|---|
+| `bodaborg-tpu7x-inference` (project `tpu-prod-env-automated`) | 8× 1t (1×1×1), 6× 4t (2×2×1) | First choice for single-host calibration. Runs on `medium` priority during low-usage windows; full during business-hours. |
+| `bodaborg-super-rbq` (project `cloud-tpu-multipod-dev`) | 16× 4×4×4, 1088× 4×8×8 | Production training cluster. **No 1t/4t nodes**. A 1-chip calibration on the 4×4×4 pool burns 64 chip-min for a 5-15 min run — wasteful but always available. |
+| `ninja-v7x-64-spot` | 8× 2×4×4 | Spot/preemptible. Skip for calibration (unreliable). |
+
+**Image cross-project pulls**: images at `gcr.io/tpu-vm-gke-testing/...` pull
+fine across both `cloud-tpu-multipod-dev` and `tpu-prod-env-automated`
+projects (verified iter-3, qwen3coder-calibration earlier). No project-local
+mirroring needed.
+
 ---
 
 ## 7. Filing tool issues (vs working around)

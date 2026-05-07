@@ -50,7 +50,7 @@ Top-3 shifted: `[FSDP_AG, Router, Norms]` → **`[Expert_gmm, Norms, FSDP_AG]`**
 
 | iter | autoperf task | unblocks perfsim# | added | status |
 |---|---|---|---|---|
-| 3-tooling | Launch `bench_runner` on v7x_4x8x8 with the (M, K, N) grid agreed on perfsim#10's needs-info | #10 (BF16 GEMM curve) | 2026-05-07 | pending — first action of iter-3 |
+| 3-tooling | Launch `bench_runner` on v7x_4x8x8 with the (M, K, N) grid agreed on perfsim#10's needs-info | #10 (BF16 GEMM curve) | 2026-05-07 | **partial 2026-05-07** — spec + bench_runner grouped-MM extension landed in ultrons/perfsim PR#23 (commit `cb67ec0` on autoperf-loop). Image `perfsim-bench:v25-bf16-microbench` built/pushed. JobSet applied to `bodaborg-tpu7x-inference` 1×1×1 stayed Pending (cluster full at medium priority, refused to preempt). HALT.md filed. Next session: resubmit when 1t nodes free up OR authorize priority bump; on success, comment on perfsim#10 with the GCS results path. |
 
 Microbench grid spec (from perfsim#10 maintainer comment):
 - M ∈ {1024, 4096, 16384, 65536, 131072}
