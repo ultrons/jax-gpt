@@ -162,6 +162,62 @@ until the corresponding bug is closed. The workload yamls bake these in.
   perfsim follow-up to extend the pattern, or picks from the
   remaining (correctly-bucketed) leaves.
 
+### Headroom-leaf trust state (2026-05-07; revisit when perfsim#19 + #7 land)
+
+After the deep perfsim review (12 issues filed, ultrons/perfsim#7-#18; sibling
+#19 added per maintainer's analysis on #7), some training-side compute leaves
+are **not currently trustworthy** as headroom signal because the train-side
+headroom_report still calls `simulator.py` (legacy path), which has a
+documented 25-48% divergence from `model_builder.py` on attention compute. The
+ADR-001 migration + per-op port (#19 → #7) is the structural fix.
+
+| Leaf | Trust today | Why |
+|---|---|---|
+| `Expert_gmm` | TRUSTED | post-#4 calibration landed; ratio 1.12 on iter-2 (gmm_ag, batch_sharded_by_ep=True). Bucketer caveat above applies for post-gmm_v2 xplanes. |
+| `FSDP_AG` | TRUSTED | comm leaf; doesn't go through the divergent simulator path. Note iter-2 saw 264→389 ms shift after gmm_v2 (schedule-position effect, currently unmodelled — perfsim#16). |
+| `EP_AG_dispatch` | TRUSTED | clean ratio 0.99 on iter-2. |
+| `Router` | TRUSTED with caveat | ratio 8.88; calibration mystery, may overlap with simulator path issue but bucketing is correct. |
+| `Norms` | TRUSTED | ratio 1.28; small absolute headroom. |
+| `Embed_lookup` | TRUSTED | predicted=0 (out of scope), measured small. |
+| `QKV_proj` | **NOT TRUSTED** | ratio 0.40 — exactly in the 25-48% sim-vs-bld divergence zone. Don't pick as a lever target until #19 + #7 land. |
+| `O_proj` | **NOT TRUSTED** | ratio 0.74 — same divergence zone. |
+| `Attn_scores` | **NOT TRUSTED** | ratio 0.69 — same divergence zone. |
+| `LMHead` | NOT TRUSTED | ratio 0.25; partial calibration debt. |
+
+**Implication for iter-3 lever pick**: choose from the TRUSTED set. The two
+candidates with both clean signal and non-trivial headroom are:
+- `FSDP_AG` (389 ms/step on iter-2 baseline; schedule-position experiment)
+- `Router` (206 ms/step; investigate the 8.88× ratio)
+
+Don't pick from QKV/O/Attn until ultrons/perfsim#19 + #7 land. Even if their
+ratios look big, the prediction is on the wrong code path.
+
+### Agent architecture: 1-agent + reviewer (2026-05-07)
+
+Pivoted from 4-agent (autoperf + 3 maintainer fixers) to 1-agent + reviewer
+on 2026-05-07. The autoperf agent now fixes inline across all 4 repos
+(jax-gpt, perfsim, cde, xla-shell) on `autoperf-loop` branches in dedicated
+worktrees under `~/autoperf/repos/<repo>/`. Maintainer agents move to a
+review-only role: hourly pass over `autoperf-loop` PRs, comment, never merge.
+Human gates daily merges.
+
+Reasons for the pivot:
+- Cross-repo handoffs (autoperf → maintainer agent → close issue) added
+  multi-hour latency for fixes the autoperf agent could have made in 30
+  seconds (e.g., the `from kernels.gmm_v2_train` relative-import bug on
+  iter-2 attempt 1 — found, fixed, re-launched in one turn).
+- Context fragmentation: the maintainer agents had to re-derive autoperf's
+  diagnostic context from issue bodies; the autoperf agent had it in head.
+- The 4-agent design's main benefit (second-pair-of-eyes review) is
+  preserved by reviewer-agent role; we trade synchronous handoffs for
+  async PR review.
+
+Bootstrap: `autoperf/bootstrap.sh` creates the 3 worktrees on first run.
+Invocations of perfsim/xla-shell scripts use
+`PYTHONPATH=~/autoperf/repos/<repo>` to override the user's `pip install -e`
+without disturbing the user's primary checkout. See AGENT.md §6 for the
+worktree pattern.
+
 ### Aux loss
 - `cfg.moe_aux_loss_coeff = 1e-4` by default
 - Initial aux at random init: `coeff × E (=256) × sum(f·P) ≈ 7` per MoE layer
