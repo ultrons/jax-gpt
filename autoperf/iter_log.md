@@ -327,15 +327,37 @@ cv_pct < 1% on most rows. JSON + log uploaded manually to
 `gs://max-experiments/autoperf/microbench/v7x_4x8x8_bf16_2026-05-07/`. Local
 copy at `autoperf/microbench-results/v7x_4x8x8_bf16_2026-05-07/`.
 
-**v304 anchor outcome**: spec target eff=0.244 (xplane-derived per #10 first
-comment); microbench measured **0.6226** at the same shape. Re-normalizing
-the anchor to per-core peak (the maintainer used per-chip 2307 TFLOPS as
-denominator; bench is single-core 1153.5 TFLOPS) cuts the gap to 0.488 vs
-0.622 (1.27×). The remaining ~30% reflects in-training overhead the
-standalone microbench doesn't capture — router dispatch, neighbor-activation
-HBM contention, scheduler-induced overlap inefficiency. **Curve-fitter
-recommendation**: fit `gemm_eff_curve_bf16` to the microbench; treat the
-in-training overhead as a separate calibration term in the MoE leaf.
+**v304 anchor outcome (CORRECTED 2026-05-07 per perfsim agent's
+review of PR#23)**: spec target eff=0.244 (xplane-derived per #10 first
+comment); microbench measured **0.6226** at the same shape. The
+"renormalize to per-core" reasoning I posted initially was wrong:
+`GemmEfficiencyConfig` already uses per-core peak (1153.5 TFLOPS) as
+denominator (`hardware.py:32-35`), and the maintainer's 0.244 derivation
+implicitly normalizes per-core too (achieved-per-chip / peak-per-chip =
+achieved-per-core / peak-per-core by symmetry, since both v7x cores are
+active during gmm_ag in production). **The 2.5× gap stands intact.**
+
+**Corrected framing**: the 2.5× delta IS the iter-N headroom signal autoperf
+is built to surface, NOT a "separate in-training overhead calibration term"
+to absorb into `HardwareSpec.gemm_eff_curve_bf16`. Per AGENT.md §1, perfsim's
+job is to predict the kernel-only achievable ceiling; the gap between
+ceiling and in-training measured is the optimization signal. Folding the
+gap into the curve would collapse predictions toward measured and erase the
+headroom autoperf needs to act on.
+
+**Curve fit will REVEAL more headroom than iter-2 saw**. iter-2 used
+`gemm_eff.expert_fwd=0.50` for Expert_gmm prediction (predicted 13.72M
+us/step vs measured 15.34M us/step → ratio 1.12×, headroom +1.6 sec/step).
+With microbench-derived eff=0.6226 substituted in, predicted drops to
+~11.0M us/step → headroom grows to ~+4.3 sec/step (**2.7× the
+previously-visible gap**). iter-4's trust table will look meaningfully
+different from iter-2's once the curve fit lands.
+
+**iter-4 hypothesis**: the 2.5× ceiling-vs-measured gap on Expert_gmm is
+a jax-gpt-side optimization opportunity — router dispatch coordination,
+scheduler-induced overlap inefficiency, neighbor-activation HBM contention.
+The lever is in jax-gpt model code or scheduling hints, NOT in perfsim
+curve adjustments.
 
 **Operational gotcha discovered for future calibration runs**: image
 `Dockerfile.tpu` doesn't install `gsutil`/`gcloud storage`, so the wrapper

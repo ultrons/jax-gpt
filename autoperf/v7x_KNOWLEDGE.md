@@ -202,6 +202,82 @@ headroom — exactly the diagnostic autoperf wanted from the start.
   position experiment, exposed by iter-2's 264→389 ms shift) or Router
   (investigate the 8.88× ratio if it persists).
 
+### iter-3 BF16 microbench landed (2026-05-07)
+
+35-workload BF16 grid measured on `bodaborg-tpu7x-inference` 1×1×1 single
+chip. Results at
+`gs://max-experiments/autoperf/microbench/v7x_4x8x8_bf16_2026-05-07/` and
+`autoperf/microbench-results/v7x_4x8x8_bf16_2026-05-07/`. cv_pct < 1% on
+most rows, all `effective_dtype: bf16` (no fp8 fallbacks).
+
+**Per-core efficiency convention (from perfsim agent's PR#23 review)**:
+`HardwareSpec.bf16_tflops_per_chip = 2307` is per-CHIP (both v7x cores
+combined). `GemmEfficiencyConfig` values are fractions of per-CORE peak
+(`bf16_tflops_per_chip / d2d_size = 1153.5 TFLOPS`). When deriving
+efficiency from xplane data: achieved-per-chip / peak-per-chip equals
+achieved-per-core / peak-per-core BY SYMMETRY, since both cores contribute
+equally to gmm_ag in production. Don't double-count the d2d_size factor.
+
+**Top-leaf efficiency anchors** (per-core, BF16, the new
+`gemm_eff_curve_bf16` ground truth):
+
+| Block | Shape (K, N) | n_groups | M=1024 | M=4096 | M=16384 | M=65536 | M=131072 |
+|---|---|---|---|---|---|---|---|
+| LMHead dense | (7168, 129280) | 1 | 0.805 | 0.768 | 0.770 | 0.783 | 0.786 |
+| QKV dense    | (7168, 7168)   | 1 | 0.764 | 0.755 | 0.759 | 0.770 | 0.743 |
+| Router dense | (7168, 64)     | 1 | 0.025 | 0.100 | 0.131 | 0.145 | 0.147 |
+| QKV grouped g=8  | (7168, 7168) | 8  | 0.233 | 0.469 | 0.613 | 0.669 | 0.674 |
+| QKV grouped g=64 | (7168, 7168) | 64 | 0.036 | 0.131 | 0.470 | 0.558 | 0.602 |
+| Expert gate/up   | (2048, 7168) | 64 | 0.036 | 0.138 | 0.494 | 0.577 | 0.623 |
+| Expert down      | (7168, 2048) | 64 | 0.036 | 0.130 | 0.459 | 0.556 | 0.611 |
+
+**iter-3 v304 headroom datum (Expert_gmm)** — the 2.5× ceiling-vs-measured
+gap that iter-4 should investigate:
+
+| | per-core efficiency | per-core TFLOPS |
+|---|---|---|
+| microbench (kernel-only ceiling) | 0.6226 | 718 |
+| v304 in-training (xplane-derived) | 0.244 | 281 |
+| ratio (overhead) | | **2.55×** |
+
+This is **NOT** a `HardwareSpec.gemm_eff_curve_bf16` adjustment — it's the
+optimization signal autoperf is built to surface. Per AGENT.md §1, perfsim
+predicts the kernel-only ceiling; the in-training gap is the headroom
+autoperf investigates with jax-gpt-side levers.
+
+**Plausible iter-4 levers for the 2.5× Expert_gmm gap** (in roughly priority
+order; not yet validated against the post-curve-fit headroom report):
+1. **Router dispatch coordination overhead** — gmm_ag dispatches all-gathered
+   tokens to all 4 EP shards. Per-call dispatch path may have setup cost
+   not visible in standalone bench. Investigate the dispatch HLO ops in
+   the v304 xplane for unaccounted time near each ragged-dot.
+2. **Scheduler-induced overlap inefficiency** — ragged-dot calls happen
+   inside an MoE chunk loop with nearby norms/router/A2A. XLA may not
+   be overlapping the second core's available compute window with HBM
+   reads on the dispatch path.
+3. **Neighbor-activation HBM contention** — production training has live
+   activations (decoder state, KV cache, gradient checkpoint state)
+   competing for HBM bandwidth. Standalone bench has no co-resident memory
+   pressure.
+
+**iter-2 lever revisited**: the gmm_v2 swap (+6.6% TPS) captured part of
+this gap by changing the kernel; the rest of the gap (after gmm_v2) is in
+the dispatch/scheduling/contention bucket above. iter-4 picks one of these
+levers after the curve fit lands.
+
+**Cluster-discovery footnotes for next session**:
+1. Bench JSON marker-delimited stdout is the durable data channel —
+   `Dockerfile.tpu` lacks gsutil/gcloud, so the wrapper script's GCS
+   upload is a no-op. Recovery via `kubectl logs` + manual `gcloud
+   storage cp` from local works.
+2. `tpu7x-inference-cluster` (`cloud-tpu-multipod-dev` project) has been
+   broken for days due to stale reservation pinning on the MIG template
+   (`cloudtpu-20251017124413-573252602` doesn't match current resource
+   specs). Don't waste cycles there until owner fixes the node pool.
+3. Halt declarations should re-poll JobSet state on session resume —
+   Kueue admits asynchronously; iter-3's halt was premature, the bench
+   actually completed in the queue while autoperf was off pivoting.
+
 ### Agent architecture: 1-agent + reviewer (2026-05-07)
 
 Pivoted from 4-agent (autoperf + 3 maintainer fixers) to 1-agent + reviewer
