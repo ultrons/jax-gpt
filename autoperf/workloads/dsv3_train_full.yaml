@@ -37,3 +37,13 @@ cde_overrides:
   dtype: bfloat16
   gradient_checkpoint: true
   no_cp: true
+  # iter2 lever: switch expert GEMMs from default ragged-dot to Pallas
+  # gmm_v2 (with fused gate+up+silu). Top headroom on v304 baseline (post
+  # perfsim#4 fix) is Expert_gmm: predicted 13.72M us/step vs measured
+  # 15.34M us/step (ratio 1.12×, headroom +1,617 ms/step — 6× FSDP_AG).
+  # Heuristic table FSDP_AG-equivalent for Expert_gmm: "verify gmm_ag
+  # kernel registration over the default ragged-dot path" — this flag
+  # (model.py:1791-1799) routes the 3 ragged-dots/chunk through Pallas
+  # gmm_v2, with bwd via jax.vjp on jax.lax.ragged_dot reference.
+  # qwen35 uses same kernel in production at 728 TPS/chip on v7x at BS=4096.
+  moe_use_gmm_v2: true
