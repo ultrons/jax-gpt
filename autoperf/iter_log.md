@@ -224,4 +224,54 @@ of the physical mesh.
   patterns may interact differently. Watch for compile errors or NaN
   signals.
 - **Decision**: launch.
-- **Result**: TBD.
+- **Result**: **`create_mesh` patch worked** — the program reached XLA's
+  HLO allocator (proving TP-on-X mesh construction is correct). Compile
+  then OOM'd with **even more HBM excess than attempt 2** (135.89 G vs
+  126.45 G; +41 GB over the 94.75 GB conservative limit). The HALT.md
+  prediction "TP=4 cuts AG transient to v304-equivalent" was **wrong**;
+  the actual XLA-allocator data shows a different root cause.
+
+  Top allocations at OOM (extracted from rank-0 pod log):
+  ```
+  1. 7.00 GB weight_allgather_f shape bf16[1,256,2048,7168]
+  2. 7.00 GB reduce_sum shape bf16[524288,7168]
+  3. 7.00 GB copy of all-gathered weights bf16[256,2048,7168]
+  4. 7.00 GB weight_allgather_f (2nd copy)
+  5-10. 7.00 GB each (more remat copies + bwd ag)
+  11-13. 7.00 GB each (gather_offload_custom_fusion, all 256 experts × D)
+  ```
+  Just the AG transient + remat copies stack to ~35 GB before activations.
+
+- **What I had wrong about TP=4 cutting the AG transient**: I assumed TP
+  shards the AG output (so per-device transient = `#experts × F/TP × D`).
+  The XLA allocator shows the AG materializes the **full pre-TP-split
+  tensor** `bf16[1,256,2048,7168]` = 7 GB, then TP-sharding happens
+  downstream. So AG transient is determined entirely by
+  `#experts_per_FSDP_shard = total_experts / EP`. **TP doesn't help.**
+  Only EP reduces the per-device expert count.
+
+- **Empirical conclusion (now definitive at HLO-allocator level)**:
+  no-EP at gbs=4096 on v7x_4x8x8 cannot fit compile-time HBM, regardless
+  of TP/FSDP geometry. The 7 GB AG transient × 5+ live copies in bwd-
+  transpose alone exceeds the +41 GB excess. EP=4 in v304 is HBM-forced
+  by the linear scaling of AG transient with `#experts/EP`.
+
+- **Other knobs that won't help (verified by reading train.py CLI flags)**:
+  - `--moe_no_weight_ag`: gated on `EP>1+TP>1`. We have EP=1.
+  - `--moe_shard_e_with_fsdp`: shards a different axis but total AG
+    bytes are unchanged.
+  - `--moe_shard_d_with_fsdp`: same total bytes.
+  - `--moe_n_chunks > 2`: Bug 3 (n_chunks=4 NaNs in bwd). Off-limits.
+
+- **Halt reason**: `track_exhausted` (now genuinely conclusive — four
+  attempts, four distinct walls, with the final attempt providing the
+  HLO-allocator data that explains why none of the others could have
+  worked either). The structural argument from the original ep=4
+  → no-EP pivot is now backed by concrete XLA evidence, not just
+  reasoning.
+
+- **The patch stays** — `create_mesh` extension to support single-axis
+  TP placement on X/Y/Z is a real correctness improvement (TP > nc was
+  silently rejected before, even when a single-axis match exists). It
+  just doesn't unlock no-EP at this batch size; the limit is HBM, not
+  mesh construction.

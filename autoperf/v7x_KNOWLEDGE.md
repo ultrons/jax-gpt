@@ -192,27 +192,57 @@ until the corresponding bug is closed. The workload yamls bake these in.
   TP-on-X / TP-on-Y experiments are valid; they just need the
   TP-on-ICI cost in the diary as a known caveat.
 
-### `ep=1` at `gbs=4096` doesn't fit compile-time HBM (autoperf purefsdp iter-0b, 2026-05-06)
-- Geometry tested: `dp=1 fsdp=256 ep=1 tp=2` (v321 historical config)
-  on v7x_4x8x8 with full + ga=1 + n_chunks=2 + gbs=4096.
-- Crashes at compile with:
-  ```
-  JaxRuntimeError: CompileTimeHbmOom: Used 126.45G of 94.75G hbm.
-  Exceeded hbm capacity by 31.70G.
-  ```
-- Cause: ep=1 means every device handles all 256 experts' AG transient
-  per layer (~3.56 GiB/chunk vs v304's 1.78 GiB/chunk at ep=4). With
-  61 layers + activations at PDBS=16 + program binary, compile-time
-  peak crosses the 94.75 GB conservative HBM limit.
-- The `v262`/`v263`/`v272` historical fsdp=256+tp=2 profiles in gs://
-  ran at **gbs=2048** (PDBS=8 — half the activation memory). They fit;
-  ours at gbs=4096 doesn't. v321 likely also pre-dates the gbs=4096
-  baseline.
-- **Implication**: `ep=1` parallelism choices are constrained on v7x_4x8x8
-  at gbs=4096. EP=4 in v304 baseline isn't a free choice — it's forced
-  by HBM. To validate "no-EP" empirically would require either lowering
-  gbs (changes the workload definition) or further reducing per-device
-  HBM via TP=4 (untested) / fp8 weights / shard-D-with-fsdp.
+### `ep=1` doesn't fit at gbs=4096 — HLO-allocator evidence (autoperf purefsdp iter-0b/0d, 2026-05-06)
+**Updated with iter-0d's full XLA allocation table**
+
+Tested across three geometries, all at `dp=1 ep=1 ... gbs=4096 + n_chunks=2`:
+| geometry | HBM used | over | failure point |
+|---|---|---|---|
+| `fsdp=512 tp=1` | — | — | libtpu SC-offload CHECK fail (didn't reach allocator) |
+| `fsdp=256 tp=2` | 126.45 GB | +32 GB | CompileTimeHbmOom |
+| `fsdp=128 tp=4` | 135.89 GB | +41 GB | CompileTimeHbmOom; **full HLO allocations dump** |
+
+**Root cause** (per XLA's largest-allocation table at iter-0d's OOM):
+the `weight_allgather_f/all_gather` op materializes the full pre-TP-split
+expert weights tensor `bf16[1, 256_experts, F=2048, D=7168]` = **7.00 GB**
+per device per chunk. With `gradient_checkpoint=true`, the bwd transpose
+recomputes the AG, so 5+ copies of the 7 GB tensor are live concurrently:
+
+```
+1. 7.00 GB weight_allgather_f
+2. 7.00 GB ragged-dot reduce_sum on AG'd weights
+3. 7.00 GB copy of AG'd weights
+4. 7.00 GB weight_allgather_f (bwd recompute)
+5-10. 7.00 GB each (more remat / fwd-bwd copies)
+11-13. 7.00 GB each (gather_offload_custom_fusion, full E×D)
+```
+
+~35 GB just from the weight AG + its remat copies, before activations
+or program binary.
+
+**The TP doesn't shard the AG output**: the AG produces the full pre-TP
+tensor, then TP-split happens downstream. So AG transient is determined
+by `#experts_per_FSDP_shard = total_experts / EP`. EP=1 → 256 experts
+on every device → 7 GB. EP=4 (v304) → 64 experts → 1.79 GB. **TP/FSDP/DP
+don't help — only EP reduces the AG transient.**
+
+**Knobs that *don't* fix this** (all verified by reading train.py CLI
+flags):
+- `--moe_no_weight_ag`: gated on `EP>1+TP>1`.
+- `--moe_shard_e_with_fsdp` / `--moe_shard_d_with_fsdp`: shard a
+  different axis; total AG bytes unchanged.
+- `--moe_n_chunks > 2`: Bug 3 (n_chunks=4 NaNs in bwd).
+
+**Implication**: EP=4 in the v304 baseline is HBM-forced, NOT a free
+design choice. autoperf workloads on v7x_4x8x8 at gbs=4096 must keep
+ep ≥ 4. Lowering gbs to 2048 would change the workload definition
+(half the activation memory but also half the compute per step;
+different optimizer-state-relative-to-compute regime).
+
+**The historical v262/v263/v272 (fsdp=256+tp=2) profiles in gs://**
+that "worked" all ran at gbs=2048 (PDBS=8 — half the activation
+memory). v321 likely the same. Apples-to-oranges vs gbs=4096; their
+xplanes don't apply at v304's batch size.
 
 ### `fsdp=512 + SC-offload flags` → libtpu CHECK fail (autoperf purefsdp iter-0, 2026-05-06)
 - Pure-FSDP attempt: `dp=1 fsdp=512 ep=1 tp=1` on v7x_4x8x8, full + ga=1
