@@ -41,7 +41,7 @@ jax-gpt/
                    # fused_moe_bwd/ (SparseCore backward kernel suite)
       dsv4/        # config.py, mla.py, hybrid_attention.py, indexer.py,
                    # moe.py, mhc.py, paged_cache.py, pallas_indexer.py
-                   # (skeleton + indexer kernel; see CLAUDE.md)
+                   # (skeleton + indexer kernel)
       gpt2/        # reference impl + lm-eval-harness adapter
     trainer/       # TrainConfig, TrainState, optimizer, sharding, metrics
     data/          # grain pipeline + offline tokenization
@@ -139,11 +139,10 @@ slightly different shapes / dtypes / tiling.
 | `fused_moe_bwd/` (multi-version) | `dsv3/kernels/fused_moe_bwd/` | SparseCore backward suite (`backward_kernel_v3`, `_v4`, plus benches/tests) |
 | `pallas_indexer` (CSA top-k score) | `dsv4/` | DSv4 indexer prototype |
 
-All Mosaic constraints documented in `CLAUDE.md` apply (no scatter on JAX
-arrays, no bool reshape, no VMEM trailing-1-dim, no `@jax.jit` inside
-`shard_map`, etc.). Run the AOT compile gate (`jax.experimental.topologies`)
-locally before any cluster job — see `dsv4/pallas_indexer.py:aot_compile_check`
-for the canonical pattern.
+Standard Mosaic constraints apply (no scatter on JAX arrays, no bool reshape,
+no VMEM trailing-1-dim, no `@jax.jit` inside `shard_map`, etc.). Run the AOT
+compile gate (`jax.experimental.topologies`) locally before any cluster job —
+see `dsv4/pallas_indexer.py:aot_compile_check` for the canonical pattern.
 
 ## Related repos
 
@@ -155,8 +154,8 @@ for the canonical pattern.
 
 ## Status
 
-- **Qwen3.5 inference**: 728 TPS/chip at BS=4096 on v7x (v101). Documented
-  optimization history in `CLAUDE.md`.
+- **Qwen3.5 inference**: 728 TPS/chip at BS=4096 on v7x (v101). Optimization
+  history in commit log.
 - **DSv4-Pro**: skeleton in `jax_gpt/models/dsv4/`. mHC residual formula
   transcribed from arxiv 2512.24880; per-layer `compress_ratios` schedule
   from V4-Pro `config.json`. Indexer Pallas score kernel landed
