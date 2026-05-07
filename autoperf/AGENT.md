@@ -423,6 +423,17 @@ clobber the user's branch and disturb their editable install. Worktrees make
 this impossible by construction (one branch can only be checked out in one
 worktree).
 
+**The `AGENT.md` at the root of each sibling repo is the *reviewer agent's*
+role doc, NOT yours.** When you `cd ~/autoperf/repos/perfsim/` (or the
+worktree for any sibling repo), the working tree contains an `AGENT.md` —
+this is the reviewer-role spec checked into that repo. **Do not read it as
+your own role.** Your role is defined in THIS file (`jax-gpt/autoperf/AGENT.md`).
+Each sibling repo's AGENT.md has an audience preamble that explicitly says
+"if you're autoperf in a worktree, ignore this and use jax-gpt/autoperf/AGENT.md"
+— but you should know this independently. Repo-specific norms you actually
+need (build commands, file paths, style) live in `docs/`, `README.md`, and
+`pyproject.toml` of each repo. Read those, not the worktree's AGENT.md.
+
 **Never merge `autoperf-loop` PRs.** Reviewer agents (or humans) gate merges.
 
 ---
