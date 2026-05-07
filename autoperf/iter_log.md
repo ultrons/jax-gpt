@@ -359,6 +359,60 @@ scheduler-induced overlap inefficiency, neighbor-activation HBM contention.
 The lever is in jax-gpt model code or scheduling hints, NOT in perfsim
 curve adjustments.
 
+---
+
+## iter 4 — Tooling: bisection of moe_experts/moe_gmm_ag on iter-2b xplane
+
+- **Class**: Tooling (no jax-gpt code change, no cluster run).
+- **Why this iter**: per advisor pre-pick, the "2.5× ceiling-vs-measured"
+  framing was apples-to-oranges — the iter-3 microbench measured
+  `jax.lax.ragged_dot` (Mosaic GMM, the *pre-iter-2* kernel) forward only;
+  the iter-2b xplane is the **post-iter-2** kernel (gmm_v2 Pallas) with
+  forward + bwd path included. Without bisection, no defined lever.
+- **Method**: `xla_shell list_sources --json --top 200` on the iter-2b
+  xplane, classified all `moe_experts/moe_gmm_ag` sub-sources into
+  forward (kernel/scatter/dispatch/AG) vs remat (transpose/jvp).
+- **Output**: `research/dsv3/iter4_moe_gmm_ag_bisection.md` (full
+  decomposition + iter-5 lever candidates).
+- **Headline numbers** (iter-2b, 34.65 sec step):
+  - moe_experts/moe_gmm_ag total: **16,656 ms/step (48.1% of step)**
+  - Forward (5,436 ms): kernel 1,845 + scatter 1,685 + dispatch AG 998
+    + FSDP weight AG 389 + other 519
+  - Backward via remat (11,219 ms): bwd-transpose 7,913 + jvp 3,306
+- **Key finding 1**: gmm_v2 forward kernel is **at-ceiling** (back-of-
+  envelope: 663 µs/call, microbench 0.61–0.62 efficiency at production
+  shape ≈ same band). Tile-tuning gmm_v2 forward is unlikely to land
+  >5–10% on the kernel call.
+- **Key finding 2**: backward path dominates expert time (67% of MoE
+  time). With remat=full, fwd is recomputed in bwd, then actual bwd
+  compute runs; total ≈ 2× fwd + bwd-only. Most leverage sits here.
+- **Key finding 3**: gmm_v2 bwd uses `megablox.gmm` + `megablox.tgmm`
+  (Pallas) with tokamax-tuned tile sizes (`_gmm_tiles` /
+  `_tgmm_tiles` in `kernels/gmm_v2_train.py`). Tokamax data covers 4
+  specific (M,K,N) shapes; unmatched shapes use a generic fallback.
+  HLO inspection of bwd needed to know if any call hits the fallback.
+- **Two perfsim issues filed (housekeeping)**:
+  - ultrons/perfsim#25 — P1: Norms predicted collapsed to ~0.1ms post-PR#22.
+    Until fixed, Norms is NOT-trusted in v7x_KNOWLEDGE.md trust table.
+  - ultrons/perfsim#26 — P2: `LEAF_PATTERNS_TRAINING` Expert_gmm rule
+    doesn't match gmm_v2/tpu_custom_call fusion names. Workaround:
+    compare against v304 (pre-gmm_v2) xplane for clean Expert_gmm
+    bucketing.
+- **Decision for iter-5**: Greedy on candidate A (EP scatter fusion,
+  ~1,685 ms fwd headroom + bwd savings) or C (backward tile-tuning via
+  `_gmm_tiles` / `_tgmm_tiles` audit). Both jax-gpt-side. Both require
+  AOT compile gate before cluster submit per `~/.claude/CLAUDE.md`
+  Pallas kernel rules. Candidate B (`moe_xlayer_prefetch`) blocked by
+  iter-1's unresolved compile bug. Candidate D (remat scope reduction)
+  needs HBM headroom analysis.
+- **Corrected framing of iter-3 finding**: the "2.5× in-training overhead"
+  was a statistic comparing apples-to-oranges (forward kernel ceiling vs
+  forward+bwd in-training). Replaced in v7x_KNOWLEDGE.md §5 with the
+  iter-4 per-band breakdown.
+- **No PR opened on sibling repos**: bisection is documentation; lives
+  under jax-gpt's `research/dsv3/`. Two perfsim issues filed (#25, #26)
+  as autoperf-blocking trust-table follow-ups.
+
 **Operational gotcha discovered for future calibration runs**: image
 `Dockerfile.tpu` doesn't install `gsutil`/`gcloud storage`, so the wrapper
 script's GCS upload was a no-op. Recovery via `kubectl logs` worked because

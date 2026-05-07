@@ -179,7 +179,7 @@ TRUSTED.** The trust state below reflects the post-#22 ratios.
 | `EP_AG_dispatch` | TRUSTED | 0.94 | **0.99** | Tightened. |
 | `FSDP_AG` | TRUSTED | — | — | Comm leaf; iter-2 saw 264→389 ms schedule-position shift (perfsim#16 ADR-002 design pass; impl deferred). |
 | `Router` | TRUSTED with caveat | 8.88 | tbd | Re-verify on next iter-3 headroom report. |
-| `Norms` | TRUSTED | 1.28 | tbd | Small absolute headroom. |
+| `Norms` | **NOT TRUSTED** (post-PR#22 regression; perfsim#25 filed 2026-05-07) | 1.28 | 1994× | predicted collapsed to 0.1 ms (was 207 ms iter-2). Top-3 inclusion is an artifact; do NOT pick as iter target until #25 closes. |
 | `Embed_lookup` | TRUSTED | — | — | predicted=0 (out of scope), measured small. |
 | `LMHead` | TRUSTED with caveat | 0.25 | tbd | Re-verify on next iter-3 headroom report; not explicitly in PR#22's per-op leaf list. |
 
@@ -231,39 +231,58 @@ equally to gmm_ag in production. Don't double-count the d2d_size factor.
 | Expert gate/up   | (2048, 7168) | 64 | 0.036 | 0.138 | 0.494 | 0.577 | 0.623 |
 | Expert down      | (7168, 2048) | 64 | 0.036 | 0.130 | 0.459 | 0.556 | 0.611 |
 
-**iter-3 v304 headroom datum (Expert_gmm)** — the 2.5× ceiling-vs-measured
-gap that iter-4 should investigate:
+**iter-3 → iter-4: the "2.5× ceiling-vs-measured" framing has been
+RETRACTED** as apples-to-oranges. iter-4's bisection (Tooling iter,
+2026-05-07) of `moe_experts/moe_gmm_ag` on the iter-2b xplane via
+`xla_shell list_sources` showed:
+- The microbench (iter-3 PR#23) measured `jax.lax.ragged_dot` (Mosaic GMM,
+  the **pre-iter-2** kernel) FORWARD ONLY at 0.6226 efficiency.
+- The v304 xplane "0.244 in-training efficiency" derivation took total
+  `moe_gmm_ag` per-call wall time and divided by ragged_dot fwd FLOPs —
+  but that total time **includes dispatch, scatter, weight AG, AND the
+  backward path through remat**. The factor-of-~2 from forward to
+  backward (with remat=full) accounts for most of the gap.
+- iter-2b is on **gmm_v2 Pallas**, not ragged_dot. Neither side of the
+  iter-3 ratio is current for iter-2b state.
 
-| | per-core efficiency | per-core TFLOPS |
+**Real per-band breakdown of `moe_experts/moe_gmm_ag` on iter-2b** (full
+detail in `research/dsv3/iter4_moe_gmm_ag_bisection.md`):
+
+| band | ms/step | what |
 |---|---|---|
-| microbench (kernel-only ceiling) | 0.6226 | 718 |
-| v304 in-training (xplane-derived) | 0.244 | 281 |
-| ratio (overhead) | | **2.55×** |
+| total moe_gmm_ag | 16,656 | 48.1% of 34.65s step |
+| fwd: jit(gmm) (gmm_v2 kernel) | 1,845 | 33.9% of fwd; **at-ceiling** per microbench bucket |
+| fwd: scatter (EP psum_scatter) | 1,685 | 31% of fwd; iter-5 candidate A |
+| fwd: ep_token_gather (dispatch AG) | 998 | 18% of fwd |
+| fwd: weight_allgather (FSDP AG) | 389 | matches FSDP_AG leaf in headroom |
+| fwd: other (gather, shard_map, jvp) | 519 | mostly small |
+| **bwd**: transpose(moe...) | 7,913 | XLA autodiff bwd-transpose pass |
+| **bwd**: jvp() | 3,306 | cotangent prep + accumulation |
 
-This is **NOT** a `HardwareSpec.gemm_eff_curve_bf16` adjustment — it's the
-optimization signal autoperf is built to surface. Per AGENT.md §1, perfsim
-predicts the kernel-only ceiling; the in-training gap is the headroom
-autoperf investigates with jax-gpt-side levers.
+**gmm_v2 forward kernel is at-ceiling.** Per-call forward time ≈ 663 µs;
+microbench 0.61–0.62 efficiency at this shape; back-of-envelope agrees
+within sigma. **Tile-tuning gmm_v2 forward is unlikely to land >5–10% on
+the kernel call.**
 
-**Plausible iter-4 levers for the 2.5× Expert_gmm gap** (in roughly priority
-order; not yet validated against the post-curve-fit headroom report):
-1. **Router dispatch coordination overhead** — gmm_ag dispatches all-gathered
-   tokens to all 4 EP shards. Per-call dispatch path may have setup cost
-   not visible in standalone bench. Investigate the dispatch HLO ops in
-   the v304 xplane for unaccounted time near each ragged-dot.
-2. **Scheduler-induced overlap inefficiency** — ragged-dot calls happen
-   inside an MoE chunk loop with nearby norms/router/A2A. XLA may not
-   be overlapping the second core's available compute window with HBM
-   reads on the dispatch path.
-3. **Neighbor-activation HBM contention** — production training has live
-   activations (decoder state, KV cache, gradient checkpoint state)
-   competing for HBM bandwidth. Standalone bench has no co-resident memory
-   pressure.
+**Backward path is dominant** (67% of expert time). With remat=full,
+forward is recomputed in bwd, then actual bwd compute runs.
+`gmm_v2_train.py:33-61` has tokamax-tuned tile sizes (`_gmm_tiles` /
+`_tgmm_tiles`) for 4 specific (M,K,N) shapes; unmatched shapes use a
+generic fallback. **HLO inspection of bwd needed to know if any call
+hits the fallback.**
 
-**iter-2 lever revisited**: the gmm_v2 swap (+6.6% TPS) captured part of
-this gap by changing the kernel; the rest of the gap (after gmm_v2) is in
-the dispatch/scheduling/contention bucket above. iter-4 picks one of these
-levers after the curve fit lands.
+**iter-5 lever candidates**:
+- **A. EP scatter fusion** (1,685 ms fwd headroom + bwd savings) — replace
+  EP `psum_scatter` with fused combine, or move scatter into gmm_v2
+  kernel. Architectural; needs Pallas correctness + AOT compile gate.
+- **B. moe_xlayer_prefetch**: blocked by iter-1's unresolved compile bug
+  (don't propose).
+- **C. Backward tile audit**: profile bwd HLO to find `_gmm_tiles`
+  fallback hits at non-tokamax shapes; add tokamax entries or microbench
+  for tgmm.
+- **D. Remat scope reduction**: switch from `remat=full` to `remat=attn_only`
+  for MoE chunks. Saves ~5,400 ms/step in fwd recompute. **Requires HBM
+  headroom analysis** — model already runs near runtime-compile limit.
 
 **Cluster-discovery footnotes for next session**:
 1. Bench JSON marker-delimited stdout is the durable data channel —
