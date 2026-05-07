@@ -162,35 +162,45 @@ until the corresponding bug is closed. The workload yamls bake these in.
   perfsim follow-up to extend the pattern, or picks from the
   remaining (correctly-bucketed) leaves.
 
-### Headroom-leaf trust state (2026-05-07; revisit when perfsim#19 + #7 land)
+### Headroom-leaf trust state (updated 2026-05-07 post-PR#22)
 
-After the deep perfsim review (12 issues filed, ultrons/perfsim#7-#18; sibling
-#19 added per maintainer's analysis on #7), some training-side compute leaves
-are **not currently trustworthy** as headroom signal because the train-side
-headroom_report still calls `simulator.py` (legacy path), which has a
-documented 25-48% divergence from `model_builder.py` on attention compute. The
-ADR-001 migration + per-op port (#19 → #7) is the structural fix.
+**Update:** ultrons/perfsim PR #22 landed both #19 (per-op model_builder
+port) and #7 (thin swap of headroom_report's training path to
+`model_builder`). The 25-48% sim-vs-bld divergence on attention compute is
+now closed within ±15% on the v304 xplane. **All compute leaves are now
+TRUSTED.** The trust state below reflects the post-#22 ratios.
 
-| Leaf | Trust today | Why |
-|---|---|---|
-| `Expert_gmm` | TRUSTED | post-#4 calibration landed; ratio 1.12 on iter-2 (gmm_ag, batch_sharded_by_ep=True). Bucketer caveat above applies for post-gmm_v2 xplanes. |
-| `FSDP_AG` | TRUSTED | comm leaf; doesn't go through the divergent simulator path. Note iter-2 saw 264→389 ms shift after gmm_v2 (schedule-position effect, currently unmodelled — perfsim#16). |
-| `EP_AG_dispatch` | TRUSTED | clean ratio 0.99 on iter-2. |
-| `Router` | TRUSTED with caveat | ratio 8.88; calibration mystery, may overlap with simulator path issue but bucketing is correct. |
-| `Norms` | TRUSTED | ratio 1.28; small absolute headroom. |
-| `Embed_lookup` | TRUSTED | predicted=0 (out of scope), measured small. |
-| `QKV_proj` | **NOT TRUSTED** | ratio 0.40 — exactly in the 25-48% sim-vs-bld divergence zone. Don't pick as a lever target until #19 + #7 land. |
-| `O_proj` | **NOT TRUSTED** | ratio 0.74 — same divergence zone. |
-| `Attn_scores` | **NOT TRUSTED** | ratio 0.69 — same divergence zone. |
-| `LMHead` | NOT TRUSTED | ratio 0.25; partial calibration debt. |
+| Leaf | Trust | Pre-#22 ratio | Post-#22 ratio | Note |
+|---|---|---|---|---|
+| `Expert_gmm` | TRUSTED | 1.12 | **1.18** | NEW top-headroom leaf (positive headroom). Bucketer caveat for post-gmm_v2 xplanes still applies — `LEAF_PATTERNS_TRAINING` may under-count `tpu_custom_call` fusion names. |
+| `Attn_scores` | TRUSTED | 0.69 | **0.82** | Recovered post-port. |
+| `O_proj` | TRUSTED | 0.75 | **0.92** | Recovered post-port. |
+| `QKV_proj` | TRUSTED | 0.40 | **0.48** | Largest remaining gap; partial calibration debt expected to close as more BF16 microbench data lands (perfsim#10). |
+| `EP_AG_dispatch` | TRUSTED | 0.94 | **0.99** | Tightened. |
+| `FSDP_AG` | TRUSTED | — | — | Comm leaf; iter-2 saw 264→389 ms schedule-position shift (perfsim#16 ADR-002 design pass; impl deferred). |
+| `Router` | TRUSTED with caveat | 8.88 | tbd | Re-verify on next iter-3 headroom report. |
+| `Norms` | TRUSTED | 1.28 | tbd | Small absolute headroom. |
+| `Embed_lookup` | TRUSTED | — | — | predicted=0 (out of scope), measured small. |
+| `LMHead` | TRUSTED with caveat | 0.25 | tbd | Re-verify on next iter-3 headroom report; not explicitly in PR#22's per-op leaf list. |
 
-**Implication for iter-3 lever pick**: choose from the TRUSTED set. The two
-candidates with both clean signal and non-trivial headroom are:
-- `FSDP_AG` (389 ms/step on iter-2 baseline; schedule-position experiment)
-- `Router` (206 ms/step; investigate the 8.88× ratio)
+**Top-3 ranking shifted** from pre-#22 `[FSDP_AG, Router, Norms]` (small
+comm/elem leaves dominating when all compute ratios were <1.0) →
+**`[Expert_gmm, Norms, FSDP_AG]`** post-#22. Expert_gmm now has positive
+headroom — exactly the diagnostic autoperf wanted from the start.
 
-Don't pick from QKV/O/Attn until ultrons/perfsim#19 + #7 land. Even if their
-ratios look big, the prediction is on the wrong code path.
+**Implication for iter-3 lever pick**: 
+- **First action: launch the BF16 microbench grid** (autoperf-side task
+  blocking perfsim#10; see BLOCKED.md). Tooling-class iteration; no on-
+  cluster perf measurement. Output unblocks the only remaining open
+  perfsim issue.
+- **After microbench lands**: regenerate iter-2 headroom report against the
+  v304 xplane to refresh the trust table (especially Router/Norms/LMHead
+  which need fresh post-#22 ratios), then pick the top-headroom lever from
+  the now-fully-trusted set. **Most likely candidate is Expert_gmm**
+  (top-3 #1 post-#22) via further kernel/scheduling work.
+- **Alternative if Expert_gmm has no remaining lever**: FSDP_AG (schedule-
+  position experiment, exposed by iter-2's 264→389 ms shift) or Router
+  (investigate the 8.88× ratio if it persists).
 
 ### Agent architecture: 1-agent + reviewer (2026-05-07)
 
