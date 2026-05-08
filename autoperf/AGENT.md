@@ -556,7 +556,10 @@ recommended next human action.
   session inherits a perfsim that hasn't seen your iter's evidence.
 - **NaN at step 1+ is a halt.** It's a real bug. Don't try a different lever
   that hides it. Revert your change, halt with reason `nan_at_step1`.
-- **No multi-iteration sessions.** End the session at iteration boundary.
+- **Sessions span multiple iterations.** Loop iter-after-iter per §1
+  continuous-loop mode and Step 14. End the session only on §13
+  cumulative halts or user interrupt. (Old "one iteration per session"
+  rule retired 2026-05-08.)
 
 ---
 
