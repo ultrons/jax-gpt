@@ -551,6 +551,75 @@ resumed iter at production VMEM, cluster regression, revert).
   (`full` → `attn_only` for MoE chunks); could save ~5,400 ms/step in
   forward recompute. Needs HBM headroom analysis first; lower risk if
   HBM headroom is positive.
+
+---
+
+## iter 6 — Tooling: deeper bisection of /checkpoint/ ops on iter-2b xplane
+
+- **Class**: Tooling (no jax-gpt source change, no cluster run).
+- **Why this iter**: iter-6 candidate D as initially framed shrunk on
+  sizing — saving `hidden` only short-circuits the down-projection's
+  ~600 ms (gate/up are kernel-internal residuals inside fused_silu's
+  custom_vjp, not Python-exposed). iter-6 candidate A also revealed as
+  multi-iter architectural. Per advisor: "iter-2b is near a local
+  optimum; cheap single-iter levers are exhausted." Decided to do a
+  Tooling deeper-bisection of /checkpoint/ ops (vs Lateral
+  attention-only-checkpoint refactor) to surface the next non-obvious
+  lever before committing a cluster slot.
+- **Method**: `xla_shell list_fusions --json --top 200` on iter-2b
+  xplane, family-grouped by stripping trailing `.NN`, classified by
+  `tf_op_name` paths.
+- **Output**: `research/dsv3/iter6_checkpoint_bisection.md` (full
+  decomposition + iter-7 lever recommendation).
+- **Headline finding** — `attn_proj_out` is an unwired lever:
+  - Lines 560 + 636 in `model.py` ALREADY mark `out = ck(out,
+    "attn_proj_out")` with explicit comment "offload: 448 MB/layer,
+    skip Splash bwd recompute".
+  - The active checkpoint policy at `model.py:3052-3057` only
+    includes `moe_layer_input`, NOT `attn_proj_out`.
+  - The v315 author's comment at line 3047-3051 says BOTH have
+    favorable DUS:save ratio — "Only large activations
+    (moe_layer_input, attn_proj_out) have favorable DUS:save ratio"
+    — but only one was wired.
+  - Result: 4,216 ms/step of attention forward recompute is
+    happening unnecessarily under `/rematted_computation/mla_attention/`
+    (q_proj/k_proj/v_proj fusions 1,779 ms + splash_mha_fwd_residuals
+    1,644 ms + convert_reduce 545 ms + slice_negate 248 ms).
+- **/checkpoint/ category breakdown** (20,599 ms/step total):
+  | category | ms/step | leverage |
+  |---|---|---|
+  | True bwd (tgmm + gmm + splash_dkv) | 7,448 | None — at-ceiling per iter-5 |
+  | **Attention forward recompute** | **4,216** | **iter-7 lever — `attn_proj_out`** |
+  | MoE fwd recompute (gmm_v2 + dispatch AG) | ~3,000 | Limited — fused-silu internals |
+  | MoE bwd-only (scatter bwd + small) | ~3,300 | Architectural (candidate A) |
+  | Other (rope, fusions, small) | ~2,635 | Low individually |
+- **iter-7 recommended Greedy lever**: One-line change at
+  `model.py:3054`:
+  ```python
+  names_which_can_be_offloaded=("moe_layer_input", "attn_proj_out"),
+  ```
+  Sized at **~2,200 ms/step potential (~6% TPS)** — conservatively:
+  4,000 ms recompute saved minus ~1,800 ms DUS overhead. Marker
+  already exists; v315 author's comment endorses; no kernel rewrite.
+  Higher confidence than iter-5/iter-6 attempts because lever is
+  comment-author-validated and pre-marked.
+- **Pre-flight for iter-7** (to avoid iter-5's heuristic regression):
+  - Mirror production `LIBTPU_INIT_ARGS` in any AOT script
+    (per AGENT.md §3 step-4b post-iter-5).
+  - jax.make_jaxpr verify: post-change bwd jaxpr should have
+    `attn_proj_out` as `from_residual(...)` not as recomputed op.
+  - Standard cluster submit, compare against iter-2b baseline
+    (NOT iter-5 numbers).
+- **iter-8 Lateral lever (deferred per option #1 framing)**:
+  attention-only-checkpoint refactor. Bigger upside (~4 sec/step
+  if HBM fits), but lands cleaner on iter-7's baseline (after
+  recompute is already eliminated, the remaining levers are
+  bigger-design-space).
+- **iter-9+ multi-iter** (deferred): kernel rewrite for fused
+  scatter (candidate A), custom Pallas tgmm with `vmem_limit_bytes`,
+  sharding-plan reconsideration.
+- **No code change**: pure documentation iter. iter_log + research
+  doc + diary updated. No cluster cycles.
 - **Corrected framing of iter-3 finding**: the "2.5× in-training overhead"
   was a statistic comparing apples-to-oranges (forward kernel ceiling vs
   forward+bwd in-training). Replaced in v7x_KNOWLEDGE.md §5 with the
