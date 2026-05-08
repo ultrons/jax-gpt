@@ -620,6 +620,82 @@ resumed iter at production VMEM, cluster regression, revert).
   sharding-plan reconsideration.
 - **No code change**: pure documentation iter. iter_log + research
   doc + diary updated. No cluster cycles.
+
+---
+
+## iter 7 — Greedy: add attn_proj_out to offload list — HALTED `nan_at_step1`
+
+- **Class**: Greedy.
+- **Lever**: One-line change at `model.py:3054` adding `"attn_proj_out"`
+  to `names_which_can_be_offloaded` (iter-6 deliverable).
+- **Pre-flight (per AGENT.md §3 step-4b post-iter-5)**:
+  - Mirrored production `LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=65536`
+  - jax.make_jaxpr verification on a toy fn: dot_general count in grad-jaxpr
+    dropped 10 → 9 (Δ=-1) with the change vs without, confirming
+    attn_proj_out is correctly saved as residual instead of recomputed.
+  - Policy parsed cleanly. AOT-validated.
+- **Cluster result on dsv3train-i7** (cde-64df9c2 image):
+  - Step 1: 226.3 s (compile-included), TFLOP/s/chip 108.1, **loss=nan**
+    (lm=nan, aux=nan)
+  - Step 4: 34.12 s, TFLOP/s/chip 717, TPS/chip **1920.8** (vs iter-2b
+    1882, +2% TPS), MFU **31.1%**, **loss=nan**
+  - All steps NaN.
+- **Halt reason**: `nan_at_step1` (per CLAUDE.md "NaN at step 1+ is a
+  halt — revert your change. Don't try a different lever that hides it").
+- **Key insight on the misleading speedup**: the +2% TPS on the
+  measured step time is illusory. With NaN gradients propagating
+  through the network, computations are NaN-bit propagation (floats
+  with all bits set), which is ~uniformly fast — no actual numerical
+  work is happening. The "speedup" doesn't reflect a real lever; it
+  reflects degenerate computation. Confirmed by lm=nan + aux=nan from
+  step 1 onward — the fwd loss is nan-corrupted, meaning the offload+
+  restore cycle is mishandling some part of the attention residuals.
+- **Reverted**: commit `bbfe974` reverts `8245f5d`. Lever is
+  documented as known-broken in v7x_KNOWLEDGE.md §5.
+- **Hypothesis on why**: the v315 author's comment endorsed
+  attn_proj_out's DUS:save ratio but didn't actually wire it into the
+  policy. Likely they encountered this NaN behavior too and the
+  comment is "should be tried someday" not "is verified". Possible
+  causes:
+  1. Async offload race: `pinned_host` offload uses async DMA; if bwd
+     reads attn_proj_out before fwd's offload completes, it gets
+     uninitialized memory → NaN.
+  2. bf16 ↔ fp32 conversion on the offload roundtrip introduces drift
+     that combines with attention's softmax to produce NaN.
+  3. Sharded layout mismatch when offloaded value is restored — the
+     activation (B_l, S, D) bf16 has multi-axis sharding that may not
+     round-trip through `pinned_host` cleanly.
+  None of these are easily debugable from autoperf's vantage; this
+  becomes a jax-gpt-side issue (offload-policy correctness) rather
+  than an autoperf optimization lever.
+- **Cluster cost**: ~5 min admission + ~4 min compile + ~3 min steady
+  + Kueue preemption recovery (no sign of it on this run, but always
+  possible). Total ~15 min. Cleanly recoverable.
+- **Lessons**:
+  1. **`checkpoint_name` markers in code aren't always tested-good
+     levers.** The author may have marked something as a candidate but
+     never actually validated it. iter-6's "comment-author-endorsed"
+     framing was over-confident: the comment was a hint, not a verified
+     lever. Future iters should treat existing markers as "candidate,
+     needs cluster verification" not "ready to wire."
+  2. **NaN is a structural failure mode, not a numerical drift.** When
+     the lever introduces NaN, perf metrics on that run are degenerate
+     (NaN propagation is fast). Don't trust the +2% TPS number; it's
+     not a real result.
+  3. **The jaxpr-level AOT verification didn't catch this.** The
+     change passed AOT compile, parsed the policy correctly, and the
+     grad-jaxpr showed correct dot_general count reduction. NaN is
+     runtime-only, surfaces only on cluster. Some failure modes
+     genuinely require a cluster cycle to surface — the AOT gate
+     reduces but doesn't eliminate cluster-validation cost.
+- **Decision for iter-8**: pivot to the deferred Lateral lever from
+  iter-6 framing — **attention-only-checkpoint refactor** (option #1).
+  Bigger upside (~4 sec/step if HBM fits), and doesn't require trusting
+  unverified `checkpoint_name` markers. Will land cleanly on iter-2b
+  baseline (iter-7 reverted, no semantic change).
+- **Alternative for iter-8**: revisit non-MoE/non-attention levers.
+  iter-6 bisection's "Other (~2,635 ms)" bucket might have small wins
+  worth surfacing.
 - **Corrected framing of iter-3 finding**: the "2.5× in-training overhead"
   was a statistic comparing apples-to-oranges (forward kernel ceiling vs
   forward+bwd in-training). Replaced in v7x_KNOWLEDGE.md §5 with the

@@ -412,6 +412,42 @@ worktree pattern.
 - `n_chunks=4` triggers Bug 3 (bwd NaN). Don't propose without resolving the bug.
 - `n_chunks=8` untested as of 2026-05-05.
 
+### `attn_proj_out` offload broken at production scale (autoperf iter7, 2026-05-08)
+
+- Adding `"attn_proj_out"` to `_ckpt_policy.names_which_can_be_offloaded`
+  at `model.py:3054` produces **NaN at step 1** on the production
+  baseline (`full + ga=1 + n_chunks=2 + gbs=4096` on `fsdp=128 ep=4
+  tp=1` v7x_4x8x8). Reverted on iter-7 (commit `8245f5d` → revert
+  `bbfe974`). dsv3train-i7 step-4 reported TPS/chip 1920 (+2% vs
+  iter-2b's 1882) but **all steps had loss=nan; the speedup is illusory
+  (NaN-bit propagation is fast, no real computation)**.
+- The marker `out = ck(out, "attn_proj_out")` at `model.py:560` (CP path)
+  and `:636` (non-CP path) is in the code but the v315 author's policy
+  at `model.py:3052-3057` only includes `moe_layer_input`. The
+  comment at line 3047-3051 reads "Only large activations
+  (moe_layer_input, attn_proj_out) have favorable DUS:save ratio" —
+  this is now confirmed to be a **hint not a verified lever**. The
+  author likely encountered this NaN behavior too and the comment
+  documents the candidate without endorsing the wired-in version.
+- AOT compile gate + jaxpr verification (`dot_general` count drops
+  10→9 with the change; `attn_proj_out` appears as `from_residual` in
+  bwd jaxpr) PASSED. The NaN is runtime-only. Hypotheses:
+  1. Async `pinned_host` offload race (bwd reads stale buffer).
+  2. bf16↔fp32 conversion drift on offload roundtrip combining with
+     attention's softmax to produce NaN.
+  3. Sharded-layout mismatch when offloaded activation is restored.
+- **Don't propose `attn_proj_out` offload until the underlying NaN
+  bug is fixed.** It's the iter-6-bisection-identified lever for
+  4,216 ms/step of attention-recompute headroom; until the offload
+  correctness is fixed, that headroom is unaddressable from the
+  autoperf side. Same class of "marker-exists-policy-doesn't" might
+  also apply to `q_a` (`model.py:568`), `kv_a`, `shared_hidden`
+  (`model.py:2676`); they were tested + rejected by v315 for small
+  DUS:save ratio, but the NaN failure mode might also apply.
+- Filed as autoperf iter-7 result in `autoperf/iter_log.md`.
+  Pre-existing `moe_layer_input` offload remains the only verified
+  positive-ROI offload at iter-2b state.
+
 ### `--moe_xlayer_prefetch` broken at production scale (autoperf iter1, 2026-05-06)
 - `cfg.moe_xlayer_prefetch=True` (cross-layer FSDP weight AG prefetch via
   3-tuple scan carry, `model.py:3061-3094`) fails to compile at
