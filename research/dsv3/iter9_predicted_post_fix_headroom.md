@@ -118,18 +118,42 @@ compile-time" until empirically validated.
 
 ### Final answer: how far from best possible
 
-iter-2b at 1882 TPS/chip is **within ~8% of the perfsim-predicted
-ceiling** for this hardware/model/toolchain combination. The cheap
-single-iter Greedy/Lateral headroom is genuinely close to gone. Remaining
-gains require either (a) upstream offload-pipeline fix (jax-gpt#2/#3),
-(b) HBM-aware sharding redesign with empirical compile-time validation,
-or (c) multi-iter design-space projects (custom Pallas tgmm,
-attention-only-checkpoint refactor).
+**The original "+8% within ceiling" claim is RETRACTED**. It was bounded
+by my hand-picked 12-plan sweep (which only varied tp/ep/fsdp at fixed
+cp=1, dp=1, ep_cp_shared=False). After fixing perfsim search (PR ultrons/perfsim#46
+addresses the cell_size budget bug from perfsim#44), the full search of
+758 combos / 141 simulated reveals plans I never tried.
 
-The cumulative `regression_chain` halt was a correct signal that the
-local optimum is reached. Future autoperf sessions on this baseline
-should **wait for upstream** rather than chase additional single-iter
-gambles.
+**Perfsim's actual top-K (post-#46 fix)**:
+
+| rank | plan | step ms | predicted TPS/chip | Δ vs production | HBM (perfsim) |
+|---|---|---|---|---|---|
+| 1 | `tp=2 ep=8 cp=8 fsdp=4 dp=8 ep_cp_shared=True` | 5,762 | 11,277 | **+83.3%** | 80 GiB |
+| 2 | `tp=2 ep=8 cp=8 fsdp=8 dp=4 ep_cp_shared=True` | 5,762 | 11,277 | +83.3% | 44 GiB |
+| 3 | `tp=2 ep=8 cp=8 fsdp=32 dp=1 ep_cp_shared=True` | 5,762 | 11,277 | +83.3% | 17 GiB |
+| 4 | `tp=2 ep=4 cp=4 fsdp=8 dp=8 ep_cp_shared=True` | 10,143 | 6,406 | +70.6% | 78 GiB |
+| 5 | `tp=2 ep=4 cp=4 fsdp=64 dp=1 ep_cp_shared=True` | 10,143 | 6,406 | +70.6% | 22 GiB |
+| ... | (other configs all worse than production) | | | | |
+
+**Three structural levers I missed in my hand-picked sweep**:
+1. `ep_cp_shared=True` — EP and CP physically share the same axis
+2. `cp > 1` — context parallel splitting the seq_len=4096 axis
+3. `dp > 1 fsdp < 128` — data-parallel replicas with smaller FSDP per replica
+
+All top results use all three. Production (`tp=1 ep=4 cp=1 fsdp=128 dp=1`) doesn't appear in top-30 — either filtered by HBM or out-ranked.
+
+**Honest revised answer**:
+- **My empirical 12-plan sweep ceiling**: ~+8% TPS (was the iter-9 first answer)
+- **Perfsim search ceiling (untested at cluster)**: up to **+83% TPS** (6× speedup) IF perfsim's predictions hold
+- **What's actually achievable depends on three things perfsim may model incorrectly**:
+  - DP gradient all-reduce overhead (perfsim's accounting unverified for dp>1 at this scale)
+  - ep_cp_shared semantics for our specific MoE+attention pattern
+  - HBM compile-time peak (perfsim under-counts by ~80 GB on production sharding; the 80 GiB top-config could OOM)
+- **Real cluster ceiling** sits somewhere between +5% (if perfsim's optimistic) and +83% (if predictions hold). I don't know yet.
+
+To narrow this: pick one of the top-3 (e.g., `tp=2 ep=8 cp=8 fsdp=32 dp=1 ep_cp_shared=True` at 17 GiB perfsim-HBM — most conservative option) and submit a cluster validation run. ONE cluster slot to settle the question, not three reverts.
+
+**Lesson for the thesis**: the cumulative `regression_chain` halt was correct that **single-iter Greedy/Lateral on iter-2b's *specific sharding plan* is exhausted** — but the search shows the right multi-iter project is **a different sharding plan entirely**, not a kernel/checkpoint tweak on the same plan. iter-2b may not be a local optimum at all in the parallelism-plan space; it may be a substantially-suboptimal point we landed on for historical reasons (the v304-postrefactor baseline). Worth investigating.
 
 ## Recommendation for the maintainer agent reviewing jax-gpt#2 + #3
 

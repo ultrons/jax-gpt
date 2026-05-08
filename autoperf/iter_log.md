@@ -791,6 +791,59 @@ inline-fix work per AGENT.md §5. PR#45 batches:
 Both PR'd against `ultrons/perfsim:main` from `autoperf-loop`; humans
 gate merges per AGENT.md.
 
+## iter-9 RETRACTED + UPDATED — perfsim search now works (PR#46)
+
+The original iter-9 "+8% TPS ceiling" claim was bounded by my hand-
+picked 12-plan sweep (only varied tp/ep/fsdp at fixed cp=1, dp=1,
+ep_cp_shared=False). The user correctly pointed out: "until perfsim
+search works, we can't conclude what the ceiling is".
+
+Diagnosed perfsim#44 (search yielded 0 results): root cause at
+`search.py:147` used `hw.cell_size × d2d_size = 140,000` (DCN multi-pod
+boundary) instead of `slice_size × d2d_size = 512` (single-slice).
+Filed PR ultrons/perfsim#46 with the fix (n_chips parameter, default
+slice_size, opt-in multi-pod via parameter or `--n-chips` flag). All
+514 perfsim tests pass with the fix (after updating 2 multi-pod-scale
+regression tests to opt in).
+
+**With search working**: top configs predict up to **+83% TPS (6×
+speedup)** via `tp=2 ep=8 cp=8 fsdp=32 dp=1 ep_cp_shared=True`. Three
+structural levers production never used:
+1. `ep_cp_shared=True` — EP and CP physically share the same axis
+2. `cp > 1` — context parallel along seq_len=4096
+3. Different (tp, ep, fsdp) shape entirely — TP=2 D2D-on-chip is favored
+
+Production sharding (`tp=1 ep=4 cp=1 fsdp=128 dp=1`) doesn't appear in
+top-30 — filtered by HBM or out-ranked.
+
+**Caveats** (perfsim's predictions are unverified):
+- DP gradient all-reduce: perfsim may not correctly cost dp>1 at this
+  scale.
+- ep_cp_shared: semantics for the specific MoE+attention pattern need
+  cluster validation.
+- HBM under-count: perfsim says 17-80 GiB; production reality is 96 GiB
+  (perfsim doesn't model XLA program binary or HLO temps).
+
+**Real cluster ceiling** sits between +5% (perfsim optimistic) and +83%
+(predictions hold). Range is too wide to act on without cluster data.
+
+## Thesis update (post-iter-9-revision)
+
+iter-2b may NOT be a local optimum in the parallelism-plan space; it
+may be a substantially-suboptimal point landed on for historical reasons
+(the v304-postrefactor baseline). The cumulative `regression_chain` halt
+was correct that single-iter levers on the same sharding plan are
+exhausted, but a sharding-plan change entirely is a different multi-iter
+project that perfsim search (now working) can guide.
+
+**Recommended next session** (post-PR#46 merge):
+- Re-run perfsim search to refresh top-K
+- Pick the highest-ranked plan that fits production HBM headroom
+  (i.e., perfsim-HBM ≤ ~70 GiB to leave room for unmodeled binary/temps)
+- Submit ONE cluster validation run
+- If predictions hold within 20%, the new sharding plan is a real
+  multi-iter win
+
 ## Session-cumulative status (iter-9 closeout)
 
 iter-9 closes the post-halt extension. Sequence of work this session:
