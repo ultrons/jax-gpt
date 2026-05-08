@@ -3080,12 +3080,8 @@ def forward(params, tokens, cfg: ModelConfig, return_final_x: bool = False):
                 fn = functools.partial(
                     _moe_layer_body_pre_ag, positions=positions, cfg=cfg)
                 if cfg.gradient_checkpoint:
-                    # autoperf iter-8: prevent_cse=False → True. JAX default is
-                    # True; production opted False. iter-8 tests whether allowing
-                    # XLA to deduplicate fwd/recompute was masking offload's
-                    # effectiveness. Lateral schedule-position experiment.
                     x_new, a = jax.checkpoint(
-                        fn, policy=_ckpt_policy, prevent_cse=True)(
+                        fn, policy=_ckpt_policy, prevent_cse=False)(
                             x, cur_lp, ws_ag)
                 else:
                     x_new, a = fn(x, cur_lp, ws_ag)
@@ -3101,12 +3097,8 @@ def forward(params, tokens, cfg: ModelConfig, return_final_x: bool = False):
                 x, aux = carry
                 fn = functools.partial(_moe_layer_body, positions=positions, cfg=cfg)
                 if cfg.gradient_checkpoint:
-                    # autoperf iter-8: prevent_cse=False → True (production path).
-                    # See first instance comment for rationale. This is the
-                    # active scan-fn for the v304 baseline (moe_xlayer_prefetch=
-                    # False), so this is the line that affects iter-8 measurement.
                     x_new, a = jax.checkpoint(
-                        fn, policy=_ckpt_policy, prevent_cse=True)(x, lp)
+                        fn, policy=_ckpt_policy, prevent_cse=False)(x, lp)
                 else:
                     x_new, a = fn(x, lp)
                 return (x_new, aux + a), None
