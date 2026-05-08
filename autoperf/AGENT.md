@@ -34,18 +34,29 @@ features, anything that needs cross-repo discussion — file an issue instead
   prediction's reasoning before acting (§5b).** When measured ≫ predicted,
   the gap is in the serving stack — that's where to optimize. When predicted
   ≫ measured, the gap might be perfsim modeling the wrong shapes/collective.
-- **Halt when uncertain.** Lost cluster cycles cost real money; humans are
-  cheap to interrupt.
+- **Don't halt when uncertain — choose, act, document, continue.** The
+  autoperf agent runs in continuous overnight-loop mode by default
+  (Step 14 update, 2026-05-08). Make decisions, log them, move on. The
+  hard halts in §13 still apply (real failure modes), but session-
+  boundary halts at iter completion do NOT. No waiting for approval;
+  iter the loop until §13 fires or all leaves run out of headroom.
 - **Append knowledge to `v7x_KNOWLEDGE.md`** whenever you learn something the
   next session would benefit from: a new pitfall, a stack-pin update, a
   workload that works at higher PDBS than expected, a perfsim preset that
   proved reliable. Do not delete; only append or mark stale with a date.
   This is your `cde history` for v7x knowledge.
-- **One iteration per session.** When the iteration completes (succeeded,
-  halted, or paused for review), commit all state to disk (BLOCKED.md,
-  iter_log.md, branches pushed) and let the human start the next session
-  fresh. Multi-iteration sessions accumulate context that dilutes attention
-  on the load-bearing thread.
+- **Continuous-loop mode (default, 2026-05-08 update).** The agent runs
+  iter-after-iter without halting at iter boundaries. After a successful
+  iter's closeout (BLOCKED.md/iter_log.md/diary committed, cde annotate
+  posted, branches pushed), loop back to Step 1 of the next iter
+  immediately. After a §13 halt-with-revert (broke_training,
+  nan_at_step1, regression_chain, etc.), commit + push the revert
+  + halt documentation, then ALSO loop back — pick a different lever
+  per the §13 halt-handling rules. The session ends only when:
+  - §13 cumulative halts fire (e.g., 3 consecutive regressions across
+    iters, all-leaves-at-floor, cluster_unhealthy)
+  - the user explicitly intervenes
+  Old "one iteration per session" rule is **retired**.
 
 References (READ BEFORE STARTING, in this order):
 1. `autoperf/v7x_KNOWLEDGE.md` — **operational TPU/JAX knowledge ledger.**
@@ -288,7 +299,15 @@ If ANY of:
 - all leaves > 5% step-share have headroom < 0.5 ms → HALT with reason
   `workload_at_ceiling`
 - the change broke training (NaN, OOM, or no progress on metric we care
-  about) → HALT with reason `broke_training` and revert via `git revert HEAD`
+  about) → HALT with reason `broke_training` and revert via `git revert HEAD`.
+  **Always file a `ultrons/jax-gpt` issue with full repro details**
+  (the change diff, image tag, full cde-run command, cluster outcome,
+  AOT pre-flight result, hypotheses on root cause, related markers
+  that might share the failure mode, workaround). Use the iter-7
+  precedent (jax-gpt#2) as a template. The bug is real and fixable
+  later; the issue is the durable channel for the maintainer-agent or
+  human to pick it up. **Do this for ALL NaN/OOM/no-progress halts
+  going forward**, not just notable ones.
 - the cluster is in chaos (3 evictions in a row) → HALT with reason
   `cluster_unhealthy`
 - perfsim's reasoning didn't make sense and `--explain` didn't resolve it
@@ -318,10 +337,20 @@ avoid 12-hour discovery delays:
 
 ### Step 14 — end of iteration
 
-Commit all state to disk. Push branches. End the session. Next iteration
-starts a fresh session.
+Commit all state to disk. Push branches. **Then loop back to Step 1
+of the next iteration in the same session** (continuous-loop mode,
+2026-05-08 update). Do NOT end the session at iter boundary.
 
-When you HALT, write `autoperf/HALT.md` with: workload, last iter, reason,
+The session ends only on:
+- §13 cumulative halt conditions (3 consecutive regressions, all
+  leaves at floor, workload at ceiling, cluster_unhealthy)
+- user interrupts
+- you've exhausted the queue of viable levers (top-3 trusted leaves
+  all have HR < 0.5 ms or no actionable lever from the heuristic table)
+
+When you HALT (cumulative, not per-iter), write `autoperf/HALT.md`
+with: workload, last iter, halt reason, list of all jax-gpt issues
+filed during the session (per Step 13 NaN-issue-filing rule),
 recommended next human action.
 
 ---
