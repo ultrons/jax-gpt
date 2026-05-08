@@ -56,27 +56,20 @@ def _tgmm_tiles(K: int, M: int, N: int) -> tuple[int, int, int]:
     For tgmm: lhs[K, M], rhs[M, N]; M is the contraction axis.
     Big tile_m → fewer iterations.
 
-    Heuristic-tuned for v7x BF16 production shapes (autoperf iter-5,
-    sized at 3,026 ms/step in iter-2b xplane via xla_shell list_fusions
-    on 6× tgmm.12-17 fusions). Production runs with
-    `LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=65536` (64 MB
-    scoped VMEM, see manifests/jobset.yaml.j2:112), giving headroom
-    over megablox.tgmm's default 32 MB cap.
+    autoperf iter-5 (2026-05-08) attempted tile_m=4096 for the two
+    production shapes (gate/up K=7168,N=2048 and down K=2048,N=7168) —
+    iter-count halved but tgmm wall time grew by +38% on the cluster
+    profile (3,026 → 4,175 ms/step), causing a -1.4% TPS regression on
+    dsv3train-i5. Reverted. Empirical evidence: tgmm at these production
+    shapes is **memory-bound**, not compute-bound — bigger tile_m grows
+    the input window without amortizing compute, which adds HBM
+    bandwidth pressure. iter-count-reduction lever does not apply.
 
-    AOT-validated at 64 MB scoped VMEM (tpu7x:2x2x1):
-      d_wi_0/d_wi_1 (gate/up bwd): tgmm(K=7168, M=131072, N=2048).
-        Baseline (2048,1024,1024): 64×7×2 = 896 tile iters.
-        New      (4096,1024,1024): 32×7×2 = 448 iters (2× reduction).
-      d_wo (down bwd): tgmm(K=2048, M=131072, N=7168).
-        Baseline (2048,1024,1024): 64×2×7 = 896 iters.
-        New      (4096,1024,1024): 32×2×7 = 448 iters (2× reduction).
-    Note: at the default 32 MB cap, these tiles would FAIL AOT — they
-    REQUIRE the production --xla_tpu_scoped_vmem_limit_kib=65536 flag.
+    Future iters targeting tgmm time savings need either a microbench
+    sweep (extending bench_runner with kind:'tgmm') to find tiles that
+    actually improve wall time, or upstream JAX changes (vmem_limit_bytes
+    on megablox.tgmm to enable larger tk×tn output tiles).
     """
-    if (K, M, N) == (7168, 131072, 2048):  # gate/up d_wi (bwd)
-        return (4096, 1024, 1024)
-    if (K, M, N) == (2048, 131072, 7168):  # down d_wo (bwd)
-        return (4096, 1024, 1024)
     return (min(M, 2048), min(K, 1024), min(N, 1024))
 
 

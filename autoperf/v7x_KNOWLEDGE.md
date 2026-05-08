@@ -293,30 +293,58 @@ hits the fallback.**
   for MoE chunks. Saves ~5,400 ms/step in fwd recompute. **Requires HBM
   headroom analysis** — model already runs near runtime-compile limit.
 
-### megablox.tgmm 32 MB scoped VMEM cap (added iter-5, 2026-05-07)
+### megablox.tgmm: production VMEM is 64 MB, not 32 MB (iter-5, 2026-05-08)
 
-Per AOT compile-gate survey on tpu7x:2x2x1 with `megablox_tgmm` direct
-call, the kernel's per-call scoped VMEM allocation is constrained to ~32
-MB and the function does NOT accept a `vmem_limit_bytes` parameter. The
-cap holds across all tile choices including `(4096, 1024, 1024)`,
-`(2048, 2048, 1024)`, and `(2048, 1024, 2048)` — all FAIL AOT at 40 MB.
-Only the generic `(2048, 1024, 1024)` (16 MB obvious + 16 MB Mosaic
-overhead = exactly 32 MB) compiles cleanly.
+**INITIAL CLAIM RETRACTED**: my earlier note in this section claimed
+"megablox.tgmm has hardcoded 32 MB scoped VMEM and no vmem_limit_bytes
+parameter". The 32 MB figure was the AOT default; production runs with
+64 MB via `LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=65536` (set
+in `manifests/jobset.yaml.j2:112`). Always check the LIBTPU_INIT_ARGS
+in the production manifest before concluding a tile change is
+library-blocked.
 
-**Implication**: any iter targeting tgmm time savings via tile changes
-is blocked. To unblock:
-1. Upstream JAX fix: extend `jax.experimental.pallas.ops.tpu.megablox.gmm.tgmm`
-   to accept `vmem_limit_bytes` (mirroring `gmm_v2`'s API). This is the
-   cleanest path; eligible for filing as JAX-side issue.
-2. Custom in-tree Pallas tgmm in `jax_gpt/models/dsv3/kernels/`. Higher
-   effort but doesn't depend on upstream cooperation.
+**Tgmm IS memory-bound at the v7x DSv3 production shapes**, confirmed
+empirically by iter-5:
+  - **iter-2b baseline** (tile `(2048, 1024, 1024)`): tgmm 48.4M us =
+    3,026 ms/step, step time 34.65 s, TPS/chip 1882.
+  - **iter-5 attempt** (tile `(4096, 1024, 1024)`, 2× iter reduction):
+    tgmm 66.8M us = **4,175 ms/step (+38%)**, step time 35.30 s,
+    TPS/chip 1856 (-1.4%).
+  - The iter-count win (896 → 448 tile iters) became a wall-time loss
+    because bigger tile_m grew the LHS input window per call without
+    amortizing compute — added HBM bandwidth pressure.
 
-Pre-existing tokamax-tuned `_gmm_tiles` (used in the d_lhs path) likely
-also runs over the AOT 32 MB cap but works in production runtime — see
-the AOT failure on `transpose_jvp_jit_gmm` with tile `(128, 7168, 1024)`
-in iter-5 first-attempt log. Production scoped-VMEM may be more
-permissive than AOT's; either way, both gmm and tgmm bwd are at-or-near
-their library ceilings.
+**Operating rule for v7x DSv3 tgmm**: at the production shapes
+`(K=7168, M=131072, N=2048)` and `(K=2048, M=131072, N=7168)`, the
+generic `_tgmm_tiles = (2048, 1024, 1024)` is empirically optimal.
+Don't tile-tune without microbench data — heuristic shots regress here.
+
+**Future leverage** (if tgmm time becomes a target again):
+1. Microbench tgmm via `bench_runner` (extend with `kind: "tgmm"`)
+   to find tiles that actually improve wall time at these shapes.
+2. Investigate if megablox.tgmm has compute-bound sweet spots at other
+   shapes; the v7x DSv3 path may be a uniquely-bad case.
+
+### v7x XLA flags worth knowing about
+
+`LIBTPU_INIT_ARGS` in `manifests/jobset.yaml.j2:110-115`:
+- `--xla_tpu_scoped_vmem_limit_kib=65536` — 64 MB scoped VMEM. Default
+  is 32 MB; production needs 64 MB for `gmm_v2` and other Pallas
+  kernels at production shapes. Documented use: `kernel_feedback_pallas_bwd.md`
+  mentions 80 MB at one point.
+- `--xla_tpu_bf16_emission_mode=NATIVE_EMISSION` — bf16 native emission.
+- `--xla_tpu_num_sparse_cores_for_gather_offloading=2` — SC offload knob.
+- `--xla_tpu_enable_sparse_core_collective_offload_all_gather=true`
+- `--xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true`
+
+**AOT compile gates should mirror these flags** to avoid false "lever
+blocked" verdicts. Pattern:
+```python
+import os
+os.environ["LIBTPU_INIT_ARGS"] = "--xla_tpu_scoped_vmem_limit_kib=65536"
+# ... rest of AOT script
+```
+Without this override, AOT verdict diverges from production runtime.
 
 **Cluster-discovery footnotes for next session**:
 1. Bench JSON marker-delimited stdout is the durable data channel —

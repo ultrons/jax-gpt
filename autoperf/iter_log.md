@@ -408,7 +408,18 @@ curve adjustments.
 
 ---
 
-## iter 5 — Greedy on Expert_gmm via candidate C (backward tile audit) — HALTED `lever_blocked_at_library`
+## iter 5 — Greedy on Expert_gmm via candidate C — REGRESSED, reverted
+
+**This entry was originally written as "HALTED lever_blocked_at_library"
+based on a 32 MB scoped-VMEM AOT survey. That halt was based on the
+WRONG VMEM budget — production runs at 64 MB via
+`LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=65536`
+(`manifests/jobset.yaml.j2:112`). At the production budget, the 2× iter
+reduction tiles compile cleanly. iter-5 was resumed, applied, and run
+on cluster. The cluster run REGRESSED, leading to revert.**
+
+Below: full revised entry tracking all stages (initial AOT halt,
+resumed iter at production VMEM, cluster regression, revert).
 
 - **Class**: Greedy.
 - **Goal**: tighten `_tgmm_tiles` for the 2 production shapes
@@ -472,6 +483,74 @@ curve adjustments.
   investigating; needs HBM headroom analysis first.
 - **No PR opened**: revert is in-tree; no perfsim issue files (megablox
   is upstream JAX, not perfsim — separate dependency).
+
+### iter-5 RESUMED at production VMEM (after user pointed out the flag)
+
+- **Critical correction**: `LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=65536`
+  in `manifests/jobset.yaml.j2:112` sets production VMEM to 64 MB, not
+  the default 32 MB. My initial AOT survey ran with 32 MB and reached
+  the wrong conclusion. Re-ran AOT survey with the production env
+  override.
+- **Re-survey at 64 MB**: all 2× iter-reduction tiles PASS AOT cleanly.
+  Picked uniform `(tile_m=4096, tile_k=1024, tile_n=1024)` for both
+  shapes (gate/up and down).
+- **Applied + committed** (`6199181` on `autoperf/dsv3_train_full`).
+- **cde build → image `cde-fc67b5e`** built and pushed.
+- **cde run dsv3train-i5** submitted and ran on `bodaborg-super-rbq`.
+  Got preempted partway by a higher-priority `poc-ml-perf` workload
+  (Kueue cohort reclamation), then re-admitted and finished. JobSet
+  status: `Finished=True (Succeeded)`.
+- **Cluster result — REGRESSION**:
+  | metric | iter-2b baseline | iter-5 | Δ |
+  |---|---|---|---|
+  | step time (steps 2-4 median) | 34.65 s | 35.30 s | **+0.65 s/step** |
+  | TPS/chip | 1882 | 1856 | **-1.4%** |
+  | MFU | 30.5% | 30.0% | -0.5pp |
+  | Expert_gmm measured (xplane) | 15,303 ms | **16,499 ms** | **+1,196 ms** |
+  | tgmm self_us total (16-pass) | 48.4 M | **66.8 M** | **+38%** |
+  Step 5 was contaminated by the preemption recovery (101.7s, cold
+  caches). Steps 2-4 are clean steady-state.
+- **Empirical conclusion**: tgmm at production shapes is **memory-bound,
+  NOT compute-bound**. Bigger tile_m grows the LHS input window per
+  call without amortizing any compute, increasing HBM bandwidth
+  pressure. Iter-count reduction is NOT a valid optimization lever for
+  this kernel at this shape.
+- **Reverted** (`gmm_v2_train.py:_tgmm_tiles` returns generic only;
+  docstring updated with the empirical finding so future iters don't
+  repeat). The revert lands as a separate commit (per AGENT.md
+  "Reverted commits stay in history — that's the feature").
+- **Lessons learned**:
+  1. **AOT compile-gate at default VMEM gives wrong "blocked" verdict.**
+     Always check `LIBTPU_INIT_ARGS` in the production manifest before
+     concluding a tile change is library-blocked. Documented in
+     v7x_KNOWLEDGE.md §6 cluster ops.
+  2. **Heuristic tile-tuning without microbench data IS unreliable.**
+     iter-count reduction looks like a win on paper, but only delivers
+     wall-time savings if the kernel is compute-bound. tgmm here is
+     memory-bound — the lever was negative. Advisor warned about this
+     pre-flight; the user's "you own jax-gpt, just go" preference moved
+     us past the warning. Lesson absorbed.
+  3. **Profile-driven validation matters.** The cluster regression
+     showed ~20× more in tgmm-time growth than expected from the tile
+     formula alone — tile metadata, prefetch buffers, and kernel-
+     internal overhead also scale poorly. Microbenching tgmm directly
+     would have caught this without burning a cluster slot.
+- **Cluster cost**: ~5 min admission + ~3.5 min compile + ~3 min steady
+  + Kueue preemption + ~3 min recovery + 5-step run + 600s sleep.
+  Total ~20 min. One regression on the diary; not a `regression_chain`
+  (need 3 consecutive per AGENT.md §13).
+- **Decision for iter-6**: pivot to **candidate A — EP scatter fusion**
+  (1,685 ms fwd headroom + matched bwd savings). Architectural change
+  to gmm_v2 or its downstream `psum_scatter` that's IN OUR CONTROL
+  (jax-gpt Pallas, not megablox), so VMEM-cap problem doesn't apply.
+  Higher risk than C would have been, but real upside if it lands.
+  **Pre-flight: microbench scatter alternatives via bench_runner before
+  committing to a kernel change** — the iter-5 lesson says "validate
+  with data, not heuristics."
+- **Alternative for iter-6**: **D — remat scope reduction**
+  (`full` → `attn_only` for MoE chunks); could save ~5,400 ms/step in
+  forward recompute. Needs HBM headroom analysis first; lower risk if
+  HBM headroom is positive.
 - **Corrected framing of iter-3 finding**: the "2.5× in-training overhead"
   was a statistic comparing apples-to-oranges (forward kernel ceiling vs
   forward+bwd in-training). Replaced in v7x_KNOWLEDGE.md §5 with the
