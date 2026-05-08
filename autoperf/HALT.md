@@ -66,3 +66,41 @@ For the immediate next session: probably best to **NOT** start a new Greedy/Late
 - All committed and pushed to `autoperf/dsv3_train_full` branch
 
 The session was fruitful for **knowledge** (we now know exactly where headroom lives and which levers are blocked) but barren for **measured perf gain on iter-2b**. iter-2b stands as the production baseline.
+
+---
+
+## Post-halt extension (2026-05-08, user-authorized continuation)
+
+After this HALT was committed, user explicitly authorized continuing iteration with broader permissions. The right move per advisor framing was a **Tooling deliverable** quantifying the post-fix headroom, not another single-iter Greedy gamble.
+
+### iter-9 (Tooling) — predicted post-fix headroom
+
+Quantified what fixing jax-gpt#2 + #3 would unlock by combining iter-6's recompute-component breakdown with `perfsim.simulator.run` cross-check at `remat_policy=full` vs `attn_only`.
+
+**Headline**: realistic upside from fixing the offload-restore pipeline is **+1.5 to +2.0 sec/step (~+4.5 to +6.0% TPS)** — comparable in magnitude to iter-2's gmm_v2 swap (+6.6%) but not transformative. iter-6's framing of ~+15% from "4,216 ms attention recompute" was over-optimistic; only ~20% of that bucket is recoverable due to overlap with MoE forward.
+
+Perfsim canonical:
+- `remat=full` predicts 34,525 ms/step (matches measured 34,650 within 0.4%)
+- `remat=attn_only` predicts 33,049 ms/step (Δ −1,476 ms = +4.5% TPS)
+
+Output: `research/dsv3/iter9_predicted_post_fix_headroom.md`
+
+### Inline perfsim fixes — PR ultrons/perfsim#45
+
+Two scoped fixes per AGENT.md §5 default-fix-inline:
+
+- **#38 fix** (`098c6b5`): Dockerfile.tpu installs `google-cloud-cli` via Cloud SDK apt repo + gnupg keyring. Unblocks pod-side GCS upload that's been silently no-op'ing since iter-3.
+- **#26 fix** (`d3ec087`): `LEAF_SHAPE_QUERY_TRAINING` schema gains tuple-of-substrings fallback for shape-query. New Expert_gmm entry `("ragged-dot", "gmm_v2-")` matches both pre/post-iter-2 xplanes. Tests pass; iter-2b xplane verified "no shape mismatches" post-fix.
+
+Both PR'd against `ultrons/perfsim:main` from `autoperf-loop`; awaiting reviewer-agent + human merge.
+
+## Updated next-iter recommendation (post-extension)
+
+The iter-9 sizing reframes the "fix #2 + #3" priority: it unlocks ~+5% TPS, real but bounded. Other potentially-bigger options (multi-iter scope) need explicit user authorization:
+
+1. **Wait for jax-gpt#2 + #3 maintainer fix** — unblocks ~+5% TPS once the offload-restore pipeline is fixed.
+2. **Multi-iter: attention-only-checkpoint refactor** — same predicted ceiling (+4.5% per perfsim) but doesn't depend on #2/#3 fix; needs HBM headroom analysis (model already at 96/101.7 GB).
+3. **Multi-iter: custom Pallas tgmm with `vmem_limit_bytes`** — re-opens iter-5 candidate-C with proper VMEM control. Requires upstream JAX changes OR custom in-tree kernel.
+4. **Wait for `perfsim#44` fix** — unblocks search-driven Lateral picks.
+
+For overnight progress without user check-in: the Tooling deliverable + perfsim PR is what was achievable. Further single-iter Greedy/Lateral on iter-2b would gamble against the now-quantified small ceiling and risk further reverts.

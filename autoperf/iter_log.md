@@ -741,6 +741,67 @@ resumed iter at production VMEM, cluster regression, revert).
   measure), so chain is unbroken.
 - **Session ends here** (cumulative halt, not per-iter). HALT.md
   filed with the autoperf-side state for next-human pickup.
+
+---
+
+## iter 9 — Tooling: predicted post-fix headroom analysis (post-halt extension)
+
+After the cumulative `regression_chain` halt was committed, user
+explicitly authorized continuing iteration with broader permissions
+(kubectl get/logs/apply, sudo docker:*). Per advisor framing, the right
+move was a **Tooling iter producing a quantification of what fixing
+jax-gpt#2 + #3 would unlock** — not another single-iter Greedy gamble.
+
+- **Class**: Tooling (no jax-gpt source change, no cluster run).
+- **Method**: combined heuristic estimate (75-90% recompute eliminated
+  vs. DUS overhead) with `perfsim.simulator.run` cross-check at
+  `remat_policy=full` vs `attn_only`.
+- **Output**: `research/dsv3/iter9_predicted_post_fix_headroom.md`
+- **Headline finding**: realistic upside from fixing jax-gpt#2 + #3
+  (which iter-7+8 hit) is **+1.5 to +2.0 sec/step (~+4.5 to +6.0% TPS)**,
+  NOT the +5-15% iter-6 framing implied. Iter-6's "4,216 ms attention
+  recompute" bucket is real spend but only ~20% recoverable due to
+  overlap with MoE forward.
+- **Perfsim canonical** (closer to pessimistic end of heuristic):
+  `remat=full` predicts 34,525 ms (matches measured 34,650 within 0.4%);
+  `remat=attn_only` predicts 33,049 ms (Δ −1,476 ms = +4.5% TPS).
+- **Implication**: the regression_chain halt was correctly signaling.
+  The `attn_proj_out`-class lever's real ceiling was ~+5% TPS, not
+  +6-18%. Comparable in magnitude to iter-2's gmm_v2 swap (+6.6%).
+  Worth fixing but not transformative.
+- **Multi-iter scopes still relevant** for >5% gains: attention-only-
+  checkpoint refactor (HALT.md option 2; needs HBM headroom),
+  custom Pallas tgmm with vmem_limit_bytes (option 3), sharding-plan
+  reconsideration (blocked on perfsim#44).
+
+## Inline perfsim fixes (filed as PR ultrons/perfsim#45)
+
+While iter-9 ran, the new permissions enabled opportunistic
+inline-fix work per AGENT.md §5. PR#45 batches:
+
+- **perfsim#38 fix** (commit `098c6b5`): Dockerfile.tpu installs
+  `google-cloud-cli` via Cloud SDK apt repo. Unblocks future
+  calibration-pod GCS uploads (vs the iter-3 manual-recovery path).
+- **perfsim#26 fix** (commit `d3ec087`): `LEAF_SHAPE_QUERY_TRAINING`
+  schema accepts a tuple of substrings; first-match-wins fallback.
+  New Expert_gmm entry is `("ragged-dot", "gmm_v2-")` — matches both
+  pre-iter-2 and post-iter-2b xplanes. Tests pass; manual verification
+  on iter-2b xplane confirms "no shape mismatches" (was "1 warning(s)").
+
+Both PR'd against `ultrons/perfsim:main` from `autoperf-loop`; humans
+gate merges per AGENT.md.
+
+## Session-cumulative status (iter-9 closeout)
+
+iter-9 closes the post-halt extension. Sequence of work this session:
+- iter-3 (calibration), iter-4 (bisection), iter-5 (regression revert),
+  iter-6 (deeper bisection), iter-7 (NaN revert), iter-8 (NaN revert) →
+  cumulative `regression_chain` HALT
+- post-halt: iter-9 Tooling deliverable + 2 inline perfsim fixes (PR#45)
+
+Production state remains **iter-2b** (1882 TPS/chip @ 30.5% MFU).
+No measured perf change this session, but rich knowledge captured
+and 2 perfsim issues fixed for the next session's tooling.
 - **Corrected framing of iter-3 finding**: the "2.5× in-training overhead"
   was a statistic comparing apples-to-oranges (forward kernel ceiling vs
   forward+bwd in-training). Replaced in v7x_KNOWLEDGE.md §5 with the
