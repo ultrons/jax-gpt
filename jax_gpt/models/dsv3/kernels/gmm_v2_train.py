@@ -56,20 +56,27 @@ def _tgmm_tiles(K: int, M: int, N: int) -> tuple[int, int, int]:
     For tgmm: lhs[K, M], rhs[M, N]; M is the contraction axis.
     Big tile_m → fewer iterations.
 
-    NOTE: megablox.tgmm has a hardcoded ~32 MB scoped VMEM limit (no
-    vmem_limit_bytes param, unlike gmm_v2). Per autoperf iter-5 AOT survey
-    on tpu7x:2x2x1, all tile choices that would improve iter-count over
-    the generic (2048, 1024, 1024) overflow scoped-VMEM (40-48 MB):
-      gate/up (K=7168, N=2048): baseline 896 iter; (2048,1024,2048) →
-        40 MB FAIL; (4096,1024,1024) → 40 MB FAIL.
-      down (K=2048, N=7168):    baseline 896 iter; (2048,2048,1024) →
-        40 MB FAIL; (4096,1024,1024) → 40 MB FAIL; (4096,2048,512) → 48 MB FAIL.
-    Generic IS at-optimum within megablox.tgmm's library-fixed VMEM cap.
-    The candidate-C lever is blocked at the megablox library level; reducing
-    tgmm time requires either (a) megablox.tgmm exposing vmem_limit_bytes,
-    or (b) a custom Pallas tgmm in jax-gpt that does. Both are multi-iter
-    projects out of scope for the autoperf single-iter Greedy lever.
+    Heuristic-tuned for v7x BF16 production shapes (autoperf iter-5,
+    sized at 3,026 ms/step in iter-2b xplane via xla_shell list_fusions
+    on 6× tgmm.12-17 fusions). Production runs with
+    `LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=65536` (64 MB
+    scoped VMEM, see manifests/jobset.yaml.j2:112), giving headroom
+    over megablox.tgmm's default 32 MB cap.
+
+    AOT-validated at 64 MB scoped VMEM (tpu7x:2x2x1):
+      d_wi_0/d_wi_1 (gate/up bwd): tgmm(K=7168, M=131072, N=2048).
+        Baseline (2048,1024,1024): 64×7×2 = 896 tile iters.
+        New      (4096,1024,1024): 32×7×2 = 448 iters (2× reduction).
+      d_wo (down bwd): tgmm(K=2048, M=131072, N=7168).
+        Baseline (2048,1024,1024): 64×2×7 = 896 iters.
+        New      (4096,1024,1024): 32×2×7 = 448 iters (2× reduction).
+    Note: at the default 32 MB cap, these tiles would FAIL AOT — they
+    REQUIRE the production --xla_tpu_scoped_vmem_limit_kib=65536 flag.
     """
+    if (K, M, N) == (7168, 131072, 2048):  # gate/up d_wi (bwd)
+        return (4096, 1024, 1024)
+    if (K, M, N) == (2048, 131072, 7168):  # down d_wo (bwd)
+        return (4096, 1024, 1024)
     return (min(M, 2048), min(K, 1024), min(N, 1024))
 
 
