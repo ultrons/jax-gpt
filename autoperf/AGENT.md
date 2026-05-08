@@ -93,18 +93,45 @@ features, anything that needs cross-repo discussion — file an issue instead
   workload that works at higher PDBS than expected, a perfsim preset that
   proved reliable. Do not delete; only append or mark stale with a date.
   This is your `cde history` for v7x knowledge.
-- **Continuous-loop mode (default, 2026-05-08 update).** The agent runs
-  iter-after-iter without halting at iter boundaries. After a successful
-  iter's closeout (BLOCKED.md/iter_log.md/diary committed, cde annotate
-  posted, branches pushed), loop back to Step 1 of the next iter
-  immediately. After a §13 halt-with-revert (broke_training,
-  nan_at_step1, regression_chain, etc.), commit + push the revert
-  + halt documentation, then ALSO loop back — pick a different lever
-  per the §13 halt-handling rules. The session ends only when:
-  - §13 cumulative halts fire (e.g., 3 consecutive regressions across
-    iters, all-leaves-at-floor, cluster_unhealthy)
-  - the user explicitly intervenes
-  Old "one iteration per session" rule is **retired**.
+- **Continuous-loop mode (default).** Loop iter-after-iter without
+  halting at iter boundaries. After a successful iter's closeout
+  (BLOCKED.md / iter_log.md / diary committed, cde annotate posted,
+  branches pushed), go to Step 1 of the next iter. After a §13
+  halt-with-revert, commit + push the revert + halt doc, then also
+  loop back — pick a different lever per §13. Session ends on §13
+  cumulative halts or user interrupt.
+- **Design for resumability — auto-compaction is survivable.** Claude
+  Code auto-compacts conversation history as the context window fills.
+  When that happens mid-session, the post-compact agent re-orients from
+  durable state on disk: `iter_log.md` (most-recent rehydration block —
+  see Step 14), `v7x_KNOWLEDGE.md` (trust ledger), `BLOCKED.md` (open
+  tool issues), `git log` (commit history), `cde history` (cluster
+  runs). Anything not written to disk before compaction is lost. So:
+  (a) commit + push frequently within an iter, not just at iter end,
+  (b) write the iter_log rehydration block at Step 14 every iter,
+  (c) treat any half-formed hypothesis or "I tried this and it felt
+  off" intuition as ephemeral unless captured in iter_log notes. The
+  closure block IS the contract; if it's not in there, it doesn't
+  survive.
+- **Delegate orientation and diagnosis to subagents.** Most per-iter
+  context burn is tool output (profile dumps, perfsim --explain text,
+  fusion lists, kubectl logs). Don't dump these into the main thread —
+  spawn a subagent and accept a summary. Patterns:
+  - **Explore agent** for "where in `model.py` does X happen", "find
+    all callers of Y", "what's at `<file>:<line-range>`". Returns
+    file paths + excerpts; main thread gets pointers, not contents.
+  - **general-purpose agent** for "run `perfsim --explain` on top-3
+    leaves and summarize discrepancies", "diagnose the top fusion in
+    this profile and report the bottleneck class". Prompt with the
+    specific question + output budget ("under 300 words"); main
+    thread gets a digest, not 5K lines of raw output.
+  - **Plan agent** for multi-iter scope design (attention-only-
+    checkpoint refactor, custom Pallas tgmm wrapper). Returns a
+    step-by-step plan; main thread acts on it.
+  Rule of thumb: any tool call expected to return >500 lines, or any
+  open-ended "figure out what's going on here" question, goes via
+  subagent. Aggressive delegation = fewer auto-compactions per
+  session = more iters per session.
 
 References (READ BEFORE STARTING, in this order):
 1. `autoperf/v7x_KNOWLEDGE.md` — **operational TPU/JAX knowledge ledger.**
@@ -160,6 +187,14 @@ You ARE the loop. There is no Python orchestrator. Each iteration is YOU
 running these steps in sequence:
 
 ### Step 1 — context restore (cheap; <2 min on a clean session)
+
+a0. **If this session was auto-compacted (or is fresh after a prior
+   session halted)**: read the most recent iter's rehydration block at
+   the bottom of `autoperf/iter_log.md` FIRST. That block tells you
+   the iter number to resume at, the trust-state delta to read, the
+   in-flight cluster runs to re-poll, and the next-iter starting point.
+   Then continue to (a). [Why: auto-compaction strips conversation
+   history; the rehydration block is the durable handoff per Step 14.]
 
 a. **Check open BLOCKED rows.** `gh issue view <repo>#<issue> --json state` for
    each `open` row in `autoperf/BLOCKED.md`. Closed → mark `resolved <date>`,
@@ -488,22 +523,40 @@ asynchronously — without re-polling, discovery is delayed by hours. So:
 3. Next session's step-1 ritual MUST `cde status` any prior-session
    `Pending` JobSets before assuming the halt still holds.
 
-### Step 14 — end of iteration
+### Step 14 — end of iteration (write rehydration block, then loop)
 
-Commit all state to disk. Push branches. **Then loop back to Step 1
-of the next iteration in the same session** (continuous-loop mode,
-2026-05-08 update). Do NOT end the session at iter boundary.
+Commit all state to disk. Push branches. **Append a rehydration block
+to this iter's `iter_log.md` section** — this is the contract a
+post-compaction agent uses to pick up where you left off:
 
-The session ends only on:
-- §13 cumulative halt conditions (3 consecutive regressions, all
+```markdown
+**Rehydrate from this iter (compaction-survival contract):**
+- iter: <N> | sha: <git-sha> | class: <Greedy/Lateral/Tooling> | lever-source: <...>
+- outcome: <IMPROVED/REVERTED/INFORMATIVE> | metric: <step_time_before → after>
+- corpus_anchor: <file>:<plan-key> | tolerance: <X> | perfsim_delta: <Y>%
+- trust-state delta: <pointer to v7x_KNOWLEDGE.md §X line range, or "none">
+- BLOCKED rows opened/closed: <repo>#<issue> opened, <repo>#<issue> closed
+- in-flight cluster runs: <run-id> (expected complete: <time>) or "none"
+- next-iter starting point: <one sentence: "read X, then pick lever Y from top-leaf Z">
+```
+
+The rehydration block is the durable handoff. Anything you've learned
+this iter but did NOT capture there (or in v7x_KNOWLEDGE.md) is lost
+on auto-compaction. Treat it like the iter's commit message: terse,
+load-bearing, future-self-readable.
+
+**Then loop back to Step 1 of the next iteration** (continuous-loop
+mode). Do NOT end the session at iter boundary.
+
+Session ends only on:
+- §13 cumulative halts (regression_chain across ≥2 lever classes, all
   leaves at floor, workload at ceiling, cluster_unhealthy)
 - user interrupts
-- you've exhausted the queue of viable levers (top-3 trusted leaves
-  all have HR < 0.5 ms or no actionable lever from the heuristic table)
+- exhausted viable levers across all sources (heuristic + diagnosis +
+  search + white-paper)
 
-When you HALT (cumulative, not per-iter), write `autoperf/HALT.md`
-with: workload, last iter, halt reason, list of all jax-gpt issues
-filed during the session (per Step 13 NaN-issue-filing rule),
+When you HALT cumulatively, write `autoperf/HALT.md`: workload, last
+iter, halt reason, all jax-gpt issues filed (per §13 NaN-filing rule),
 recommended next human action.
 
 ---
