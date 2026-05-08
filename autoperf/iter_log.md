@@ -696,6 +696,51 @@ resumed iter at production VMEM, cluster regression, revert).
 - **Alternative for iter-8**: revisit non-MoE/non-attention levers.
   iter-6 bisection's "Other (~2,635 ms)" bucket might have small wins
   worth surfacing.
+
+---
+
+## iter 8 — Lateral: prevent_cse=False → True — HALTED `nan_at_step1`
+
+- **Class**: Lateral (schedule-position).
+- **Lever**: Two-line change at model.py:3084 and :3101 — switch
+  `jax.checkpoint(fn, policy=_ckpt_policy, prevent_cse=False)` to
+  `prevent_cse=True` (= JAX default). Tests whether allowing CSE was
+  masking offload's intended effect.
+- **Rationale**: After iter-7's `attn_proj_out`-NaN halt, iter-8
+  pivots to a Lateral that adds NO new offload markers — pure JAX
+  optimizer flag toggle. Aimed at being safer than iter-7 while still
+  potentially affecting recompute behavior.
+- **No AOT compile gate**: per AGENT.md §3 step-4b, AOT is for Pallas
+  changes; this is a JAX-level optimizer flag. Cluster compile is the
+  test.
+- **Cluster result on dsv3train-i8** (cde-24fa4f0 image):
+  - Step 1: 227.2 s (compile), loss=NaN (lm=nan, aux=nan)
+  - Step 2: 35.0 s, TPS/chip 1872, loss=NaN
+  - Same failure mode as iter-7 — NaN from step 1.
+- **Halt reason**: `nan_at_step1` (per CLAUDE.md "NaN at step 1+ is a
+  halt — revert your change").
+- **Reverted**: commit `05116ff`.
+- **Filed jax-gpt issue**: https://github.com/ultrons/jax-gpt/issues/3
+  (full repro per AGENT.md §13 NaN-issue-filing rule).
+- **Significance — different mechanism, same symptom**:
+  - jax-gpt#2 (iter-7): adding new offload marker `attn_proj_out` →
+    NaN.
+  - jax-gpt#3 (iter-8): no new offload, just `prevent_cse=True` → NaN.
+  Two orthogonal small changes both produce NaN-from-step-1.
+- **Hypothesis (in jax-gpt#3)**: production state is in a narrow
+  numerically-stable groove. `prevent_cse=False` may let XLA silently
+  CSE between forward and recomputed-forward, bypassing the offload-
+  restore path. With `prevent_cse=True`, the offload-restore path
+  becomes genuinely active and exposes the same async-DMA race /
+  layout drift that broke `attn_proj_out`. If correct, fixing #2 may
+  fix #3 too.
+- **CUMULATIVE HALT**: iter-5 (regression revert) + iter-7 (NaN
+  revert) + iter-8 (NaN revert) = **3 consecutive failed iters with
+  reverts on `dsv3_train_full`**. Per AGENT.md §13 `regression_chain`
+  rule, this triggers session-level halt. iter-6 was Tooling (no
+  measure), so chain is unbroken.
+- **Session ends here** (cumulative halt, not per-iter). HALT.md
+  filed with the autoperf-side state for next-human pickup.
 - **Corrected framing of iter-3 finding**: the "2.5× in-training overhead"
   was a statistic comparing apples-to-oranges (forward kernel ceiling vs
   forward+bwd in-training). Replaced in v7x_KNOWLEDGE.md §5 with the

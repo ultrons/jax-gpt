@@ -412,6 +412,26 @@ worktree pattern.
 - `n_chunks=4` triggers Bug 3 (bwd NaN). Don't propose without resolving the bug.
 - `n_chunks=8` untested as of 2026-05-05.
 
+### `prevent_cse=True` on jax.checkpoint produces NaN (autoperf iter8, 2026-05-08)
+
+- Setting `prevent_cse=False → True` on the moe-scan `jax.checkpoint`
+  call (model.py:3084 and :3101) produces **NaN at step 1** on the
+  production baseline, with the existing `moe_layer_input`-only
+  offload policy (no new offload markers added).
+- jax-gpt#3 (filed) — different mechanism than jax-gpt#2 (attn_proj_out)
+  but same NaN-at-step-1 symptom.
+- **Working hypothesis (in jax-gpt#3 body)**: production is in a narrow
+  stable groove where `prevent_cse=False` lets XLA silently CSE
+  between fwd and recomputed-fwd, effectively bypassing the offload-
+  restore path. With `prevent_cse=True`, the offload-restore path is
+  genuinely exercised and exposes the same async-DMA race / layout
+  drift issue that broke `attn_proj_out` in jax-gpt#2. If correct,
+  fixing #2 likely fixes #3.
+- **Don't propose `prevent_cse=True`** until the underlying offload-
+  restore correctness issue is fixed. iter-2b state requires
+  `prevent_cse=False` AND only `moe_layer_input` in offload — both
+  load-bearing for stability.
+
 ### `attn_proj_out` offload broken at production scale (autoperf iter7, 2026-05-08)
 
 - Adding `"attn_proj_out"` to `_ckpt_policy.names_which_can_be_offloaded`
