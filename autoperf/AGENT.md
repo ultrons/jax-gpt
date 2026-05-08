@@ -110,6 +110,17 @@ b. **Check `autoperf-loop` PR comments.** For each open PR you have on
 c. **Read the prior iteration's headroom report.** Located at
    `autoperf/reports/<workload>_iter<N>.json`. If iteration 1, skip.
 
+d. **Refresh stale cde history with `cde reap`.** cde caches in-flight
+   row status; `cde history` may show prior session's runs as
+   `running` long after they Succeeded. `cde reap` updates the cache
+   in one shot. Pair with `cde history --limit 6` to see the actual
+   recent state before trusting any row. (iter-7 retrospective: stale
+   "running" rows can mask completed-but-failed iters.)
+
+   Also re-poll any **prior-session HALT-marked Pending JobSets**
+   (per Step 13's halt-re-poll rule) — Kueue may have admitted them
+   asynchronously between sessions.
+
 ### Step 2 — pick this iteration's class
 
 Per the policy split (60/25/15 today; shifts to 40/40/20 once perfsim#12
@@ -241,6 +252,33 @@ iter<N> <git-sha>: <change> | <metric_before>→<metric_after> | top_leaf=<x> hr
 ```
 Also write the structured iter-N section in `autoperf/iter_log.md` per the
 template (class, hypothesis, result, decision for next iter).
+
+**Annotate the cde run with the autoperf-side outcome** (iter-7
+retrospective). cde's "ok" status only means "script exited 0", not
+"training was correct" — a NaN-from-step-1 run still reports cluster
+success. Encode the autoperf classification in cde's note column so a
+future session glancing at `cde history` sees the real story:
+
+```bash
+cde annotate <run_id> -m "<CLASSIFICATION>: <one-line outcome>. <key metric or finding>. <pointer to v7x_KNOWLEDGE / iter_log if relevant>."
+```
+
+Suggested classification prefixes:
+- `PRODUCTION BASELINE` — confirmed-and-held perf gain that becomes
+  the new comparison point. (Only after the result holds for at least
+  one repeat measurement per AGENT.md §5b "ratchet the corpus".)
+- `IMPROVED` — perf gain over prior baseline; becomes a candidate
+  baseline pending the ratchet check.
+- `REVERTED: <reason>` — change reverted via `git revert HEAD`.
+  `<reason>` is the AGENT.md §13 halt reason
+  (`broke_training`, `nan_at_step1`, `regression_chain`, etc.).
+- `REGRESSED` — change measured worse than baseline but kept in
+  history for audit (rare; usually reverted).
+- `INFORMATIVE` — calibration/Tooling cluster run that produced
+  data but doesn't change baseline (e.g., iter-3's microbench).
+
+The original `--note` from `cde run` is preserved as commit-time
+intent; this annotate adds the post-cluster outcome.
 
 ### Step 13 — stop check
 
