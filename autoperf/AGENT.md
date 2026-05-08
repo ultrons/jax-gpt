@@ -130,6 +130,19 @@ lands and `perfsim search` is wired):
 
 Log the class explicitly in this iter's `iter_log.md` entry.
 
+**Tooling-vs-Greedy authority (clarification, iter-5 retrospective):**
+If the heuristic Greedy lever is one source edit + AOT + cluster submit
+(i.e., a single-iter scope), **just do it** — don't pivot to a Tooling-
+class microbench iter. AGENT.md §6 grants direct jax-gpt authority; use
+it. Pivot to Tooling only when:
+- the heuristic is poorly-defined (no obvious tile/flag value to try), OR
+- it would burn ≥3 cluster slots to converge (e.g., scatter-fusion-class
+  redesigns where each compile-iter is 4 min and ~5 attempts are
+  realistic).
+A failing Greedy iter that produces a clean revert + a profile-sized
+finding is more valuable than a Tooling iter that microbenches a lever
+the cluster could have measured directly.
+
 ### Step 3 — apply the change
 
 For Greedy or Lateral: edit jax-gpt source files. ONE change.
@@ -142,6 +155,30 @@ the worktree pattern.
 
 `python -c "import jax_gpt.models.<x>"` to confirm imports still work. If
 broken, revert and HALT (don't burn cluster on broken code).
+
+**Step 4b — AOT compile gate for Pallas changes** (Greedy / Lateral only).
+Per `~/.claude/CLAUDE.md` "Pallas Kernel Testing — AOT Compile Check":
+write a focused AOT script that exercises the changed kernel path on a
+virtual `tpu7x:2x2x1` (or equivalent) topology and runs through
+`jax.jit().lower().compile()`.
+
+**CRITICAL — AOT must mirror production env vars.** Read
+`manifests/jobset.yaml.j2` (or the workload's manifest) to find the
+production `LIBTPU_INIT_ARGS`, then set the same value in `os.environ`
+at the top of your AOT script. Without this, AOT runs at default scoped
+VMEM (32 MB) while production runs at 64 MB+ — verdict diverges, leading
+to false "lever blocked at library level" halts (iter-5 retrospective).
+
+```python
+import os
+# Mirror manifests/jobset.yaml.j2:LIBTPU_INIT_ARGS to avoid AOT/runtime
+# scoped-VMEM divergence.
+os.environ["LIBTPU_INIT_ARGS"] = (
+    "--xla_tpu_scoped_vmem_limit_kib=65536 "
+    # ... other production flags from the manifest ...
+)
+import jax  # rest of AOT
+```
 
 ### Step 5 — commit + push (jax-gpt side)
 
@@ -219,6 +256,27 @@ If ANY of:
 - perfsim's reasoning didn't make sense and `--explain` didn't resolve it
   → HALT with reason `perfsim_unverifiable`, file a perfsim issue (or fix
   inline if scoped — see §5)
+- a kernel-library limit (e.g., scoped VMEM cap, hardcoded tile constraint)
+  blocks the lever and you've verified production env doesn't override it
+  → HALT with reason `lever_blocked_at_library`. **First confirm**: did
+  you mirror production `LIBTPU_INIT_ARGS` per Step 4b? AOT-only verdict
+  is not enough; check the production manifest's env overrides before
+  declaring the library a hard wall.
+
+**Halt re-poll for Pending JobSets** (iter-3 retrospective). If you
+declare HALT while a JobSet is `Pending` (e.g., `cluster_unhealthy` due
+to queue depth), the Kueue queue may admit it later asynchronously. To
+avoid 12-hour discovery delays:
+1. Delete the Pending JobSet you created. (`kubectl delete jobset
+   <name>` — pre-approve in `.claude/settings.json` for self-created
+   resources.)
+2. If you can't delete (permission filter), surface that to the user
+   AND register a delayed re-check: `cde status <run_id>` polls every
+   30 min for 24h. Either via a `cron` skill, a `loop` skill, or a
+   noted-in-HALT.md item the next session must run as step-1 ritual.
+3. The next session's step-1 ritual MUST `cde status` any prior-session
+   `Pending` JobSets in the workload's diary line before assuming the
+   halt still holds.
 
 ### Step 14 — end of iteration
 
