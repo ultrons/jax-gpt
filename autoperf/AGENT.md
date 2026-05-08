@@ -179,31 +179,22 @@ c. **Read the prior iteration's headroom report.** Located at
    `autoperf/reports/<workload>_iter<N>.json`. If iteration 1, skip.
 
 d. **Refresh stale cde history with `cde reap`.** cde caches in-flight
-   row status; `cde history` may show prior session's runs as
-   `running` long after they Succeeded. `cde reap` updates the cache
-   in one shot. Pair with `cde history --limit 6` to see the actual
-   recent state before trusting any row. (iter-7 retrospective: stale
-   "running" rows can mask completed-but-failed iters.)
+   row status; rows can show `running` long after Succeeded. `cde reap`
+   updates the cache; pair with `cde history --limit 6`. [Why: stale
+   rows can mask completed-but-failed iters from the prior session.]
 
-e. **Pull sibling worktrees** (perfsim retrospective on PR#45):
+e. **Pull sibling worktrees** before any inline fix:
    ```bash
-   git -C ~/autoperf/repos/perfsim fetch origin && \
-       git -C ~/autoperf/repos/perfsim rebase origin/main
-   git -C ~/autoperf/repos/cde      fetch origin && \
-       git -C ~/autoperf/repos/cde      rebase origin/main
-   git -C ~/autoperf/repos/xla-shell fetch origin && \
-       git -C ~/autoperf/repos/xla-shell rebase origin/main
+   for r in perfsim cde xla-shell; do
+     git -C ~/autoperf/repos/$r fetch origin && \
+       git -C ~/autoperf/repos/$r rebase origin/main
+   done
    ```
-   Skip on a fresh worktree. Without this, an inline-fix PR can
-   accumulate stale-base diffs (PR#45 had 17 commits / 730 lines of
-   stale revert when first opened; reviewer correctly flagged it).
-   If a rebase produces conflicts on already-merged commits, `git
-   rebase --skip` is the right move (the merge-equivalent is
-   upstream).
-
-   Also re-poll any **prior-session HALT-marked Pending JobSets**
-   (per Step 13's halt-re-poll rule) — Kueue may have admitted them
-   asynchronously between sessions.
+   On already-merged-commit conflicts, `git rebase --skip` is correct
+   (merge-equivalent is upstream). [Why: PRs can accumulate stale-base
+   diffs across sessions.] Also re-poll any prior-session HALT-marked
+   Pending JobSets (Step 13 halt-re-poll rule) — Kueue may have admitted
+   them asynchronously.
 
 ### Step 2 — pick this iteration's class
 
@@ -255,18 +246,13 @@ Log the class AND lever source explicitly in this iter's `iter_log.md`
 entry. (e.g., `class=Greedy, lever_source=diagnosis-derived`,
 `class=Lateral, lever_source=white-paper §4.3 GMM fused activation`.)
 
-**Tooling-vs-Greedy authority (clarification, iter-5 retrospective):**
-If the heuristic Greedy lever is one source edit + AOT + cluster submit
-(i.e., a single-iter scope), **just do it** — don't pivot to a Tooling-
-class microbench iter. AGENT.md §6 grants direct jax-gpt authority; use
-it. Pivot to Tooling only when:
-- the heuristic is poorly-defined (no obvious tile/flag value to try), OR
-- it would burn ≥3 cluster slots to converge (e.g., scatter-fusion-class
-  redesigns where each compile-iter is 4 min and ~5 attempts are
-  realistic).
-A failing Greedy iter that produces a clean revert + a profile-sized
-finding is more valuable than a Tooling iter that microbenches a lever
-the cluster could have measured directly.
+**Tooling-vs-Greedy authority:** If the Greedy lever is single-iter
+scope (one edit + AOT + cluster submit), just do it — don't pivot to
+a Tooling microbench. Pivot to Tooling only when (a) the heuristic
+gives no obvious value to try, or (b) it would burn ≥3 cluster slots
+to converge. [Why: a failing Greedy with clean revert + profile-sized
+finding beats a Tooling iter microbenching what the cluster could
+measure directly.]
 
 ### Step 3 — apply the change
 
@@ -288,11 +274,11 @@ virtual `tpu7x:2x2x1` (or equivalent) topology and runs through
 `jax.jit().lower().compile()`.
 
 **CRITICAL — AOT must mirror production env vars.** Read
-`manifests/jobset.yaml.j2` (or the workload's manifest) to find the
-production `LIBTPU_INIT_ARGS`, then set the same value in `os.environ`
-at the top of your AOT script. Without this, AOT runs at default scoped
-VMEM (32 MB) while production runs at 64 MB+ — verdict diverges, leading
-to false "lever blocked at library level" halts (iter-5 retrospective).
+`manifests/jobset.yaml.j2` (or the workload's manifest) for the production
+`LIBTPU_INIT_ARGS`, then set the same value in `os.environ` at the top of
+the AOT script. [Why: AOT default scoped VMEM is 32 MB; production runs
+at 64 MB+. Without mirroring, AOT verdict diverges from runtime → false
+`lever_blocked_at_library` halts.]
 
 ```python
 import os
@@ -367,11 +353,11 @@ iter<N> <git-sha>: <change> | <metric_before>→<metric_after> | top_leaf=<x> hr
 Also write the structured iter-N section in `autoperf/iter_log.md` per the
 template (class, hypothesis, result, decision for next iter).
 
-**Annotate the cde run with the autoperf-side outcome** (iter-7
-retrospective). cde's "ok" status only means "script exited 0", not
-"training was correct" — a NaN-from-step-1 run still reports cluster
-success. Encode the autoperf classification in cde's note column so a
-future session glancing at `cde history` sees the real story:
+**Annotate the cde run with the autoperf-side outcome.** cde's "ok"
+status only means "script exited 0" — a NaN-from-step-1 run still
+reports cluster success. Encode the autoperf classification in cde's
+note column so future sessions glancing at `cde history` see the real
+outcome:
 
 ```bash
 cde annotate <run_id> -m "<CLASSIFICATION>: <one-line outcome>. <key metric or finding>. <pointer to v7x_KNOWLEDGE / iter_log if relevant>."
@@ -445,19 +431,18 @@ distinguishing in/out tag.
 6. Append to `iter_log.md`: `corpus_anchor=<file>:<plan-key>,
    tolerance=<X>, perfsim_delta=<Y>%`.
 
-**Why this is mandatory, not optional**: iter-10 was an
-11.2× perfsim miss on a plan-class that had zero corpus anchors. The
-fix is not "calibrate perfsim better in the abstract" — it's "every
-cluster shot we ever do creates an anchor that future search/headroom
-calls calibrate against." Skipping Step 12.5 leaves the next session
-with the same calibration gap. The protocol doc puts it as: "the
+**Why mandatory, not optional**: iter-10 was an 11.2× perfsim miss on
+a plan-class with zero corpus anchors. Calibration is "every cluster
+shot creates an anchor that future search/headroom calibrates against",
+not "calibrate perfsim better in the abstract". Skipping Step 12.5
+leaves the next session with the same gap. Per the protocol doc: "the
 agentic performance harness is the long-term producer of new corpus
-entries" — that's *you*.
+entries" — that's you.
 
-**What if the cluster errored mid-run** (eviction, OOM, transient
-infra)? Still write a partial entry: `measured.status: eviction`,
-`measured.partial_step_time_ms` if any steps completed. Calibration
-gets the most signal from the long tail of imperfect runs.
+**Cluster errored mid-run** (eviction, OOM, infra)? Still write a
+partial entry: `measured.status: eviction`, `measured.partial_step_time_ms`
+for completed steps. The long tail of imperfect runs carries the most
+calibration signal.
 
 ### Step 13 — stop check
 
@@ -474,16 +459,13 @@ If ANY of:
   iterating; each regression still produced a corpus anchor (Step 12.5).
 - all leaves > 5% step-share have headroom < 0.5 ms → HALT with reason
   `workload_at_ceiling`
-- the change broke training (NaN, OOM, or no progress on metric we care
-  about) → HALT with reason `broke_training` and revert via `git revert HEAD`.
-  **Always file a `ultrons/jax-gpt` issue with full repro details**
-  (the change diff, image tag, full cde-run command, cluster outcome,
-  AOT pre-flight result, hypotheses on root cause, related markers
-  that might share the failure mode, workaround). Use the iter-7
-  precedent (jax-gpt#2) as a template. The bug is real and fixable
-  later; the issue is the durable channel for the maintainer-agent or
-  human to pick it up. **Do this for ALL NaN/OOM/no-progress halts
-  going forward**, not just notable ones.
+- the change broke training (NaN, OOM, no progress) → HALT with reason
+  `broke_training`, revert via `git revert HEAD`, and **file a
+  `ultrons/jax-gpt` issue with full repro details** (diff, image tag,
+  full cde-run command, cluster outcome, AOT pre-flight result, root-cause
+  hypotheses, related markers, workaround). Template: jax-gpt#2.
+  **Mandatory for every NaN/OOM/no-progress halt** — the issue is the
+  durable channel for the maintainer agent to pick it up.
 - the cluster is in chaos (3 evictions in a row) → HALT with reason
   `cluster_unhealthy`
 - perfsim's reasoning didn't make sense and `--explain` didn't resolve it
@@ -496,20 +478,15 @@ If ANY of:
   is not enough; check the production manifest's env overrides before
   declaring the library a hard wall.
 
-**Halt re-poll for Pending JobSets** (iter-3 retrospective). If you
-declare HALT while a JobSet is `Pending` (e.g., `cluster_unhealthy` due
-to queue depth), the Kueue queue may admit it later asynchronously. To
-avoid 12-hour discovery delays:
-1. Delete the Pending JobSet you created. (`kubectl delete jobset
-   <name>` — pre-approve in `.claude/settings.json` for self-created
-   resources.)
-2. If you can't delete (permission filter), surface that to the user
-   AND register a delayed re-check: `cde status <run_id>` polls every
-   30 min for 24h. Either via a `cron` skill, a `loop` skill, or a
-   noted-in-HALT.md item the next session must run as step-1 ritual.
-3. The next session's step-1 ritual MUST `cde status` any prior-session
-   `Pending` JobSets in the workload's diary line before assuming the
-   halt still holds.
+**Halt re-poll for Pending JobSets.** If you declare HALT while a JobSet
+is `Pending` (e.g., `cluster_unhealthy` queue depth), Kueue may admit it
+asynchronously — without re-polling, discovery is delayed by hours. So:
+1. Delete the Pending JobSet (`kubectl delete jobset <name>` —
+   pre-approved for self-created resources).
+2. If permission filter blocks delete, surface to the user AND record a
+   re-check item in HALT.md for the next session's step-1 ritual.
+3. Next session's step-1 ritual MUST `cde status` any prior-session
+   `Pending` JobSets before assuming the halt still holds.
 
 ### Step 14 — end of iteration
 
@@ -691,20 +668,12 @@ on autoperf-loop PRs.
 
 ## 6. Cross-repo worktrees (sibling tool fixes)
 
-When you fix a sibling tool inline, you work in a dedicated **git worktree**
-under `~/autoperf/repos/<repo>/`, NOT in the user's primary checkout
-(`~/<repo>/`). This isolates autoperf's `autoperf-loop` branch from whatever
-the user is doing on main.
+Sibling-repo fixes go in dedicated worktrees at `~/autoperf/repos/<repo>/`,
+NOT the user's primary checkout (`~/<repo>/`) — isolates `autoperf-loop`
+from whatever the user has checked out on main.
 
-**Bootstrap (first run only — the script handles existence checks):**
-```bash
-~/jax-gpt/autoperf/bootstrap.sh
-```
-
-This creates:
-- `~/autoperf/repos/perfsim/` (worktree of `~/perfsim`, on `autoperf-loop` branch)
-- `~/autoperf/repos/cde/` (worktree of `~/cde`, on `autoperf-loop`)
-- `~/autoperf/repos/xla-shell/` (worktree of `~/xla-shell`, on `autoperf-loop`)
+**Bootstrap** (first run; idempotent): `~/jax-gpt/autoperf/bootstrap.sh`
+creates worktrees on `autoperf-loop` for `perfsim`, `cde`, `xla-shell`.
 
 **Workflow for a sibling-repo fix:**
 ```bash
@@ -717,32 +686,22 @@ gh pr create --repo ultrons/perfsim --base main --head autoperf-loop \
     --body "Filed during autoperf iter-<N> on <workload>. ..."
 ```
 
-**Invocations from autoperf scripts use PYTHONPATH override** so the
-loop-branch code takes precedence over the user's editable install:
+**Use PYTHONPATH override** so loop-branch code takes precedence over the
+user's editable install:
 ```bash
 PYTHONPATH=~/autoperf/repos/perfsim python -m perfsim.inference.scripts.headroom_report ...
 ```
+Without it, imports resolve to `pip install -e ~/perfsim` (on main) and
+your fix isn't tested. **Never check out `autoperf-loop` in `~/perfsim`
+directly** — would clobber the user's branch (worktrees prevent this by
+construction).
 
-Without this override, perfsim resolves to the user's `pip install -e
-~/perfsim` (which is on main, not `autoperf-loop`) and your fix isn't tested.
+**The `AGENT.md` at the root of each sibling repo is the *reviewer
+agent's* role doc, NOT yours.** Your role is THIS file. Repo-specific
+norms (build commands, file paths, style) live in `docs/`, `README.md`,
+and `pyproject.toml` — read those, not the worktree's AGENT.md.
 
-**Never check out `autoperf-loop` in `~/perfsim` directly** — that would
-clobber the user's branch and disturb their editable install. Worktrees make
-this impossible by construction (one branch can only be checked out in one
-worktree).
-
-**The `AGENT.md` at the root of each sibling repo is the *reviewer agent's*
-role doc, NOT yours.** When you `cd ~/autoperf/repos/perfsim/` (or the
-worktree for any sibling repo), the working tree contains an `AGENT.md` —
-this is the reviewer-role spec checked into that repo. **Do not read it as
-your own role.** Your role is defined in THIS file (`jax-gpt/autoperf/AGENT.md`).
-Each sibling repo's AGENT.md has an audience preamble that explicitly says
-"if you're autoperf in a worktree, ignore this and use jax-gpt/autoperf/AGENT.md"
-— but you should know this independently. Repo-specific norms you actually
-need (build commands, file paths, style) live in `docs/`, `README.md`, and
-`pyproject.toml` of each repo. Read those, not the worktree's AGENT.md.
-
-**Never merge `autoperf-loop` PRs.** Reviewer agents (or humans) gate merges.
+**Never merge `autoperf-loop` PRs.** Reviewer agents and humans gate merges.
 
 ---
 
