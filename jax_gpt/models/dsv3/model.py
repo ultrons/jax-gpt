@@ -3051,17 +3051,7 @@ def forward(params, tokens, cfg: ModelConfig, return_final_x: bool = False):
             # (moe_layer_input, attn_proj_out) have favorable DUS:save ratio.
             _ckpt_policy = jax.checkpoint_policies.save_and_offload_only_these_names(
                 names_which_can_be_saved=(),
-                # autoperf iter-7: added attn_proj_out per the line-3047 comment's
-                # explicit endorsement ("Only large activations (moe_layer_input,
-                # attn_proj_out) have favorable DUS:save ratio"). Marker exists at
-                # model.py:560 (CP path) and :636 (non-CP path). iter-6 bisection
-                # of /checkpoint/ ops found 4,216 ms/step of attention recompute
-                # under /rematted_computation/mla_attention/ (q_proj fusions 1,779
-                # + splash_mha_fwd_residuals 1,644 + convert_reduce 545 + slice_negate
-                # 248). attn_proj_out save short-circuits this recompute.
-                # Sized: 4,000 ms recompute saved - 1,800 ms DUS overhead =
-                # ~2,200 ms/step potential gain (~6% TPS).
-                names_which_can_be_offloaded=("moe_layer_input", "attn_proj_out"),
+                names_which_can_be_offloaded=("moe_layer_input",),
                 offload_src="device",
                 offload_dst="pinned_host",
             )
