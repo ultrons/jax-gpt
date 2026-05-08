@@ -128,6 +128,22 @@ d. **Refresh stale cde history with `cde reap`.** cde caches in-flight
    recent state before trusting any row. (iter-7 retrospective: stale
    "running" rows can mask completed-but-failed iters.)
 
+e. **Pull sibling worktrees** (perfsim retrospective on PR#45):
+   ```bash
+   git -C ~/autoperf/repos/perfsim fetch origin && \
+       git -C ~/autoperf/repos/perfsim rebase origin/main
+   git -C ~/autoperf/repos/cde      fetch origin && \
+       git -C ~/autoperf/repos/cde      rebase origin/main
+   git -C ~/autoperf/repos/xla-shell fetch origin && \
+       git -C ~/autoperf/repos/xla-shell rebase origin/main
+   ```
+   Skip on a fresh worktree. Without this, an inline-fix PR can
+   accumulate stale-base diffs (PR#45 had 17 commits / 730 lines of
+   stale revert when first opened; reviewer correctly flagged it).
+   If a rebase produces conflicts on already-merged commits, `git
+   rebase --skip` is the right move (the merge-equivalent is
+   upstream).
+
    Also re-poll any **prior-session HALT-marked Pending JobSets**
    (per Step 13's halt-re-poll rule) — Kueue may have admitted them
    asynchronously between sessions.

@@ -86,6 +86,51 @@ Note that perfsim's prediction of 34,525 ms is **0.4% off the measured 34,650 ms
 - v7x_KNOWLEDGE.md §3 entries: attn_proj_out broken, prevent_cse=True broken
 - HALT.md cumulative session state
 
+## Post-PR#45 update — sharding-plan sweep via direct simulator.run
+
+After perfsim PR#45 was rebased + reviewed, ran `perfsim.simulator.run`
+directly to scan candidate sharding plans (bypassing perfsim#44 search-
+bug; root cause: `search.py:147` uses `hw.cell_size × d2d_size = 140,000`
+instead of `hw.slice_size × d2d_size = 512`).
+
+Top sharding candidates by perfsim-predicted step time:
+
+| plan (tp, ep, fsdp, remat) | step ms (predicted) | TPS/chip ratio | Δ vs production |
+|---|---|---|---|
+| (1, 1, 512, full) — ep=1 | 32,503 | ~1992 | **+5.9% ⚠ HBM dubious** |
+| (1, 4, 128, **attn_only**) — post-fix#2/#3 | 33,049 | ~1963 | **+4.3%** |
+| (1, 2, 256, full) — sharding-only | 33,486 | ~1938 | **+3.0%** |
+| (1, 4, 128, full) — production | 34,525 | 1882 measured | 0% baseline |
+| (2, 4, 64, full) — tp=2 d2d | 39,572 | ~1639 | −14.6% |
+| ep=8/16/32 various | 42K–213K | catastrophic | huge regressions |
+
+### Two orthogonal levers above production
+
+1. **Remat policy** (post-jax-gpt#2/#3 fix): `attn_only` saves +4.3%
+2. **Sharding** (with HBM caveats): ep=2 saves +3.0%
+
+These are structurally orthogonal; combined ceiling is ~**+8% TPS**
+(estimated, untested). HBM caveat: perfsim's HBM estimate is
+under-counted by ~80 GB on production sharding (perfsim says 16 GB,
+actual production peak is 96 GB) because perfsim doesn't model XLA
+program binary or HLO temps. Treat ep=2/ep=1 plans as "may OOM at
+compile-time" until empirically validated.
+
+### Final answer: how far from best possible
+
+iter-2b at 1882 TPS/chip is **within ~8% of the perfsim-predicted
+ceiling** for this hardware/model/toolchain combination. The cheap
+single-iter Greedy/Lateral headroom is genuinely close to gone. Remaining
+gains require either (a) upstream offload-pipeline fix (jax-gpt#2/#3),
+(b) HBM-aware sharding redesign with empirical compile-time validation,
+or (c) multi-iter design-space projects (custom Pallas tgmm,
+attention-only-checkpoint refactor).
+
+The cumulative `regression_chain` halt was a correct signal that the
+local optimum is reached. Future autoperf sessions on this baseline
+should **wait for upstream** rather than chase additional single-iter
+gambles.
+
 ## Recommendation for the maintainer agent reviewing jax-gpt#2 + #3
 
 This analysis quantifies exactly what's at stake: **fixing #2 + #3 (or just #2 if they share root cause) unlocks ~+5% TPS** on the v304-class production training baseline. That's a real win, comparable in magnitude to iter-2's gmm_v2 swap (+6.6%). Worth prioritizing.
