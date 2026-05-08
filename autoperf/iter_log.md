@@ -405,6 +405,73 @@ curve adjustments.
   Pallas kernel rules. Candidate B (`moe_xlayer_prefetch`) blocked by
   iter-1's unresolved compile bug. Candidate D (remat scope reduction)
   needs HBM headroom analysis.
+
+---
+
+## iter 5 — Greedy on Expert_gmm via candidate C (backward tile audit) — HALTED `lever_blocked_at_library`
+
+- **Class**: Greedy.
+- **Goal**: tighten `_tgmm_tiles` for the 2 production shapes
+  (gate/up `(K=7168, M=131072, N=2048)` and down `(K=2048, M=131072,
+  N=7168)`); reduce 3,026 ms/step in tgmm calls per iter-4 sizing.
+- **Sizing (xla_shell list_fusions on iter-2b xplane)**:
+  - 6× `tgmm.12-17` fusions, 7.99M-8.19M us each (16-pass total) =
+    **3,026 ms/step in tgmm** (out of 11,219 ms/step bwd).
+  - 6× `gmm.12-17` fusions, 4.76M-4.90M us each = 1,800 ms/step
+    (already at-tuned via tokamax `_gmm_tiles`; not a lever).
+  - The leverage gap is in `_tgmm_tiles` specifically, where the comment
+    says "No tokamax data for tgmm".
+- **AOT compile-gate survey** (tpu7x:2x2x1 virtual topology,
+  `megablox.tgmm` direct call). Megablox.tgmm has a **hardcoded ~32 MB
+  scoped VMEM limit and does NOT accept a `vmem_limit_bytes` parameter**
+  (unlike gmm_v2 which uses 48 MB). At the 32 MB cap, the obvious tile
+  components are:
+    - accumulator `[tile_k, tile_n]` in fp32 = `4 × tk × tn` bytes
+    - output window `[1, tile_k, tile_n]` in bf16, double-buffered = `4 × tk × tn`
+    - input window `[tile_m, tile_n]` in bf16, double-buffered = `4 × tm × tn`
+    - + Mosaic ~16 MB internal overhead (prefetch, control structures)
+  - Constraint becomes `4 × tn × (2 × tk + tm) ≤ 16 MB`.
+- **Survey result** (every tile that improves iter-count over baseline FAILS AOT):
+  | tile (tm, tk, tn) | iter | scoped VMEM | AOT |
+  |---|---|---|---|
+  | baseline `(2048, 1024, 1024)` | 896 | 32 MB | OK |
+  | down `(2048, 2048, 1024)` 2× | 448 | 40 MB | FAIL |
+  | down `(4096, 1024, 1024)` 2× | 448 | 40 MB | FAIL |
+  | down `(4096, 2048, 512)` 2× | 448 | **48 MB** | FAIL |
+  | gate/up `(2048, 1024, 2048)` 2× | 448 | 40 MB | FAIL |
+  | gate/up `(4096, 1024, 1024)` 2× | 448 | 40 MB | FAIL |
+- **Conclusion**: the **generic baseline `(2048, 1024, 1024)` is
+  at-optimum within megablox.tgmm's library-fixed 32 MB VMEM cap.**
+  No tile choice yields a clean iter-count reduction. The candidate-C
+  lever is blocked at the megablox library level, not by tile-choice
+  arithmetic.
+- **Reverted** the (failed) tile changes in `kernels/gmm_v2_train.py`;
+  function returns generic only with documentation explaining why.
+- **Halt reason**: `lever_blocked_at_library` (per AGENT.md §13 spirit;
+  not exact match — closest pre-existing reason is `perfsim_unverifiable`
+  but applied to a kernel-library limit, not a perfsim modeling issue).
+  No code change to jax-gpt landed. No cluster cycles consumed (no
+  build, no submit). Total cost: ~5 min of AOT compiles.
+- **Findings to capture in v7x_KNOWLEDGE.md**:
+  1. **megablox.tgmm 32 MB scoped VMEM cap, no vmem_limit_bytes param.**
+     Future iters targeting tgmm efficiency need either (a) an upstream
+     JAX fix exposing `vmem_limit_bytes` (similar to how gmm_v2 already
+     supports it), or (b) a custom Pallas tgmm in jax-gpt that wraps the
+     megablox internals. Both are multi-iter follow-ups.
+  2. **Generic `_tgmm_tiles` at `(2048, 1024, 1024)` is provably-optimal**
+     under the megablox library cap; no tuning win possible without
+     library changes.
+- **Decision for iter-6**: pivot to **candidate A — EP scatter fusion**
+  (1,685 ms fwd headroom + matched bwd savings, possibly 3,000+ ms/step
+  total). Architectural change to gmm_v2 or its downstream `psum_scatter`;
+  needs Pallas correctness validation + AOT compile gate. Higher risk
+  than C would have been, but A's library is in our control (jax-gpt's
+  own Pallas kernels), so the VMEM-cap problem doesn't apply.
+- **Alternative for iter-6**: if A is too high-risk, candidate D
+  (remat scope reduction from `full` to `attn_only`) is worth
+  investigating; needs HBM headroom analysis first.
+- **No PR opened**: revert is in-tree; no perfsim issue files (megablox
+  is upstream JAX, not perfsim — separate dependency).
 - **Corrected framing of iter-3 finding**: the "2.5× in-training overhead"
   was a statistic comparing apples-to-oranges (forward kernel ceiling vs
   forward+bwd in-training). Replaced in v7x_KNOWLEDGE.md §5 with the

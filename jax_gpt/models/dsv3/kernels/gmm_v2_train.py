@@ -55,9 +55,21 @@ def _tgmm_tiles(K: int, M: int, N: int) -> tuple[int, int, int]:
     """Tile sizes for megablox.tgmm. Same default issue.
     For tgmm: lhs[K, M], rhs[M, N]; M is the contraction axis.
     Big tile_m → fewer iterations.
+
+    NOTE: megablox.tgmm has a hardcoded ~32 MB scoped VMEM limit (no
+    vmem_limit_bytes param, unlike gmm_v2). Per autoperf iter-5 AOT survey
+    on tpu7x:2x2x1, all tile choices that would improve iter-count over
+    the generic (2048, 1024, 1024) overflow scoped-VMEM (40-48 MB):
+      gate/up (K=7168, N=2048): baseline 896 iter; (2048,1024,2048) →
+        40 MB FAIL; (4096,1024,1024) → 40 MB FAIL.
+      down (K=2048, N=7168):    baseline 896 iter; (2048,2048,1024) →
+        40 MB FAIL; (4096,1024,1024) → 40 MB FAIL; (4096,2048,512) → 48 MB FAIL.
+    Generic IS at-optimum within megablox.tgmm's library-fixed VMEM cap.
+    The candidate-C lever is blocked at the megablox library level; reducing
+    tgmm time requires either (a) megablox.tgmm exposing vmem_limit_bytes,
+    or (b) a custom Pallas tgmm in jax-gpt that does. Both are multi-iter
+    projects out of scope for the autoperf single-iter Greedy lever.
     """
-    # No tokamax data for tgmm. Reasonable bf16 guess: large tile_m for
-    # contraction efficiency, moderate tile_k/tile_n.
     return (min(M, 2048), min(K, 1024), min(N, 1024))
 
 

@@ -277,12 +277,46 @@ hits the fallback.**
   kernel. Architectural; needs Pallas correctness + AOT compile gate.
 - **B. moe_xlayer_prefetch**: blocked by iter-1's unresolved compile bug
   (don't propose).
-- **C. Backward tile audit**: profile bwd HLO to find `_gmm_tiles`
-  fallback hits at non-tokamax shapes; add tokamax entries or microbench
-  for tgmm.
+- **C. Backward tile audit**: ❌ **iter-5 HALT — lever_blocked_at_library**
+  (2026-05-07). Sizing showed 3,026 ms/step in tgmm (sized via
+  `xla_shell list_fusions`, 6× tgmm.12-17 fusions ~8M us each over
+  16-pass run). AOT compile-gate survey on tpu7x:2x2x1 confirmed
+  **megablox.tgmm has hardcoded 32 MB scoped VMEM and no
+  `vmem_limit_bytes` parameter** (unlike gmm_v2 which accepts 48 MB).
+  All tile choices that improve iter-count over the generic
+  `(2048, 1024, 1024)` exceed scoped-VMEM (40-48 MB) and FAIL AOT.
+  **Generic `_tgmm_tiles` is provably-optimal within library cap**; no
+  tile-tuning win possible. Future iters targeting tgmm need either
+  upstream JAX `vmem_limit_bytes` exposure or a custom in-tree Pallas
+  tgmm. Multi-iter follow-up; out of scope for single-iter Greedy.
 - **D. Remat scope reduction**: switch from `remat=full` to `remat=attn_only`
   for MoE chunks. Saves ~5,400 ms/step in fwd recompute. **Requires HBM
   headroom analysis** — model already runs near runtime-compile limit.
+
+### megablox.tgmm 32 MB scoped VMEM cap (added iter-5, 2026-05-07)
+
+Per AOT compile-gate survey on tpu7x:2x2x1 with `megablox_tgmm` direct
+call, the kernel's per-call scoped VMEM allocation is constrained to ~32
+MB and the function does NOT accept a `vmem_limit_bytes` parameter. The
+cap holds across all tile choices including `(4096, 1024, 1024)`,
+`(2048, 2048, 1024)`, and `(2048, 1024, 2048)` — all FAIL AOT at 40 MB.
+Only the generic `(2048, 1024, 1024)` (16 MB obvious + 16 MB Mosaic
+overhead = exactly 32 MB) compiles cleanly.
+
+**Implication**: any iter targeting tgmm time savings via tile changes
+is blocked. To unblock:
+1. Upstream JAX fix: extend `jax.experimental.pallas.ops.tpu.megablox.gmm.tgmm`
+   to accept `vmem_limit_bytes` (mirroring `gmm_v2`'s API). This is the
+   cleanest path; eligible for filing as JAX-side issue.
+2. Custom in-tree Pallas tgmm in `jax_gpt/models/dsv3/kernels/`. Higher
+   effort but doesn't depend on upstream cooperation.
+
+Pre-existing tokamax-tuned `_gmm_tiles` (used in the d_lhs path) likely
+also runs over the AOT 32 MB cap but works in production runtime — see
+the AOT failure on `transpose_jvp_jit_gmm` with tile `(128, 7168, 1024)`
+in iter-5 first-attempt log. Production scoped-VMEM may be more
+permissive than AOT's; either way, both gmm and tgmm bwd are at-or-near
+their library ceilings.
 
 **Cluster-discovery footnotes for next session**:
 1. Bench JSON marker-delimited stdout is the durable data channel —
