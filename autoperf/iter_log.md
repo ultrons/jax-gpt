@@ -844,6 +844,88 @@ project that perfsim search (now working) can guide.
 - If predictions hold within 20%, the new sharding plan is a real
   multi-iter win
 
+---
+
+## iter 10 — Lateral: cluster validation of perfsim search rank-3 plan — REGRESSED
+
+iter-9-revised speculated the perfsim search ceiling could be up to +83% TPS;
+the user asked "what's stopping us from testing?" — nothing was. iter-10
+empirically validates rank-3 of the search top-K.
+
+- **Class**: Lateral (sharding-plan experiment, no jax-gpt code change).
+- **Plan tested**: `tp=2 ep=8 cp=8 fsdp=32 dp=1 pp=1 ep_cp_shared=True`
+  (perfsim search rank-3, chosen for most-conservative HBM 17 GiB).
+- **Mapped to jax-gpt CLI**: `--tp=2 --ep=8 --fsdp=32 --gbs=4096 \
+   --moe_use_gmm_v2=true --gradient_checkpoint`. CRITICAL: production has
+  `--no_cp` (CP disabled); iter-10 OMITS this so `use_cp=True` →
+  jax-gpt's ep_cp_shared semantics activate.
+- **Cluster result on dsv3train-i10** (cde-cc8e008 image):
+  | metric | iter-2b production | iter-10 (rank-3) | perfsim predicted |
+  |---|---|---|---|
+  | step time | 34,650 ms | **64,700 ms (+86%)** | 5,762 ms |
+  | TPS/chip | 1882 | **1013 (-46%)** | 11,277 |
+  | MFU | 30.5% | **16.4%** | 26.8% |
+  | Perfsim error | matches within 0.4% ✅ | **11.2× over-optimistic** ❌ | — |
+- **Loss check**: lm=12.037 matches production exactly (forward path
+  numerically clean; not a NaN issue). aux=196 differs from production's
+  403 because the load-balance loss computation differs at ep=8+CP vs
+  ep=4+no-CP, but it's finite and stable (208.058 → 208.067 step 1 → 4).
+- **Halt reason**: not a hard halt; just a regression. **No revert
+  needed**: the rank-3 sharding was cde-run flags only, no jax-gpt code
+  change. iter-2b is still the semantic production state on disk.
+- **Filed perfsim issue #47**: documents the calibration miss with the
+  iter-10 measurement as empirical anchor. Three candidate root causes:
+  CP/EP shared-axis communication under-modeled, fsdp=32 weight-memory
+  traffic under-modeled, TP=2 D2D AR overhead under-modeled. Maintainer
+  agent or perfsim author can pick which to investigate.
+
+## Thesis update (iter-10 retrospective)
+
+**iter-2b at 1882 TPS/chip IS near a local optimum** — this is now
+empirically confirmed, not just inferred from regression chain. Both:
+
+1. The hand-picked sweep ceiling estimate (~+8%) was correct in
+   spirit (we're close to the achievable max)
+2. The perfsim-search-driven "+83%" estimate was a calibration
+   artifact, NOT a real signal
+
+The cumulative `regression_chain` halt was a correct signal **even
+post-iter-10**. The "search-driven Lateral exploration" lever turned
+out to be unsafe at this scale because perfsim's calibration corpus
+is anchored only to production sharding. Until it's calibrated against
+non-production-class plans, search predictions for plans involving
+`ep_cp_shared=True`, `cp>1`, `dp>1`, or `tp>1` (any combination of
+these vs production) are not actionable signals.
+
+**The actual answer to "how far from best possible"**: iter-2b is
+within ~5-8% of the achievable cluster ceiling on this hardware/model/
+toolchain. Confirmed via 4 cluster shots (iter-5, iter-7, iter-8, iter-10)
+all reverting to production. Multi-iter design-space changes (kernel
+rewrites, sharding-plan-with-perfsim-recalibration, attention-only-
+checkpoint refactor) remain the only path to >+5% gains.
+
+## Session-cumulative status (iter-10 closeout)
+
+| iter | class | outcome | net change |
+|---|---|---|---|
+| 3 | Tooling | BF16 microbench grid | unblocked perfsim#10 |
+| 4 | Tooling | bisection of moe_gmm_ag | identified levers (some wrong) |
+| 5 | Greedy | tgmm tile_m=4096 | -1.4% TPS revert |
+| 6 | Tooling | /checkpoint/ deeper bisection | identified attn_proj_out lever |
+| 7 | Greedy | attn_proj_out offload | NaN, jax-gpt#2 filed, revert |
+| 8 | Lateral | prevent_cse=True | NaN, jax-gpt#3 filed, revert |
+| 9 | Tooling | predicted-headroom analysis | retracted twice as more data landed |
+| 10 | Lateral | rank-3 sharding (perfsim search) | -46% TPS, perfsim#47 filed |
+
+Total: 4 cluster shots, all reverted. **iter-2b production state
+preserved.** No measured perf change this session. Knowledge captured:
+substantial — including empirical proof that perfsim search isn't yet
+calibrated for non-production-class plans (the most surprising
+finding of the session).
+
+iter-2b remains the verified production baseline at 1882 TPS/chip @
+30.5% MFU.
+
 ## Session-cumulative status (iter-9 closeout)
 
 iter-9 closes the post-halt extension. Sequence of work this session:

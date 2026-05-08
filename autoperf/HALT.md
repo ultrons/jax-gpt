@@ -104,3 +104,29 @@ The iter-9 sizing reframes the "fix #2 + #3" priority: it unlocks ~+5% TPS, real
 4. **Wait for `perfsim#44` fix** — unblocks search-driven Lateral picks.
 
 For overnight progress without user check-in: the Tooling deliverable + perfsim PR is what was achievable. Further single-iter Greedy/Lateral on iter-2b would gamble against the now-quantified small ceiling and risk further reverts.
+
+---
+
+## iter-10 (post-iter-9-revision) — empirical ceiling confirmation
+
+User asked "what's stopping us from testing perfsim's recommended sharding?". Nothing was — submitted as iter-10. **Result: perfsim's prediction was 11× over-optimistic; the rank-3 plan is a -46% TPS regression.**
+
+| | step time | TPS/chip | MFU | perfsim error |
+|---|---|---|---|---|
+| iter-2b production | 34,650 ms | 1882 | 30.5% | matches within 0.4% |
+| iter-10 rank-3 (cluster) | 64,700 ms | 1013 | 16.4% | **11.2× off** |
+| iter-10 rank-3 (perfsim) | 5,762 ms | 11,277 | 26.8% | (the prediction) |
+
+**Implications**:
+1. The "iter-2b is +83% from optimal" hypothesis from iter-9-revised was WRONG. Production IS near a local optimum.
+2. Perfsim search isn't calibrated for non-production-class sharding plans (those involving `ep_cp_shared=True`, `cp>1`, `dp>1`, or `tp>1`). Filed perfsim#47.
+3. Until perfsim is recalibrated, search top-K predictions on alternative-sharding plans should NOT be acted upon as Lateral lever sources.
+
+**Final session score (now updated post-iter-10)**:
+- 4 cluster shots, all reverted (iter-5/7/8/10)
+- 4 issues filed (jax-gpt#2 attn_proj_out NaN, jax-gpt#3 prevent_cse NaN, perfsim#44 search budget, perfsim#47 search calibration miss)
+- 2 perfsim PRs landed (PR#45 closes #26 + #38, PR#46 closes #44)
+- Production state preserved at iter-2b (1882 TPS/chip @ 30.5% MFU)
+- iter-10's most surprising finding: **perfsim search predictions are aspirational, not actionable** until calibrated against non-production-class plans
+
+The thesis is now empirically grounded: iter-2b is within ~5-8% of the cluster-achievable ceiling on this hardware/model/toolchain. Multi-iter scope changes (custom Pallas tgmm, attention-only-checkpoint refactor) remain the only path to >+5% gains.
