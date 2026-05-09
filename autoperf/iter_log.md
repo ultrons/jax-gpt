@@ -1132,7 +1132,7 @@ levers are exhausted on this bottleneck shape. **No cluster shot.**
    change + MMLU re-run. Deferred per `project_fused_gate_up.md`.
 
 **Rehydrate from this iter (compaction-survival contract):**
-- iter: 12 | sha: <pending> | class: Lateral | lever-source: white-paper pattern (Qwen3.5-Coder §HighLevel #2 / #5)
+- iter: 12 | sha: e50dd3f | class: Lateral | lever-source: white-paper pattern (Qwen3.5-Coder §HighLevel #2 / #5)
 - outcome: INFORMATIVE (no cluster run; pattern diagnosed inapplicable single-iter)
 - corpus_anchor: none (no measurement)
 - trust-state delta: NEW v7x_KNOWLEDGE.md §3 entry — "chunk pipelining without compute/collective overlap (~13.4 s exposed; iter-12 HLO finding)". White paper as lever-source noted as inference-skewed.
