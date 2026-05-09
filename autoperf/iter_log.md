@@ -964,3 +964,79 @@ update on `autoperf-loop`, regenerate iter-2 headroom on the v304 xplane to
 refresh the trust table. Most likely top-leaf is still **Expert_gmm** (top-3
 #1 post-PR#22) — but the new curve may shift other leaves. iter-4 picks the
 greedy lever from the refreshed trusted set.
+
+---
+
+## iter 11 — Tooling: perfsim corpus backfill (operationalize Step 12.5)
+
+**Class**: Tooling. **Lever source**: AGENT.md §1 'every cluster shot anchors
+perfsim' + Step 12.5 (mandatory corpus write per cluster shot). **Hypothesis**:
+the iter-10 11.2× perfsim miss happened because no non-production-class plan
+had ever been corpus-anchored. Backfilling corpus entries for the prior
+cluster shots (iter-2b/5/7/8/10) gives perfsim#47 a regression target and
+demonstrates the new harness rule end-to-end before iter-12 acts under it.
+
+**Scope**: no cluster run. Two file ops in the perfsim worktree:
+
+1. **Refresh `dsv3_671b_v7x_4x8x8_train_v304.json` in place** — same plan
+   tuple (tp=1 ep=4 fsdp=128); gmm_v2 is kernel-internal, not parallelism.
+   - measured: 36,970 → **34,659 ms/step** (iter-2b post-gmm_v2; image
+     `cde-fc67b5e`, source `gs://max-experiments/dsv3/profiles/dsv3train-i2b/`)
+   - tolerance: 0.15 → **0.10** (predicted within 0.4% of measured)
+   - new `_iter_history` field documents iter-5/7/8 (all reverted on the
+     same plan tuple — tile_m=4096 -1.4% TPS; attn_proj_out NaN; prevent_cse
+     NaN). Calibration value: confirms v304's plan-class is locally near-
+     optimal under default policy.
+   - top-level `name` changed `v304` → `production` (filename preserved
+     for test-ID stability).
+
+2. **New file `dsv3_671b_v7x_4x8x8_train_iter10_rank3.json`** — first
+   non-production-class entry on this hardware.
+   - plan: `tp=2 ep=8 cp=8 fsdp=32 dp=1 pp=1 ep_cp_shared=True` (perfsim
+     search rank-3). `ep_cp_shared=True` requires `ep == cp` per
+     `perfsim/search.py:342` — cp=8 mandatory.
+   - measured: 64,700 ms / 1013 TPS/chip (cluster -46% vs production)
+   - predicted: 5,762 ms / 11,277 TPS/chip (perfsim search top-K)
+   - **perfsim error: 11.2× over-optimistic**
+   - `skip_test_validation: true` with cite of perfsim#47; remove the skip
+     once #47 lands and prediction is within real tolerance.
+
+**Bug caught en route**: HALT.md and earlier conversation summaries described
+iter-10's plan as "tp=2 ep=8 fsdp=32 use_cp=True ep_cp_shared=True" without
+listing `cp` — a reader (user, 2026-05-09) interpreted that as `cp=1` implicit,
+which would contradict `ep_cp_shared=True`. iter_log.md line 856 records the
+real plan correctly (cp=8). HALT.md updated this iter to make cp=8 unambiguous.
+
+**Output**:
+- perfsim PR `ultrons/perfsim#48` opened on `autoperf-loop` branch.
+- iter-2b's predicted vs measured (0.4%) re-validates AGENT.md §1 'measured
+  agreement justifies tightening tolerance'.
+- iter-10 entry is now the regression target perfsim#47 needs.
+
+**Decision for iter-12**: per AGENT.md §13 (revised), `regression_chain`
+session-end requires regressions across ≥2 distinct lever classes AND ≥1
+white-paper-pattern attempt. We have 0 white-paper-pattern attempts, so the
+session shouldn't end. iter-12 = Greedy/Lateral with `lever_source=white-paper
+pattern`. Bottleneck still 4,216 ms attention-recompute (iter-6 finding;
+trust-state in v7x_KNOWLEDGE.md §3 unchanged). Candidate patterns from the
+Qwen3.5-Coder white paper applicable to this bottleneck shape:
+1. **Local reduction before collective** (white paper §X.X): if any cross-
+   layer or cross-expert reduction can be moved before an EP collective,
+   that's a free latency win. Need to inspect EP_AG_dispatch / EP_RS path
+   for opportunities.
+2. **Eliminate input all-to-all in EP** (white paper §X.X): only applicable
+   if there's an A2A in the EP path that can be folded into a Reduce-Scatter.
+3. **Custom tgmm with vmem_limit_bytes parameter** — re-opens iter-5
+   candidate-C with proper VMEM control. Multi-iter scope.
+
+iter-12 first action: read white paper §3-6 in detail, map specific patterns
+to the iter-2b profile's bottleneck, file pattern-source for the chosen lever.
+
+**Rehydrate from this iter (compaction-survival contract):**
+- iter: 11 | sha: <pending-jax-gpt-commit> | class: Tooling | lever-source: harness-rule-operationalization (AGENT.md Step 12.5)
+- outcome: INFORMATIVE (no cluster run) | metric: n/a (no measurement)
+- corpus_anchor: dsv3_671b_v7x_4x8x8_train_v304.json (refreshed; tolerance 0.10 / perfsim_delta 0.4%) + dsv3_671b_v7x_4x8x8_train_iter10_rank3.json (new; skip_test_validation true / perfsim#47 target)
+- trust-state delta: none (no new trust changes; v7x_KNOWLEDGE.md §3 broken-levers unchanged)
+- BLOCKED rows opened/closed: marked stale-as-resolved perfsim#25 + #26 in BLOCKED.md (both already closed upstream). Open: jax-gpt#2, jax-gpt#3, perfsim#47.
+- in-flight cluster runs: none
+- next-iter starting point: read `~/uLLM-Qwen3-Coder-480B-Optimization-White-Paper.pdf` §3-6 (white-paper-pattern catalog), map to iter-2b bottleneck (4,216 ms attention-recompute per iter-6 / v7x_KNOWLEDGE.md §3), pick a single pattern for iter-12 Lateral. Also: open `ultrons/perfsim#48` should be reviewer-merged async — no blocking on it.

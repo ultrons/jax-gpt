@@ -109,7 +109,7 @@ For overnight progress without user check-in: the Tooling deliverable + perfsim 
 
 ## iter-10 (post-iter-9-revision) — empirical ceiling confirmation
 
-User asked "what's stopping us from testing perfsim's recommended sharding?". Nothing was — submitted as iter-10. **Result: perfsim's prediction was 11× over-optimistic; the rank-3 plan is a -46% TPS regression.**
+User asked "what's stopping us from testing perfsim's recommended sharding?". Nothing was — submitted as iter-10. **Plan tested: tp=2 ep=8 cp=8 fsdp=32 dp=1 pp=1 ep_cp_shared=True** (perfsim search rank-3). [ep_cp_shared=True requires ep == cp per perfsim/search.py:342, so cp=8 is mandatory; in jax-gpt this maps to omitting `--no_cp` so cfg.use_cp=True activates CP-on-EP-axis.] **Result: perfsim's prediction was 11× over-optimistic; the rank-3 plan is a -46% TPS regression.**
 
 | | step time | TPS/chip | MFU | perfsim error |
 |---|---|---|---|---|

@@ -54,8 +54,12 @@ Two new perfsim issues filed. Both autoperf-blocking class for trust-table coher
 
 | iter | workload | repo#issue | filed | status |
 |---|---|---|---|---|
-| 4-housekeeping | dsv3_train_full | ultrons/perfsim#25 | 2026-05-07 | **OPEN** — P1: Norms predicted collapsed to ~0.1ms post-PR#22 (was 207ms iter-2). Top-3 inclusion of Norms is artifact, not real signal. Until fixed, Norms NOT-trusted. |
-| 4-housekeeping | dsv3_train_full | ultrons/perfsim#26 | 2026-05-07 | **OPEN** — P2: LEAF_PATTERNS_TRAINING Expert_gmm rule needs gmm_v2/tpu_custom_call fusion-name match. Post-iter-2b xplanes under-count Expert_gmm measured. Workaround: compare against v304 (pre-gmm_v2) xplane for clean Expert_gmm bucketing. |
+| 4-housekeeping | dsv3_train_full | ultrons/perfsim#25 | 2026-05-07 | resolved 2026-05-08 (closed upstream; verified iter-11 step 1) |
+| 4-housekeeping | dsv3_train_full | ultrons/perfsim#26 | 2026-05-07 | resolved 2026-05-07 (PR#45 — `d3ec087`; tuple-fallback for shape-query) |
+| 11-tooling | dsv3_train_full | ultrons/perfsim#47 | 2026-05-08 | **OPEN** — search calibration miss for ep_cp_shared / cp>1 / dp>1 / tp>1 plans. iter-10 produced 11.2× over-optimistic prediction. iter-11 backfilled the corpus anchor (`dsv3_671b_v7x_4x8x8_train_iter10_rank3.json`) as the regression target. NOT autoperf-blocking — search top-K can still inform Lateral picks for production-class plans. |
+| 11-tooling | dsv3_train_full | ultrons/jax-gpt#2 | 2026-05-08 | **OPEN** — attn_proj_out checkpoint offload produces NaN at step 1. Blocks ~+5% TPS via offload-list extension. Multi-iter-scope alternative: attention-only-checkpoint refactor. |
+| 11-tooling | dsv3_train_full | ultrons/jax-gpt#3 | 2026-05-08 | **OPEN** — `prevent_cse=True` produces NaN at step 1; same family as #2. Likely shared root cause in offload-restore path. Fixing #2 may fix #3. |
+| 11-tooling | dsv3_train_full | ultrons/perfsim#48 | 2026-05-09 | **OPEN PR (not issue)** — corpus backfill for iter-2b refresh + iter-10 anchor. NOT autoperf-blocking; review/merge happens async outside the harness loop per AGENT.md §0. |
 
 ## Autoperf-side tasks blocking perfsim issues
 
