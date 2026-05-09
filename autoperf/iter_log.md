@@ -1204,7 +1204,7 @@ for chunk-0 (overlapped with chunk-1 compute) but not chunk-1 (body-tail
 exposure). This is the structural form of the ~2.4% recoverable headroom.
 
 **Rehydrate from this iter (compaction-survival contract):**
-- iter: 13 | sha: <pending> | class: Tooling | lever-source: iter-12 surfaced bottleneck; multi-iter #1 authorized
+- iter: 13 | sha: b52365a | class: Tooling | lever-source: iter-12 surfaced bottleneck; multi-iter #1 authorized
 - outcome: INFORMATIVE (no cluster run; deep diagnostic on chunk-pipelining)
 - corpus_anchor: none (no measurement)
 - trust-state delta: NEW v7x_KNOWLEDGE.md §3 entry already landed iter-12 (chunk pipelining without overlap); iter-13 refines mechanism = body-tail exposure under TC serialization
