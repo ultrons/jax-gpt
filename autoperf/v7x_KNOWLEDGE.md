@@ -74,7 +74,7 @@ libtpu  0.0.41.dev20260417+nightly   ← reverted from dev20260504 due to Bug 1
 |---|---|---|---|---|
 | Bug 1 | NEW libtpu (dev20260504) NaN at production baseline | Pinned libtpu to dev20260417 | (none — fixed in-tree) | 2026-05-05 |
 | Bug 2 | scan grad_accum > 1 + remat + vjp produces NaN cotangents | Use `--grad_accum=1` | task #43 | 2026-05-05 |
-| Bug 3 | n_chunks=4 MoE body produces NaN cotangents in bwd (any libtpu) | Use `--moe_n_chunks=2` | task #44 | 2026-05-05 |
+| Bug 3 | n_chunks=4 MoE body produces NaN cotangents in bwd (any libtpu) | Use `--moe_n_chunks=2` | task #44 | 2026-05-05 (multiple fix attempts failed) |
 | Bug 4 | PDBS=1 (gbs=512 at fsdp=128 ep=4) produces NaN at mini config | Use `--gbs ≥ 1024` (PDBS ≥ 2) | task #45 | 2026-05-05 |
 | Bug 5 | `attn_proj_out` checkpoint offload produces NaN at step 1 (production scale) | Don't add to offload list (jax-gpt model.py:3054) | jax-gpt#2 | 2026-05-08 |
 | Bug 6 | `jax.checkpoint(prevent_cse=True)` produces NaN at step 1; same family as #2 | Keep `prevent_cse=False` (current code default) | jax-gpt#3 | 2026-05-08 |
@@ -87,28 +87,23 @@ yamls bake these in.
 
 ### Operational findings (NOT bugs, just shape-of-the-bottleneck)
 
-- **moe_gmm_ag chunk pipelining without compute/collective overlap** (iter-12
-  HLO finding, 2026-05-09). The `_expert_mlp_gmm_ag_body` runs n_chunks=2;
-  HLO shows 2 distinct `reduce-scatter` ops at IDs 84/94 (single-operand
-  each — XLA combiner is correctly **not merging** them). However, each
-  reduce-scatter has ~6.8 s self-time; combined ~13.4 s exposed stall
-  (~2.4% of step). XLA scheduler is failing to overlap these collectives
-  with the TC compute on the other chunk. The `optimization_barrier` was
-  intentionally REMOVED in v323 to allow overlap (model.py:1745-1748
-  comment), but the overlap isn't achieving its intended value. Multi-iter
-  scope to investigate (collective ordering hints, alternative barrier
-  placement, staggered_call wrapper). **Implication**: ~2.4% TPS sits in
-  this overlap gap and is recoverable IF the scheduling can be coerced.
-- **White paper as a lever-source has training-coverage gaps** (iter-12
-  meta-finding, 2026-05-09). The Qwen3.5-Coder white paper's optimization
-  catalog skews INFERENCE-side. Training-specific bottlenecks
-  (autodiff transpose of collectives, recompute-policy levers,
-  weight-sharding-for-grad accumulators) are systematically
-  underrepresented. AGENT.md §13 "≥1 white-paper-pattern attempt" before
-  cumulative halt should be reinterpreted on training workloads as
-  "diagnose-from-white-paper-and-find-it-doesn't-apply" being a valid
-  attempt outcome.
-
+- **moe_gmm_ag chunk pipelining: chunk-0 overlaps cleanly, chunk-1
+  body-tail-exposes** (iter-12 HLO + iter-13 timeline, 2026-05-09).
+  `_expert_mlp_gmm_ag_body` runs n_chunks=2 on v7x; SC offload makes
+  RS async (mini_chunk_repro/FINDINGS.md was on v4 with sync RS).
+  iter-13 timeline: **chunk0's RS.86 fully overlaps with chunk1's TC
+  compute (15.7ms hidden)** ✓; **chunk1's RS.84 fires at t=913555us
+  when its scatter operand becomes ready, then the body has only
+  RS.84.done + concat left → 7.9ms wire time fully exposed** ✗.
+  Mechanism: the two chunks' TC compute serializes (one TC, two halves);
+  whichever RS issues second has nothing left in the body to hide
+  behind. `jnp.concatenate` at line 1871 + moe_scan body boundary force
+  a sync, blocking cross-iter prefetch. **Implication**: ~2.4% TPS in
+  the body-tail. Path A (n_chunks=4 = smaller tail) blocked by Bug 3
+  (failed multiple fix attempts: 3756666 barrier, fb17291 v341n
+  serializing barrier, ff41a58 scan conversion). Path C (collective
+  fusion: scatter+RS → direct AR) is the active multi-iter pursuit
+  per autoperf iter-13.
 ---
 
 ## 4. JAX/XLA operational pitfalls (learned the hard way)

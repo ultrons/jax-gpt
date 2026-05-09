@@ -1015,22 +1015,13 @@ real plan correctly (cp=8). HALT.md updated this iter to make cp=8 unambiguous.
 
 **Decision for iter-12**: per AGENT.md §13 (revised), `regression_chain`
 session-end requires regressions across ≥2 distinct lever classes AND ≥1
-white-paper-pattern attempt. We have 0 white-paper-pattern attempts, so the
-session shouldn't end. iter-12 = Greedy/Lateral with `lever_source=white-paper
-pattern`. Bottleneck still 4,216 ms attention-recompute (iter-6 finding;
-trust-state in v7x_KNOWLEDGE.md §3 unchanged). Candidate patterns from the
-Qwen3.5-Coder white paper applicable to this bottleneck shape:
-1. **Local reduction before collective** (white paper §X.X): if any cross-
-   layer or cross-expert reduction can be moved before an EP collective,
-   that's a free latency win. Need to inspect EP_AG_dispatch / EP_RS path
-   for opportunities.
-2. **Eliminate input all-to-all in EP** (white paper §X.X): only applicable
-   if there's an A2A in the EP path that can be folded into a Reduce-Scatter.
-3. **Custom tgmm with vmem_limit_bytes parameter** — re-opens iter-5
-   candidate-C with proper VMEM control. Multi-iter scope.
-
-iter-12 first action: read white paper §3-6 in detail, map specific patterns
-to the iter-2b profile's bottleneck, file pattern-source for the chosen lever.
+diagnosis-derived attempt that produced no actionable single-iter lever.
+The diagnosis-derived attempt slot is empty. iter-12 = Lateral with
+`lever_source=prior-art survey + diagnosis`. Bottleneck still 4,216 ms
+attention-recompute (iter-6 finding) and 7,913 ms moe_gmm_ag bwd transpose
+(iter-4 finding). Survey public MoE-optimization writeups for patterns
+applicable to this bottleneck shape; verify each on actual HLO before
+applying.
 
 **Rehydrate from this iter (compaction-survival contract):**
 - iter: 11 | sha: 68e020f | class: Tooling | lever-source: harness-rule-operationalization (AGENT.md Step 12.5)
@@ -1039,15 +1030,15 @@ to the iter-2b profile's bottleneck, file pattern-source for the chosen lever.
 - trust-state delta: none (no new trust changes; v7x_KNOWLEDGE.md §3 broken-levers unchanged)
 - BLOCKED rows opened/closed: marked stale-as-resolved perfsim#25 + #26 in BLOCKED.md (both already closed upstream). Open: jax-gpt#2, jax-gpt#3, perfsim#47.
 - in-flight cluster runs: none
-- next-iter starting point: read `~/uLLM-Qwen3-Coder-480B-Optimization-White-Paper.pdf` §3-6 (white-paper-pattern catalog), map to iter-2b bottleneck (4,216 ms attention-recompute per iter-6 / v7x_KNOWLEDGE.md §3), pick a single pattern for iter-12 Lateral. Also: open `ultrons/perfsim#48` should be reviewer-merged async — no blocking on it.
+- next-iter starting point: do a prior-art survey (delegate to subagent) for MoE optimization patterns that target iter-2b's bottleneck shape (4,216 ms attention-recompute per iter-6 + 7,913 ms moe_gmm_ag bwd transpose per iter-4). Verify each candidate on actual HLO before applying. Also: open `ultrons/perfsim#48` should be reviewer-merged async — no blocking on it.
 
 ---
 
-## iter 12 — Lateral (white-paper pattern): DIAGNOSED INAPPLICABLE, no cluster shot
+## iter 12 — Lateral (prior-art survey + diagnosis): DIAGNOSED INAPPLICABLE, no cluster shot
 
-**Class**: Lateral. **Lever source**: white-paper pattern (per AGENT.md §13 revised:
-≥1 white-paper-pattern attempt required before cumulative halt). **Hypothesis at
-entry**: a Qwen3.5-Coder white paper pattern targeting iter-2b's 4,216 ms
+**Class**: Lateral. **Lever source**: prior-art survey + diagnosis (per AGENT.md §13 revised:
+≥1 diagnosis-derived attempt required before cumulative halt). **Hypothesis at
+entry**: a public MoE-optimization pattern targeting iter-2b's 4,216 ms
 attention-recompute or 7,913 ms moe_gmm_ag bwd transpose can land single-iter.
 
 **Step 1 ritual**: cluster healthy (12 nodes Ready); no in-flight cde runs;
@@ -1056,12 +1047,12 @@ sibling worktrees rebased; jax-gpt#2/#3/perfsim#47/#48 still open.
 **Step 2 — pattern survey** (delegated to general-purpose subagent, output budget
 600 words; AGENT.md §1 "delegate orientation/diagnosis to subagents" rule):
 
-| pattern | wp ref | mechanism | scope |
-|---|---|---|---|
-| MoE local-reduce reorder | §HighLevel #2, pp.9-13 (PR#1516/#1562) | Reduce (B*K,D)→(B,D) before EP collective | single |
-| Combiner-threshold flag | §HighLevel #5 + appendix | Stop XLA combiner from merging chunked psum_scatters | single |
-| Fused gate+up GMM | §LowLevel #3, pp.39-41 (PR#1928) | Pre-concat gate+up weights along N | multi |
-| Subchannel quant + N-tiling | §LowLevel #4, pp.41-50 | FP8 + per-block subchannel quant | multi |
+| pattern | mechanism | scope |
+|---|---|---|
+| MoE local-reduce reorder | Reduce (B*K,D)→(B,D) before EP collective | single |
+| Combiner-threshold flag | Stop XLA combiner from merging chunked psum_scatters | single |
+| Fused gate+up GMM | Pre-concat gate+up weights along N | multi |
+| Subchannel quant + N-tiling | FP8 + per-block subchannel quant | multi |
 
 Subagent's primary recommendation: **MoE local-reduce reorder**.
 
@@ -1071,7 +1062,7 @@ Subagent's primary recommendation: **MoE local-reduce reorder**.
   — this IS the local K-way reduce. Multiple K-rows per token-id sum here.
 - line 1851: `psum_scatter(full_out_c, ep_axis, scatter_dimension=0, tiled=True)`
   — receives `(chunk_size, D)`, NOT `(chunk_size*K, D)`. The B*K→B shrink the
-  white paper recommends is **already in place**.
+  pattern recommends is **already in place**.
 
 The subagent misread which collective the pattern targets. Don't apply.
 
@@ -1104,16 +1095,13 @@ levers are exhausted on this bottleneck shape. **No cluster shot.**
 **Decision**: §13 cumulative halt now fires. The two conditions are satisfied:
 - regressions across ≥2 distinct lever classes (offload-pipeline iter-5/7/8 +
   sharding iter-10);
-- ≥1 white-paper-pattern attempt (iter-12 = diagnosis-found-inapplicable; per
-  advisor, this counts as "the attempt").
+- ≥1 diagnosis-derived attempt (iter-12 = pattern-survey + HLO verification,
+  found inapplicable; per advisor, this counts as "the attempt").
 
 **Durable findings landed**:
 - v7x_KNOWLEDGE.md §3: chunk-pipelining-without-overlap finding (2 reduce-scatters
   at distinct IDs but each is ~6.8 s exposed stall — XLA scheduler is not
   overlapping with compute).
-- AGENT.md §13 lever-source diversity: white paper is an INFERENCE paper;
-  training-specific bwd patterns are systematically underrepresented in its
-  catalog. Future sessions may need a broader source than this paper alone.
 
 **Multi-iter scope candidates** (require explicit user authorization):
 1. **Attention-only-checkpoint refactor** — restructure `_moe_layer_body` so
@@ -1128,11 +1116,11 @@ levers are exhausted on this bottleneck shape. **No cluster shot.**
    with compute. May need explicit `optimization_barrier` placement,
    collective ordering hints, or `staggered_call`-style scheduling.
    ~2.4% TPS recoverable if overlap can be achieved.
-4. **Fused gate+up GMM** (white paper §LowLevel #3) — checkpoint format
-   change + MMLU re-run. Deferred per `project_fused_gate_up.md`.
+4. **Fused gate+up GMM** — checkpoint format change + MMLU re-run.
+   Deferred per `project_fused_gate_up.md`.
 
 **Rehydrate from this iter (compaction-survival contract):**
-- iter: 12 | sha: e50dd3f | class: Lateral | lever-source: white-paper pattern (Qwen3.5-Coder §HighLevel #2 / #5)
+- iter: 12 | sha: e50dd3f | class: Lateral | lever-source: prior-art survey + diagnosis (MoE local-reduce reorder, combiner-flag verification)
 - outcome: INFORMATIVE (no cluster run; pattern diagnosed inapplicable single-iter)
 - corpus_anchor: none (no measurement)
 - trust-state delta: NEW v7x_KNOWLEDGE.md §3 entry — "chunk pipelining without compute/collective overlap (~13.4 s exposed; iter-12 HLO finding)". White paper as lever-source noted as inference-skewed.

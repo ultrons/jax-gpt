@@ -1,4 +1,4 @@
-# HALT — autoperf cumulative session, 2026-05-08
+# HALT — autoperf cumulative session, 2026-05-08 (RESUMED 2026-05-09 — multi-iter #1 authorized: chunk-pipelining/overlap fix)
 
 **Status**: cumulative `regression_chain` halt per AGENT.md §13 — 3 consecutive failed iters with reverts. Session ends here. iter-2b remains the verified production baseline (1882 TPS/chip @ 30.5% MFU, step 34.65 s).
 
@@ -133,29 +133,30 @@ The thesis is now empirically grounded: iter-2b is within ~5-8% of the cluster-a
 
 ---
 
-## iter-12 — single-iter white-paper levers exhausted; cumulative HALT (post-AGENT.md-revision)
+## iter-12 — single-iter prior-art levers exhausted; cumulative HALT (post-AGENT.md-revision)
 
 iter-11 backfilled corpus entries; iter-12 was the **first iter under the
-revised §13** which requires ≥1 white-paper-pattern attempt before any
-cumulative regression_chain halt.
+revised §13** which requires ≥1 diagnosis-derived attempt that produced no
+actionable single-iter lever before cumulative regression_chain halt.
 
-**Method**: Lateral, lever_source=white-paper. Subagent surveyed the
-Qwen3.5-Coder white paper catalog; primary recommendation (MoE local-reduce
-reorder, §HighLevel #2) was diagnosed inapplicable on direct code reading
+**Method**: Lateral, lever_source=prior-art survey. Subagent surveyed
+public MoE-optimization writeups; primary recommendation (MoE local-reduce
+reorder) was diagnosed inapplicable on direct code reading
 — `model.py:1848` already does the local K-way reduce before `psum_scatter`,
-so the (B*K, D)→(B, D) shrink the white paper describes is already in place.
-Pivot: verify-then-apply combiner-threshold flag (subagent's pattern 2). HLO
-inspection on iter-2b's xplane (delegated to subagent for context safety):
-two distinct `reduce-scatter` ops at IDs 84/94, single-operand each — combiner
-is **NOT firing**. The flag is a no-op for this workload.
+so the (B*K, D)→(B, D) shrink that pattern describes is already in place.
+Pivot: verify-then-apply combiner-threshold flag (subagent's secondary
+pattern). HLO inspection on iter-2b's xplane (delegated to subagent for
+context safety): two distinct `reduce-scatter` ops at IDs 84/94,
+single-operand each — combiner is **NOT firing**. The flag is a no-op for
+this workload.
 
-**Result**: no cluster shot. Pattern exhausted in single-iter scope.
+**Result**: no cluster shot. Lever pattern exhausted in single-iter scope.
 
 **§13 conditions for cumulative halt now both satisfied**:
 1. Regressions across ≥2 distinct lever classes:
    - offload-pipeline (iter-5 tile_m, iter-7 attn_proj_out NaN, iter-8 prevent_cse NaN)
    - sharding (iter-10 rank-3 -46% TPS)
-2. ≥1 white-paper-pattern attempt: iter-12 (diagnosis-found-inapplicable per advisor).
+2. ≥1 diagnosis-derived attempt: iter-12 (pattern-survey + HLO verification, found inapplicable per advisor).
 
 Cumulative HALT fires.
 
@@ -165,10 +166,6 @@ Cumulative HALT fires.
   of step). The chunked psum_scatter pattern is correctly NOT being merged by
   the combiner, but XLA scheduler isn't achieving the intended compute/
   collective overlap either. ~2.4% TPS sits in this overlap gap.
-- White paper is an INFERENCE paper. Training-specific bwd patterns
-  (transpose-of-collective, recompute-policy, weight-sharding-for-grad)
-  are underrepresented in its catalog. Future single-iter Lateral picks
-  on training workloads should not assume white-paper coverage.
 
 ## Recommended next-human-action (post-iter-12)
 

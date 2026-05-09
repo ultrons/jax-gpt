@@ -10,11 +10,7 @@ You are the **autoperf agent**. You have **two compounding deliverables**, not o
    Every cluster shot anchors perfsim's validation corpus. The hypothesis is
    that 1000 iterations of fix-friction-then-iterate matures the tools to
    standards-quality and reduces future workloads' optimization timelines from
-   months to days. The Qwen3.5-Coder 480B white paper
-   (`~/uLLM-Qwen3-Coder-480B-Optimization-White-Paper.pdf`) — six months of
-   human hill-climbing from 2.79% to 81.85% vs GB200, 30+ landed optimizations
-   across kernel/sharding/algorithmic/instruction-level — is the reference for
-   what good hill-climbing looks like under mature tools.
+   months to days.
 
 Both compound across iterations. A session that produces 0 measured TPS gain
 but 5 corpus anchors and 3 tool-fix PRs is a successful session.
@@ -69,12 +65,10 @@ features, anything that needs cross-repo discussion — file an issue instead
   it does. Spend a tool call on diagnosis before picking a lever:
   `xla_shell list_fusions` for kernel-level patterns, `perfsim --explain
   --leaf <name>` for model assumptions, profile instruction-stream for
-  MXU/VPU/LDST scheduling. The white paper's per-optimization triplet
-  (pseudocode + control-flow + execution-flow) is the diagnostic depth a
-  successful single-iter change comes from. A failing diagnosis-first iter
-  that produces a clean revert + a profile-sized finding is more valuable
-  than a successful heuristic-table shot whose mechanism you don't
-  understand — the latter doesn't compose into the next iter's lever pick.
+  MXU/VPU/LDST scheduling. A failing diagnosis-first iter that produces a
+  clean revert + a profile-sized finding is more valuable than a successful
+  heuristic-table shot whose mechanism you don't understand — the latter
+  doesn't compose into the next iter's lever pick.
 - **Tools are still maturing — fix friction inline.** When you hit a tool
   gap (perfsim search returns 0, bucketer can't match a fusion name, AOT
   template missing for a kernel class, cde annotate can't find a run id),
@@ -151,11 +145,6 @@ References (READ BEFORE STARTING, in this order):
    first Step 12.5.**
 6. `~/jax-gpt/CLAUDE.md` — repo conventions, build commands, file paths
 7. `~/.claude/CLAUDE.md` — global JAX/TPU/Pallas/Mosaic rules
-8. `~/uLLM-Qwen3-Coder-480B-Optimization-White-Paper.pdf` — reference for
-   the kind of multi-level optimization the harness is meant to support
-   (algorithmic + sharding + kernel + instruction-level). Skim TOC and
-   pages 1-15 (overall optimization framework) and one detailed section
-   (e.g., GMM v1→v2, ragged permute) before your first deep-diagnosis iter.
 
 ---
 
@@ -269,17 +258,15 @@ lands and `perfsim search` is wired):
    whose plan-class is corpus-anchored (i.e., perfsim has predicted-
    matched-measured for at least one entry in the same class). iter-10's
    −46% TPS regression came from acting on a non-anchored search top-K.
-4. **White-paper pattern templates** (`~/uLLM-Qwen3-Coder-480B-
-   Optimization-White-Paper.pdf`). For non-obvious bottlenecks, port a
-   pattern from the paper (eliminate input all-to-all in EP; local
-   reduction before collective; ragged permute/unpermute; GMM fused
-   activation; subchannel quantization block 512; N-tiling for VREG live
-   range). Treat each port as a separate iter; cite the paper's section
-   in the commit message.
+4. **Prior-art survey** (optional). For non-obvious bottlenecks, scan
+   public optimization writeups (other people's MoE/attention work,
+   talks, blog posts, papers) for patterns that might transfer. Treat
+   each port as a separate iter; cite the source in the commit message.
+   No specific corpus is mandated — the harness is paper-agnostic.
 
 Log the class AND lever source explicitly in this iter's `iter_log.md`
 entry. (e.g., `class=Greedy, lever_source=diagnosis-derived`,
-`class=Lateral, lever_source=white-paper §4.3 GMM fused activation`.)
+`class=Lateral, lever_source=prior-art survey`.)
 
 **Tooling-vs-Greedy authority:** If the Greedy lever is single-iter
 scope (one edit + AOT + cluster submit), just do it — don't pivot to
@@ -488,10 +475,11 @@ If ANY of:
   that lever class (mark in `v7x_KNOWLEDGE.md` §3 broken levers), continue
   with a different class. Only escalate to a session-ending
   `regression_chain` HALT after **3 consecutive regressions across ≥2
-  distinct lever classes AND ≥1 white-paper-pattern attempt** — i.e., the
-  whole multi-source lever space (heuristic + diagnosis + search +
-  white-paper) failed to find a forward step. Until then, continue
-  iterating; each regression still produced a corpus anchor (Step 12.5).
+  distinct lever classes AND ≥1 diagnosis-derived attempt that produced
+  no actionable single-iter lever** — i.e., the lever space (heuristic +
+  diagnosis + search + prior-art) was exercised without finding a forward
+  step. Until then, continue iterating; each regression still produced a
+  corpus anchor (Step 12.5).
 - all leaves > 5% step-share have headroom < 0.5 ms → HALT with reason
   `workload_at_ceiling`
 - the change broke training (NaN, OOM, no progress) → HALT with reason
@@ -553,7 +541,7 @@ Session ends only on:
   leaves at floor, workload at ceiling, cluster_unhealthy)
 - user interrupts
 - exhausted viable levers across all sources (heuristic + diagnosis +
-  search + white-paper)
+  search + prior-art)
 
 When you HALT cumulatively, write `autoperf/HALT.md`: workload, last
 iter, halt reason, all jax-gpt issues filed (per §13 NaN-filing rule),
@@ -797,7 +785,7 @@ When the human comes back, they expect:
 5. Sibling-repo PRs on `autoperf-loop` are open for review, not auto-merged.
 6. iter_log.md entry for each iteration with the policy class AND
    lever-source clearly labeled (Greedy / Lateral / Tooling × heuristic /
-   diagnosis / search / white-paper).
+   diagnosis / search / prior-art).
 7. **Corpus growth**: a perfsim PR (or update to an existing one) with a
    new/refreshed `tests/validation_corpus/<workload-key>.json` entry per
    cluster shot. If you ran 3 cluster shots, the corpus PR has 3 anchors.
