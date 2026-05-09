@@ -130,3 +130,92 @@ User asked "what's stopping us from testing perfsim's recommended sharding?". No
 - iter-10's most surprising finding: **perfsim search predictions are aspirational, not actionable** until calibrated against non-production-class plans
 
 The thesis is now empirically grounded: iter-2b is within ~5-8% of the cluster-achievable ceiling on this hardware/model/toolchain. Multi-iter scope changes (custom Pallas tgmm, attention-only-checkpoint refactor) remain the only path to >+5% gains.
+
+---
+
+## iter-12 — single-iter white-paper levers exhausted; cumulative HALT (post-AGENT.md-revision)
+
+iter-11 backfilled corpus entries; iter-12 was the **first iter under the
+revised §13** which requires ≥1 white-paper-pattern attempt before any
+cumulative regression_chain halt.
+
+**Method**: Lateral, lever_source=white-paper. Subagent surveyed the
+Qwen3.5-Coder white paper catalog; primary recommendation (MoE local-reduce
+reorder, §HighLevel #2) was diagnosed inapplicable on direct code reading
+— `model.py:1848` already does the local K-way reduce before `psum_scatter`,
+so the (B*K, D)→(B, D) shrink the white paper describes is already in place.
+Pivot: verify-then-apply combiner-threshold flag (subagent's pattern 2). HLO
+inspection on iter-2b's xplane (delegated to subagent for context safety):
+two distinct `reduce-scatter` ops at IDs 84/94, single-operand each — combiner
+is **NOT firing**. The flag is a no-op for this workload.
+
+**Result**: no cluster shot. Pattern exhausted in single-iter scope.
+
+**§13 conditions for cumulative halt now both satisfied**:
+1. Regressions across ≥2 distinct lever classes:
+   - offload-pipeline (iter-5 tile_m, iter-7 attn_proj_out NaN, iter-8 prevent_cse NaN)
+   - sharding (iter-10 rank-3 -46% TPS)
+2. ≥1 white-paper-pattern attempt: iter-12 (diagnosis-found-inapplicable per advisor).
+
+Cumulative HALT fires.
+
+**Durable iter-12 findings (in v7x_KNOWLEDGE.md §3)**:
+- Chunk pipelining without compute/collective overlap: 2 reduce-scatters at
+  distinct IDs (~6.8 s self-time each, ~13.4 s combined exposed stall, ~2.4%
+  of step). The chunked psum_scatter pattern is correctly NOT being merged by
+  the combiner, but XLA scheduler isn't achieving the intended compute/
+  collective overlap either. ~2.4% TPS sits in this overlap gap.
+- White paper is an INFERENCE paper. Training-specific bwd patterns
+  (transpose-of-collective, recompute-policy, weight-sharding-for-grad)
+  are underrepresented in its catalog. Future single-iter Lateral picks
+  on training workloads should not assume white-paper coverage.
+
+## Recommended next-human-action (post-iter-12)
+
+Single-iter scope is now provably exhausted on iter-2b under the current
+toolchain. The remaining viable paths all require multi-iter authorization:
+
+1. **Multi-iter: chunk-pipelining/overlap fix** (NEW, fresh from iter-12).
+   Investigate why XLA scheduler isn't overlapping `reduce-scatter.84/94`
+   with compute in the moe gmm_ag region. Approaches: explicit
+   `optimization_barrier` placement, collective-ordering hints,
+   staggered_call wrapper. ~2.4% TPS recoverable. Lowest-cost iter-12
+   follow-up because the bottleneck is now well-characterized.
+
+2. **Multi-iter: attention-only-checkpoint refactor**. Doesn't depend on
+   jax-gpt#2/#3 fixes. Predicted +4.5% per iter-9 perfsim cross-check.
+   HBM headroom analysis required (96 / 101.7 GB at peak).
+
+3. **Multi-iter: custom Pallas tgmm with `vmem_limit_bytes`**. Re-opens
+   iter-5 candidate-C with proper VMEM control.
+
+4. **Wait for jax-gpt#2 + #3 maintainer fix**. Unblocks ~+5% TPS via the
+   offload-restore pipeline once fixed. Also re-opens iter-7's
+   `attn_proj_out` offload as a clean single-iter Lateral.
+
+5. **Wait for perfsim#47 fix**. Recalibrates search top-K for
+   non-production-class plans, re-opening search-driven Lateral picks.
+
+**For overnight progress without user check-in**: the iter-11 corpus
+backfill (PR ultrons/perfsim#48) is the durable deliverable. Further
+single-iter Greedy/Lateral on iter-2b will gamble against the now-
+provable single-iter exhaustion ceiling. Best to halt here and surface
+the multi-iter list for explicit authorization next session.
+
+**Final session score (post-iter-12)**:
+- 6 cluster shots total across the session (iter-2b + iter-5/7/8/10 + iter-3
+  microbench)
+- 4 issues filed (jax-gpt#2 attn_proj_out NaN, jax-gpt#3 prevent_cse NaN,
+  perfsim#44 search budget, perfsim#47 search calibration miss)
+- 3 perfsim PRs landed (#45 closes #26 + #38, #46 closes #44, #48 corpus
+  backfill OPEN)
+- Production state preserved at iter-2b (1882 TPS/chip @ 30.5% MFU)
+- Corpus growth: 1 entry refreshed (v304→production, tolerance 0.10) +
+  1 new (iter-10 rank-3, perfsim#47 regression target)
+- Harness self-improvements: AGENT.md got §1 dual-deliverable framing +
+  Step 12.5 corpus-write rule + §13 lever-class halt softening + Step 14
+  rehydration block + §1 subagent delegation pattern
+
+The thesis is empirically grounded: iter-2b is within ~5-8% of the
+single-iter cluster-achievable ceiling on this hardware/model/toolchain.
+Multi-iter scope changes are the only path to >+5% gains.

@@ -1040,3 +1040,102 @@ to the iter-2b profile's bottleneck, file pattern-source for the chosen lever.
 - BLOCKED rows opened/closed: marked stale-as-resolved perfsim#25 + #26 in BLOCKED.md (both already closed upstream). Open: jax-gpt#2, jax-gpt#3, perfsim#47.
 - in-flight cluster runs: none
 - next-iter starting point: read `~/uLLM-Qwen3-Coder-480B-Optimization-White-Paper.pdf` §3-6 (white-paper-pattern catalog), map to iter-2b bottleneck (4,216 ms attention-recompute per iter-6 / v7x_KNOWLEDGE.md §3), pick a single pattern for iter-12 Lateral. Also: open `ultrons/perfsim#48` should be reviewer-merged async — no blocking on it.
+
+---
+
+## iter 12 — Lateral (white-paper pattern): DIAGNOSED INAPPLICABLE, no cluster shot
+
+**Class**: Lateral. **Lever source**: white-paper pattern (per AGENT.md §13 revised:
+≥1 white-paper-pattern attempt required before cumulative halt). **Hypothesis at
+entry**: a Qwen3.5-Coder white paper pattern targeting iter-2b's 4,216 ms
+attention-recompute or 7,913 ms moe_gmm_ag bwd transpose can land single-iter.
+
+**Step 1 ritual**: cluster healthy (12 nodes Ready); no in-flight cde runs;
+sibling worktrees rebased; jax-gpt#2/#3/perfsim#47/#48 still open.
+
+**Step 2 — pattern survey** (delegated to general-purpose subagent, output budget
+600 words; AGENT.md §1 "delegate orientation/diagnosis to subagents" rule):
+
+| pattern | wp ref | mechanism | scope |
+|---|---|---|---|
+| MoE local-reduce reorder | §HighLevel #2, pp.9-13 (PR#1516/#1562) | Reduce (B*K,D)→(B,D) before EP collective | single |
+| Combiner-threshold flag | §HighLevel #5 + appendix | Stop XLA combiner from merging chunked psum_scatters | single |
+| Fused gate+up GMM | §LowLevel #3, pp.39-41 (PR#1928) | Pre-concat gate+up weights along N | multi |
+| Subchannel quant + N-tiling | §LowLevel #4, pp.41-50 | FP8 + per-block subchannel quant | multi |
+
+Subagent's primary recommendation: **MoE local-reduce reorder**.
+
+**Diagnosis: primary recommendation doesn't apply.** Re-reading
+`_expert_mlp_gmm_ag_body` model.py:1830-1853:
+- line 1848: `full_out_c = jnp.zeros((chunk_size, D)).at[local_tids_c].add(out_local_c)`
+  — this IS the local K-way reduce. Multiple K-rows per token-id sum here.
+- line 1851: `psum_scatter(full_out_c, ep_axis, scatter_dimension=0, tiled=True)`
+  — receives `(chunk_size, D)`, NOT `(chunk_size*K, D)`. The B*K→B shrink the
+  white paper recommends is **already in place**.
+
+The subagent misread which collective the pattern targets. Don't apply.
+
+**Pivot: verify-then-apply combiner flag.** Per advisor: only helps if XLA's
+all-reduce-combiner is currently merging the 2 chunked psum_scatters back into
+one combined op (defeating the chunk-pipelining intent). Verify via HLO
+inspection before applying.
+
+**Step 11 (delegated) — HLO inspection** (general-purpose subagent, 250-word
+budget; downloaded `gs://max-experiments/dsv3/profiles/dsv3train-i2b/.../*.xplane.pb`,
+`xla_shell explain` on the moe gmm_ag region):
+
+> **Verdict: NOT COMBINING.** Two distinct reduce-scatter ops at distinct IDs:
+> - `reduce-scatter.84` — async-start single-operand `bf16[65536,7168]` →
+>   single-result `bf16[16384,7168]`. Self-time 6.83 s.
+> - `reduce-scatter.94` — same shape signature. Self-time 6.58 s.
+>
+> A combined op would have a 2-tuple operand and 2-tuple result; both are
+> single-operand. The combiner is already not firing.
+>
+> Side-note: each reduce-scatter is ~6.8 s exposed stall (combined ~13.4 s,
+> ~2.4% of step). Compute/collective overlap is failing, but NOT due to
+> combining — likely a scheduling problem.
+
+**Verdict for iter-12**: combiner flag is a no-op. White-paper single-iter
+levers are exhausted on this bottleneck shape. **No cluster shot.**
+
+**Step 12.5**: not applicable (no cluster measurement to anchor).
+
+**Decision**: §13 cumulative halt now fires. The two conditions are satisfied:
+- regressions across ≥2 distinct lever classes (offload-pipeline iter-5/7/8 +
+  sharding iter-10);
+- ≥1 white-paper-pattern attempt (iter-12 = diagnosis-found-inapplicable; per
+  advisor, this counts as "the attempt").
+
+**Durable findings landed**:
+- v7x_KNOWLEDGE.md §3: chunk-pipelining-without-overlap finding (2 reduce-scatters
+  at distinct IDs but each is ~6.8 s exposed stall — XLA scheduler is not
+  overlapping with compute).
+- AGENT.md §13 lever-source diversity: white paper is an INFERENCE paper;
+  training-specific bwd patterns are systematically underrepresented in its
+  catalog. Future sessions may need a broader source than this paper alone.
+
+**Multi-iter scope candidates** (require explicit user authorization):
+1. **Attention-only-checkpoint refactor** — restructure `_moe_layer_body` so
+   `jax.checkpoint` wraps only the attention part. Doesn't depend on jax-gpt#2
+   fix. Predicted +4.5% per iter-9 perfsim cross-check. HBM headroom analysis
+   needed (96 / 101.7 GB at peak).
+2. **Custom Pallas tgmm with `vmem_limit_bytes` parameter** — re-opens iter-5
+   candidate-C with proper VMEM control. Requires upstream JAX or in-tree
+   custom kernel.
+3. **Chunk pipelining/overlap fix** (NEW, from iter-12 HLO finding) —
+   investigate why XLA scheduler isn't overlapping reduce-scatter.84/94
+   with compute. May need explicit `optimization_barrier` placement,
+   collective ordering hints, or `staggered_call`-style scheduling.
+   ~2.4% TPS recoverable if overlap can be achieved.
+4. **Fused gate+up GMM** (white paper §LowLevel #3) — checkpoint format
+   change + MMLU re-run. Deferred per `project_fused_gate_up.md`.
+
+**Rehydrate from this iter (compaction-survival contract):**
+- iter: 12 | sha: <pending> | class: Lateral | lever-source: white-paper pattern (Qwen3.5-Coder §HighLevel #2 / #5)
+- outcome: INFORMATIVE (no cluster run; pattern diagnosed inapplicable single-iter)
+- corpus_anchor: none (no measurement)
+- trust-state delta: NEW v7x_KNOWLEDGE.md §3 entry — "chunk pipelining without compute/collective overlap (~13.4 s exposed; iter-12 HLO finding)". White paper as lever-source noted as inference-skewed.
+- BLOCKED rows opened/closed: none new
+- in-flight cluster runs: none
+- next-iter starting point: **CUMULATIVE HALT REACHED.** Read autoperf/HALT.md (overwritten this iter); if user authorizes multi-iter scope, candidate #3 (chunk pipelining/overlap fix) is the freshest and lowest-cost lead from iter-12's diagnosis. Otherwise wait for jax-gpt#2/#3 maintainer fix to unlock single-iter offload-pipeline path.
