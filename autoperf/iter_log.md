@@ -1265,7 +1265,7 @@ collective-fusion variant designed and gate-rejected. **No cluster spend.**
 Next multi-iter project requires user authorization.
 
 **Rehydrate from this iter (compaction-survival contract):**
-- iter: 14 | sha: <pending> | class: Tooling | lever-source: iter-14a Plan agent recommendation (engine-assignment gate)
+- iter: 14 | sha: 1090a44 | class: Tooling | lever-source: iter-14a Plan agent recommendation (engine-assignment gate)
 - outcome: INFORMATIVE (no cluster run; path C abandoned via gate-rejection)
 - corpus_anchor: none (no measurement)
 - trust-state delta: NEW v7x_KNOWLEDGE.md §3 entry — "ragged_all_to_all on v7x training: RaggedAllToAllEmitter (no fusion-aware variant), 2 MB scoped-memory reservation (no async double-buffer); contrast RS = 64 MB, SingleInputAllReduceScatterFusion. Replacing RS with ragged_a2a in the chunked pattern likely loses the async overlap that makes chunking pay."
