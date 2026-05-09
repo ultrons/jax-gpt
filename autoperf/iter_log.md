@@ -1139,3 +1139,75 @@ levers are exhausted on this bottleneck shape. **No cluster shot.**
 - BLOCKED rows opened/closed: none new
 - in-flight cluster runs: none
 - next-iter starting point: **CUMULATIVE HALT REACHED.** Read autoperf/HALT.md (overwritten this iter); if user authorizes multi-iter scope, candidate #3 (chunk pipelining/overlap fix) is the freshest and lowest-cost lead from iter-12's diagnosis. Otherwise wait for jax-gpt#2/#3 maintainer fix to unlock single-iter offload-pipeline path.
+
+---
+
+## iter 13 — Tooling: chunk-pipelining/overlap deep diagnosis (multi-iter #1, sub-iter 1)
+
+**Class**: Tooling. **Lever source**: iter-12 surfaced bottleneck;
+multi-iter scope #1 authorized by user 2026-05-09. **Hypothesis at entry**:
+characterize WHY chunked psum_scatters aren't overlapping with TC compute,
+to inform iter-14's lever pick.
+
+**Step 1**: ritual unchanged from iter-12 (cluster healthy; jax-gpt#2/#3,
+perfsim#47/#48 still open; no in-flight runs).
+
+**Step 2 — diagnosis** (delegated to general-purpose subagent with xla_shell
++ gsutil access; output budget 500 words; prior iter-12 findings as
+durable context):
+
+> **Diagnosis: body-tail exposure under TC serialization.**
+>
+> The 2 chunks' psum_scatters don't contend on ICI — chunk0's `RS.86`
+> async-start fires at t=897874us and runs 15.7ms FULLY OVERLAPPED with
+> chunk1's TC compute (sort + ragged_dot + scatter). chunk1's `RS.84`
+> async-start fires at t=913555us — exactly when its operand
+> (`scatter_custom_fusion.263`, the chunk1 scatter-add) becomes ready,
+> not earlier. After that, the body has only `RS.84.done + concat` left,
+> so the full 7.9ms wire time is exposed.
+>
+> **Mechanism**: the two chunks' ragged_dots + scatters serialize on TC
+> (one TC, two compute halves). Whichever chunk's RS issues second has
+> nothing left in the body to hide behind. The `jnp.concatenate` at
+> line 1871 + moe_scan body boundary force a sync before the next layer's
+> attention QKV can start, so XLA can't hoist next-layer compute into
+> the prefetch lane either.
+>
+> Cross-checked against `research/dsv3/mini_chunk_repro/FINDINGS.md`
+> (2026-04-23 mini-repro on v4): consistent. v4 had sync RS so chunking
+> never paid; v7x has SC-offloaded async RS so chunk0 overlap works,
+> but body-tail remains.
+
+**Levers proposed by diagnosis** (in priority order, with discriminators):
+
+| lever | mechanism | impact | risk | scope |
+|---|---|---|---|---|
+| A. n_chunks=4 (with line-1859 barrier) | tail-exposed RS shrinks 917 MB → 459 MB (~3.5ms vs 7.9ms) | +1-1.5% TPS | depends on Bug 3 still active | single-iter IF Bug 3 stale, multi-iter IF still active |
+| B. cross-iter prefetch (hoist next-layer attn QKV before concat) | give chunk1's RS something to overlap behind | +0.5-1% TPS | medium (donate/aliasing) | multi-iter (full moe_scan refactor) |
+| C. collective fusion (scatter+RS → gather+AR) | eliminate 12.9s scatter_custom_fusion + RS pair → single all-reduce | +3-5% TPS | high (NaN-class similar to v325) | multi-iter |
+| D. XLA scheduling flag tuning | (proposed during deliberation) | ~0% — structural not scheduling | low | n/a |
+
+**Advisor input** (for iter-14 strategic call): D is out (body-tail is
+structural, no flag changes the dataflow graph). B is out (effort/reward
+ratio bad). A vs C is the real call; discriminator is whether v7x_KNOWLEDGE
+Bug 3 was filed pre or post barrier cluster-test. Two git commands settle
+it. iter-14 path A = 1-cluster-shot verification; path C = mini-repro on
+v4 toy shapes (mini_chunk_repro infrastructure exists), then cluster.
+
+**Step 12.5**: not applicable (no cluster measurement to anchor).
+
+**Decision for iter-14**: discriminator pending (post-iter-13 commit). Path
+A or C will be chosen based on Bug 3 archaeology.
+
+**Side-finding (durable, in v7x_KNOWLEDGE.md §3)**: chunk-pipelining works
+for chunk-0 (overlapped with chunk-1 compute) but not chunk-1 (body-tail
+exposure). This is the structural form of the ~2.4% recoverable headroom.
+
+**Rehydrate from this iter (compaction-survival contract):**
+- iter: 13 | sha: <pending> | class: Tooling | lever-source: iter-12 surfaced bottleneck; multi-iter #1 authorized
+- outcome: INFORMATIVE (no cluster run; deep diagnostic on chunk-pipelining)
+- corpus_anchor: none (no measurement)
+- trust-state delta: NEW v7x_KNOWLEDGE.md §3 entry already landed iter-12 (chunk pipelining without overlap); iter-13 refines mechanism = body-tail exposure under TC serialization
+- BLOCKED rows opened/closed: none new
+- in-flight cluster runs: none
+- next-iter starting point: discriminate A vs C via 2 git commands: `git log --oneline -- jax_gpt/models/dsv3/model.py | grep -iE "v32[3-5]|v34[01]|n_chunks|barrier|chunk"` then `git show <v341-sha>`. If Bug 3 filed BEFORE barrier cluster-test → path A (1 cluster shot). If filed AFTER barrier failed on cluster → path C (mini-repro on v4 first, then cluster). iter-13 commit is the durable handoff for the diagnosis.
