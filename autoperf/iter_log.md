@@ -1033,7 +1033,7 @@ iter-12 first action: read white paper §3-6 in detail, map specific patterns
 to the iter-2b profile's bottleneck, file pattern-source for the chosen lever.
 
 **Rehydrate from this iter (compaction-survival contract):**
-- iter: 11 | sha: <pending-jax-gpt-commit> | class: Tooling | lever-source: harness-rule-operationalization (AGENT.md Step 12.5)
+- iter: 11 | sha: 68e020f | class: Tooling | lever-source: harness-rule-operationalization (AGENT.md Step 12.5)
 - outcome: INFORMATIVE (no cluster run) | metric: n/a (no measurement)
 - corpus_anchor: dsv3_671b_v7x_4x8x8_train_v304.json (refreshed; tolerance 0.10 / perfsim_delta 0.4%) + dsv3_671b_v7x_4x8x8_train_iter10_rank3.json (new; skip_test_validation true / perfsim#47 target)
 - trust-state delta: none (no new trust changes; v7x_KNOWLEDGE.md §3 broken-levers unchanged)
