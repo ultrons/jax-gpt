@@ -1199,3 +1199,76 @@ exposure). This is the structural form of the ~2.4% recoverable headroom.
 - BLOCKED rows opened/closed: none new
 - in-flight cluster runs: none
 - next-iter starting point: discriminate A vs C via 2 git commands: `git log --oneline -- jax_gpt/models/dsv3/model.py | grep -iE "v32[3-5]|v34[01]|n_chunks|barrier|chunk"` then `git show <v341-sha>`. If Bug 3 filed BEFORE barrier cluster-test → path A (1 cluster shot). If filed AFTER barrier failed on cluster → path C (mini-repro on v4 first, then cluster). iter-13 commit is the durable handoff for the diagnosis.
+
+---
+
+## iter 14 — Tooling: AOT engine-assignment probe for ragged_all_to_all (multi-iter #1, sub-iter 3)
+
+**Class**: Tooling. **Lever source**: iter-13 surfaced bottleneck; multi-iter
+scope #1 authorized; iter-14 design (Plan agent) flagged **likely net regression**
+and recommended a cheap engine-assignment probe before committing further iters.
+
+**Hypothesis**: if ragged_all_to_all lowers async on v7x (with SC offload, like
+reduce_scatter does), proceed to iter-14b mini-repro. If it lowers sync (or
+without SC-offload async-fusion infrastructure), abandon path C.
+
+**Probe**: `research/dsv3/aot_collective_fusion_check.py`. AOT compile a
+ragged_all_to_all shard_map fn against `tpu7x:2x2x1` topology with production
+LIBTPU_INIT_ARGS (mirrored from `manifests/jobset.yaml.j2:110-156`); same for
+psum_scatter as reference. Inspect optimized HLO.
+
+**Verdict**: AOT-stage HLO doesn't split either op into separate start/done
+pairs — both appear as single op nodes with `frontend_attributes={async_collective_name="..."}`
+hints. The AOT probe alone is INCONCLUSIVE on async behavior (start/done
+splitting may happen later during latency-hiding-scheduler runs in real
+training context).
+
+**Soft signals from backend_config** (decisive):
+
+| metadata | reduce_scatter | ragged_all_to_all |
+|---|---|---|
+| emitter | `SingleInputAllReduceScatterFusion` (fusion-aware) | `RaggedAllToAllEmitter` (plain) |
+| scoped_memory size | **64 MB** (async double-buffer) | **2 MB** (no double-buffer) |
+| strategy | `StrategyRing` (1D phase_count:1) | (none) |
+
+The 32× scoped-memory delta is decisive: RS reserves async double-buffer
+space that's needed for engine-overlapped execution; ragged_all_to_all
+doesn't. Combined with the production manifest's missing SC-offload flag for
+all-to-all, **path C lowers in a way that XLA cannot fuse async with TC
+compute** in the same way RS does. The current chunking pattern's win came
+from RS-on-SC overlap; replacing RS with ragged_a2a removes the
+infrastructure that creates the win.
+
+**Decision**: ABANDON path C. The Plan agent's "low-to-medium confidence,
+likely net regression" assessment stands; this probe corroborates with
+backend-config evidence.
+
+**Pivot candidates** (from HALT.md multi-iter list):
+
+1. **Multi-iter #2: attention-only-checkpoint refactor**. Restructure
+   `_moe_layer_body` so `jax.checkpoint` wraps only the attention part.
+   Predicted +4.5% per iter-9 perfsim cross-check. Doesn't depend on
+   jax-gpt#2/#3 fix. HBM headroom analysis required (model already at
+   96 / 101.7 GB at peak).
+2. **Multi-iter #3: custom Pallas tgmm with `vmem_limit_bytes`**.
+   Re-opens iter-5 candidate-C. Requires custom in-tree kernel since
+   megablox.tgmm has hardcoded 32 MB scoped VMEM.
+3. **Wait for jax-gpt#2 + #3 maintainer fix**. Unblocks ~+5% TPS via
+   offload-restore pipeline. No agent work; depends on upstream.
+
+**Step 12.5**: not applicable (no cluster shot).
+
+**Multi-iter scope #1 closeout**: 3 sub-iters spent (iter-13 diagnosis,
+iter-14a Plan-agent design, iter-14 AOT probe). Mechanism diagnosed
+(body-tail exposure under TC serialization), prior-art surveyed,
+collective-fusion variant designed and gate-rejected. **No cluster spend.**
+Next multi-iter project requires user authorization.
+
+**Rehydrate from this iter (compaction-survival contract):**
+- iter: 14 | sha: <pending> | class: Tooling | lever-source: iter-14a Plan agent recommendation (engine-assignment gate)
+- outcome: INFORMATIVE (no cluster run; path C abandoned via gate-rejection)
+- corpus_anchor: none (no measurement)
+- trust-state delta: NEW v7x_KNOWLEDGE.md §3 entry — "ragged_all_to_all on v7x training: RaggedAllToAllEmitter (no fusion-aware variant), 2 MB scoped-memory reservation (no async double-buffer); contrast RS = 64 MB, SingleInputAllReduceScatterFusion. Replacing RS with ragged_a2a in the chunked pattern likely loses the async overlap that makes chunking pay."
+- BLOCKED rows opened/closed: none
+- in-flight cluster runs: none
+- next-iter starting point: multi-iter scope #1 (chunk-pipelining/overlap fix) is exhausted; user-pivot decision required for next multi-iter project. Top candidate: multi-iter #2 attention-only-checkpoint refactor (+4.5% predicted, HBM analysis prerequisite). Read HALT.md "Recommended next-human-action" list for full set.

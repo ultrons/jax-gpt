@@ -103,7 +103,16 @@ yamls bake these in.
   (failed multiple fix attempts: 3756666 barrier, fb17291 v341n
   serializing barrier, ff41a58 scan conversion). Path C (collective
   fusion: scatter+RS → direct AR) is the active multi-iter pursuit
-  per autoperf iter-13.
+  per autoperf iter-13. **iter-14 update (2026-05-09)**: path C abandoned
+  after AOT engine-assignment probe — `ragged_all_to_all` on v7x training
+  uses `RaggedAllToAllEmitter` (plain, not fusion-aware) with 2 MB scoped-
+  memory reservation; `reduce_scatter` uses `SingleInputAllReduceScatterFusion`
+  with 64 MB scoped-memory (async double-buffer). The 32× scoped-memory
+  delta + missing `xla_tpu_enable_sparse_core_collective_offload_all_to_all`
+  flag in production manifest mean replacing RS-on-SC with ragged_a2a-on-TC
+  would lose the async overlap that makes chunking pay. Multi-iter scope #1
+  is exhausted at iter-14 without cluster spend. Probe artifact:
+  `research/dsv3/aot_collective_fusion_check.py`.
 ---
 
 ## 4. JAX/XLA operational pitfalls (learned the hard way)
