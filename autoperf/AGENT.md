@@ -69,6 +69,15 @@ features, anything that needs cross-repo discussion — file an issue instead
   clean revert + a profile-sized finding is more valuable than a successful
   heuristic-table shot whose mechanism you don't understand — the latter
   doesn't compose into the next iter's lever pick.
+  **Read author comments on `checkpoint_name`, `named_scope`,
+  `with_sharding_constraint`, and similar annotations.** Authors leave
+  forward-looking lever hints there ("skip Splash bwd recompute",
+  "offload: 448 MB/layer", "v341 found NaN at n_chunks=4"). iter-16's
+  lever was sitting in plain sight at `model.py:560,636` with the
+  explicit comment "skip Splash bwd recompute" for 4+ days. Before
+  proposing a lever, grep for `checkpoint_name(` and read every
+  comment in the surrounding region — the author has already told you
+  which levers are well-formed and which already failed.
 - **Tools are still maturing — fix friction inline.** When you hit a tool
   gap (perfsim search returns 0, bucketer can't match a fusion name, AOT
   template missing for a kernel class, cde annotate can't find a run id),
@@ -219,6 +228,25 @@ e. **Pull sibling worktrees** before any inline fix:
    diffs across sessions.] Also re-poll any prior-session HALT-marked
    Pending JobSets (Step 13 halt-re-poll rule) — Kueue may have admitted
    them asynchronously.
+
+f. **Verify cluster infrastructure liveness** before the first cluster
+   submit of the session. The workload yaml's `cluster_context` points
+   at a GKE cluster; `cde.yaml`'s `defaults_overrides` pin a namespace
+   and priority class. Clusters get reset / re-provisioned; old
+   namespaces and priority classes disappear silently. Quick check:
+   ```bash
+   ctx=$(yq -r .cluster_context autoperf/workloads/<workload>.yaml)
+   ns=$(yq -r .defaults_overrides.namespace cde.yaml)
+   pc=$(yq -r .defaults_overrides.priority_class cde.yaml)
+   kubectl --context "$ctx" get ns "$ns" priorityclass "$pc" 2>&1
+   ```
+   If either is `NotFound`, fix `cde.yaml` inline before launching
+   (point at an existing namespace + priority class on the target
+   cluster). [Why: iter-16 wasted ~30 min cluster wait on
+   `Error from server (NotFound): namespaces "poc-dev" not found`
+   because the cluster had been reset ~19 days earlier and the
+   `cde.yaml` defaults were stale. Fix takes 30 seconds; discovery
+   without the check takes a Kueue admission cycle.]
 
 ### Step 2 — pick this iteration's class
 
@@ -489,6 +517,14 @@ If ANY of:
   hypotheses, related markers, workaround). Template: jax-gpt#2.
   **Mandatory for every NaN/OOM/no-progress halt** — the issue is the
   durable channel for the maintainer agent to pick it up.
+  **Also mandatory: enumerate untried alternative code paths in the
+  issue body.** A NaN in one variant (e.g., OFFLOAD-list checkpoint)
+  does NOT mean sibling variants (e.g., SAVE-list checkpoint) are
+  also dead. See §5c for the checkpoint-policy enumeration template;
+  apply analogous reasoning for other lever classes (sharding mesh
+  alternatives, collective ops, kernel tiling variants). iter-16
+  retrospective: jax-gpt#2 was filed in iter-7 without enumeration,
+  and the working SAVE-list variant sat undiscovered for 4 days.
 - the cluster is in chaos (3 evictions in a row) → HALT with reason
   `cluster_unhealthy`
 - perfsim's reasoning didn't make sense and `--explain` didn't resolve it
@@ -704,6 +740,69 @@ containing: iteration number, commit SHA, change description, top-leaf
 before/after with `headroom_total_ms`, decision for next iteration, **policy
 class** (Greedy/Lateral/Tooling). Reviewer agents read this when commenting
 on autoperf-loop PRs.
+
+---
+
+## 5c. Working with checkpoint policies (jax.checkpoint)
+
+DSv3 uses `jax.checkpoint_policies.save_and_offload_only_these_names` to
+choose which named tensors survive into the bwd pass. The policy has
+**two sub-lists** that look similar but trigger **different XLA code
+paths**:
+
+| sub-list | destination | code path | broken? (as of 2026-05-11) |
+|---|---|---|---|
+| `names_which_can_be_saved` | HBM (device) | direct save/restore | **NO** — works |
+| `names_which_can_be_offloaded` | pinned_host (CPU DMA) | async DMA + restore | **YES** — jax-gpt#2/#3 |
+
+**iter-7 vs iter-16 worked example** (the load-bearing distinction):
+
+- iter-7 added `"attn_proj_out"` to `names_which_can_be_offloaded` →
+  NaN at step 1 across all runs. Filed jax-gpt#2 with the read "this
+  lever is dead". The read was incomplete: the OFFLOAD code path is
+  dead, but the SAVE code path was never tried.
+- iter-16 added `"attn_proj_out"` to `names_which_can_be_saved` (HBM
+  resident, ~26 GB across L_moe=58 layers @ 448 MB/layer) → **+1.8%
+  TPS, loss matches production exactly**.
+
+**Rules**:
+
+1. **When proposing a checkpoint-policy lever, state the sub-list
+   explicitly** in the iter_log entry. "Add X to offload" and "Add X
+   to save" are entirely different changes.
+2. **OFFLOAD path is currently broken** for any name not already in
+   the production offload list (jax-gpt#2/#3 hypothesize a latent
+   offload-restore bug exposed only by departures from
+   `prevent_cse=False` + the current single offload). Don't try OFFLOAD
+   levers until #2 or #3 lands.
+3. **SAVE path is the active lever class**. When you see a
+   `checkpoint_name` in code with a comment like "skip X bwd recompute",
+   that's an explicit author hint that SAVE-list inclusion is a
+   well-formed lever. iter-16's lever was sitting in plain sight at
+   `model.py:560,636` with that exact comment for 4+ days.
+4. **HBM budget check before submit**: each saved name adds `local_batch
+   × seq × D × 2B × n_layers` bytes per shard (bf16). Run a quick
+   back-of-envelope; if total saved + current peak > 101.7 GB (v7x
+   runtime cap), expect compile OOM. Cluster compile is fast-fail
+   (~10 min) — for a checkpoint-policy change without other risk
+   factors, going direct to cluster is acceptable in lieu of an AOT
+   gate (Step 4b applies primarily to Pallas/Mosaic changes).
+
+**For § 13 NaN-issue-filing rule**: when a checkpoint lever NaNs, the
+issue body MUST explicitly enumerate the untried alternative code paths:
+
+```markdown
+## Untried alternative code paths
+- [ ] SAVE list instead of OFFLOAD list (HBM-resident, different DMA path)
+- [ ] `prevent_cse=True` paired with original list (forces XLA to materialize)
+- [ ] Move offload_dst from pinned_host to device_memory_space=N (different
+      sub-DMA path)
+```
+
+Without this enumeration, a future agent (or maintainer) sees "the
+lever is broken" and walks past a working variant. iter-7's jax-gpt#2
+issue body did not enumerate; iter-16's success was 4 days late as a
+result.
 
 ---
 
