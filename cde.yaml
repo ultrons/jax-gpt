@@ -18,12 +18,14 @@ defaults:
   tpu-type: tpu7x-256
   num-slices: 1
 
-# Override cde's team→namespace derivation to match the existing
-# bodaborg-super-rbq cluster's quota setup (namespace stayed as poc-dev
-# from the original team-quota chart instance).
+# Override cde's team→namespace derivation. autoperf 2026-05-11 update:
+# bodaborg-super-rbq cluster was reset ~19 days ago; old poc-dev namespace
+# + poc-dev-priority were dropped. New layout: all jobsets run in `default`
+# namespace with standard cluster-wide priority classes (high/medium/low);
+# localqueue `lq` is in default namespace.
 defaults_overrides:
-  namespace: poc-dev
-  priority_class: poc-dev-priority
+  namespace: default
+  priority_class: medium
 
   # v304-auxar reproduction defaults (override per-run with --set).
   config: full
