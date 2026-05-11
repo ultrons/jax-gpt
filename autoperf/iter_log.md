@@ -1366,7 +1366,7 @@ future iters. If gain doesn't hold (e.g., variance is wide), keep
 iter-2b as baseline and file the noise band finding.
 
 **Rehydrate from this iter (compaction-survival contract):**
-- iter: 16 | sha: <pending> | class: Lateral | lever-source: iter-15 diagnosis (attention-only-checkpoint via attn_proj_out save)
+- iter: 16 | sha: a4032c3 | class: Lateral | lever-source: iter-15 diagnosis (attention-only-checkpoint via attn_proj_out save)
 - outcome: IMPROVED (+1.8% TPS, +0.6 pp MFU) | metric: 34659→34200 ms steady state, lm/aux match
 - corpus_anchor: dsv3_671b_v7x_4x8x8_train_v304.json _iter_history (iter-16 IMPROVED candidate); perfsim PR#49 open
 - trust-state delta: NEW v7x_KNOWLEDGE.md §3 entry "attn_proj_out save (NOT offload) is a +1.8% TPS lever that respects jax-gpt#2/#3 broken offload-restore — SAVE path is a different code path from OFFLOAD"
