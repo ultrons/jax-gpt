@@ -3049,8 +3049,14 @@ def forward(params, tokens, cfg: ModelConfig, return_final_x: bool = False):
             # = 1.5-2 s of pure-overhead per offload — way more than the cheap
             # matmul recompute they would save. Only large activations
             # (moe_layer_input, attn_proj_out) have favorable DUS:save ratio.
+            # autoperf-iter16 (2026-05-11): attention-only-checkpoint via SAVE
+            # (not offload) of attn_proj_out. Adds ~26 GB HBM but skips ~4,216
+            # ms attention recompute per step (iter-6 finding). Save-path
+            # avoids the broken offload-restore pipe (jax-gpt#2/#3 — iter-7
+            # tried offload of attn_proj_out and NaN'd). Predicted +4.5% TPS
+            # per iter-9 perfsim cross-check.
             _ckpt_policy = jax.checkpoint_policies.save_and_offload_only_these_names(
-                names_which_can_be_saved=(),
+                names_which_can_be_saved=("attn_proj_out",),
                 names_which_can_be_offloaded=("moe_layer_input",),
                 offload_src="device",
                 offload_dst="pinned_host",
