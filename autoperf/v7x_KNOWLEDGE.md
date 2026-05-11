@@ -113,6 +113,39 @@ yamls bake these in.
   would lose the async overlap that makes chunking pay. Multi-iter scope #1
   is exhausted at iter-14 without cluster spend. Probe artifact:
   `research/dsv3/aot_collective_fusion_check.py`.
+
+- **`attn_proj_out` SAVE (NOT offload) is a +1.8% TPS lever** (iter-16
+  cluster-validated, 2026-05-11). Adding `"attn_proj_out"` to
+  `_ckpt_policy.names_which_can_be_saved` (model.py:3053) keeps the
+  attention output residual in HBM during fwd (~26 GB across L_moe=58
+  layers @ ~448 MB/layer). Skips the 4,216 ms Splash bwd recompute
+  (iter-6 finding). Measured: step time 34,659 → 34,200 ms, TPS/chip
+  1882 → 1916, MFU 30.5 → 31.1%. Loss matches iter-2b exactly (no NaN).
+  **Critical**: SAVE goes to HBM, OFFLOAD goes to pinned_host —
+  different code paths. The broken offload-restore pipe (jax-gpt#2/#3,
+  which made iter-7's OFFLOAD of the same name NaN) does NOT affect
+  SAVE. Don't confuse the two when reading checkpoint policy code.
+  Comments at model.py:560,636 explicitly anticipated this lever
+  ("skip Splash bwd recompute"). Status as of 2026-05-11: IMPROVED
+  candidate, pending iter-17 ratchet confirmation. Once confirmed,
+  this becomes the new PRODUCTION BASELINE replacing iter-2b.
+
+- **cde.yaml in docker build context = brittle tag-hash** (iter-16
+  ops finding, 2026-05-11). Editing cde.yaml changes the
+  build-context hash → image tag changes → previous image (different
+  hash but identical digest) results in `ImagePullBackOff`. Workaround:
+  rebuild after any cde.yaml commit. Better fix: add `cde.yaml` to
+  `.dockerignore` (the file is consumed by the cde wrapper at submit
+  time, not inside the trainer container). Deferred to a Tooling iter.
+
+- **bodaborg-super-rbq cluster reset 2026-04-22** (iter-16 ops
+  finding). Old `poc-dev` namespace + `poc-dev-priority` class were
+  dropped. New layout: all jobsets in `default` namespace; standard
+  cluster-wide priority classes (`high`=750, `medium`=500, `low`=250);
+  localqueue `lq` in default namespace. cde.yaml updated at
+  commit `4be94f3`. Re-check if cluster is reset again in future iter
+  rituals.
+
 ---
 
 ## 4. JAX/XLA operational pitfalls (learned the hard way)

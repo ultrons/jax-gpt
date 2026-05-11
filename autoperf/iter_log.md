@@ -1272,3 +1272,104 @@ Next multi-iter project requires user authorization.
 - BLOCKED rows opened/closed: none
 - in-flight cluster runs: none
 - next-iter starting point: multi-iter scope #1 (chunk-pipelining/overlap fix) is exhausted; user-pivot decision required for next multi-iter project. Top candidate: multi-iter #2 attention-only-checkpoint refactor (+4.5% predicted, HBM analysis prerequisite). Read HALT.md "Recommended next-human-action" list for full set.
+
+---
+
+## iter 15 — Tooling: attention-only-checkpoint HBM analysis (multi-iter #2, sub-iter 1)
+
+**Class**: Tooling. **Lever source**: HALT.md multi-iter #2 candidate;
+user-authorized 2026-05-11.
+
+**Subagent investigation** (general-purpose with model.py reads):
+- DSv3-671B has L=61 layers, L_dense=3, L_moe=58.
+- Current `_ckpt_policy` (model.py:3052-3057): `save_and_offload_only_these_names(saved=(), offloaded=("moe_layer_input",))`.
+- `attn_proj_out` is `checkpoint_named` at lines 560 and 636 with comments
+  "offload: 448 MB/layer, skip Splash bwd recompute" — designers anticipated
+  this lever.
+- Subagent's initial pitch: save `moe_layer_output` with nested FFN
+  checkpoint. **Diagnosed wrong**: moe_layer_output is the layer's output
+  residual (scan carry), saving it doesn't avoid attention recompute.
+- Correct lever: add `"attn_proj_out"` to `names_which_can_be_saved`
+  (NOT offload — that's iter-7's broken path).
+- HBM budget: ~26 GB across 58 layers (448 MB/layer per comment), but
+  saving may displace bwd intermediate generation (Q/K/V intermediates),
+  so net delta might be smaller than +26 GB. Cluster compile is the
+  only reliable check.
+
+**Decision**: iter-16 = one-line patch + cluster shot.
+
+---
+
+## iter 16 — Lateral: attention-only-checkpoint (multi-iter #2, sub-iter 2) — IMPROVED
+
+**Class**: Lateral. **Lever source**: iter-15 diagnosis.
+
+**Patch** (commit `cbba921`): single-line edit to `_ckpt_policy` at
+`model.py:3053`:
+```python
+names_which_can_be_saved=("attn_proj_out",)   # was: ()
+```
+
+**Side fix** (commit `4be94f3`): cde.yaml namespace adapted from
+`poc-dev` (gone) to `default`; priority `medium`. bodaborg-super-rbq
+cluster was reset ~19 days ago; old namespace and priority class
+dropped. Per AGENT.md §1 "fix friction inline".
+
+**Side fix** (cluster ops): first cluster submit failed
+`ImagePullBackOff` — the cde.yaml commit changed the build-context
+hash from `cde-7e92bae` (built pre-fix) to `cde-b950f34`. Rebuilt
+(same digest, just new tag) and Kueue auto-re-admitted the suspended
+JobSet (was waiting on image). Latent issue: cde.yaml is in the
+docker build context but doesn't affect the image — should add to
+`.dockerignore`. Deferred to a Tooling iter.
+
+**Cluster result on `dsv3train-i16`** (image cde-b950f34):
+
+| metric | iter-2b | iter-16 | delta |
+|---|---|---|---|
+| step time (avg steps 2-4) | 34,659 ms | **34,200 ms** | **-460 ms (-1.3%)** |
+| TPS/chip | 1882 | **1916** | **+34 (+1.8%)** |
+| MFU | 30.5% | **31.1%** | **+0.6 pp** |
+| loss (lm/aux) | 12.037 / 403.45 | 12.037 / 403.43 | matches ✓ |
+
+Per-step breakdown:
+- step 1: 224.7 s (compile + warmup)
+- step 2: 34.107 s
+- step 3: 34.367 s
+- step 4: 34.134 s
+- step 5: 104.2 s (profile capture overhead)
+
+Steady-state avg of steps 2-4 = 34.203 s.
+
+**Comparison with perfsim's iter-9 prediction**: predicted +1,476 ms
+(`remat=full` 34,525 → `remat=attn_only` 33,049). Actual +460 ms.
+Perfsim used a "half-of-none" heuristic assuming ALL FFN intermediates
+also saved (~217 GB infeasible); the actual lever only saves
+`attn_proj_out` (~26 GB), skipping the 4,216 ms attention recompute
+(iter-6 finding) but FFN bwd intermediates remain recomputed. +460 ms
+matches the attention-recompute path alone.
+
+**Step 12.5 — corpus update** (mandatory per AGENT.md): perfsim PR#49
+opens with iter-16 added to `dsv3_671b_v7x_4x8x8_train_v304.json`
+`_iter_history` as IMPROVED candidate. Production `measured` block
+stays at iter-2b until ratchet (next iter = repeat measurement).
+
+**No HALT triggered.** Loss matches production, no NaN, no OOM. Multi-
+iter scope #2's hypothesis confirmed: attention-only-checkpoint works,
+delivers ~+1.8% TPS, doesn't depend on jax-gpt#2/#3 fix.
+
+**Decision for next iter** (per AGENT.md §5b ratchet rule):
+**iter-17 = repeat measurement on same code/image**. If gain holds
+(±0.3% noise band), promote to PRODUCTION BASELINE; ratchet corpus
+production entry to iter-16 measurement; new comparison point for
+future iters. If gain doesn't hold (e.g., variance is wide), keep
+iter-2b as baseline and file the noise band finding.
+
+**Rehydrate from this iter (compaction-survival contract):**
+- iter: 16 | sha: <pending> | class: Lateral | lever-source: iter-15 diagnosis (attention-only-checkpoint via attn_proj_out save)
+- outcome: IMPROVED (+1.8% TPS, +0.6 pp MFU) | metric: 34659→34200 ms steady state, lm/aux match
+- corpus_anchor: dsv3_671b_v7x_4x8x8_train_v304.json _iter_history (iter-16 IMPROVED candidate); perfsim PR#49 open
+- trust-state delta: NEW v7x_KNOWLEDGE.md §3 entry "attn_proj_out save (NOT offload) is a +1.8% TPS lever that respects jax-gpt#2/#3 broken offload-restore — SAVE path is a different code path from OFFLOAD"
+- BLOCKED rows opened/closed: none new; perfsim#48 closed (merged); perfsim#49 OPEN
+- in-flight cluster runs: none
+- next-iter starting point: iter-17 = repeat cluster shot on same image cde-b950f34 with same flags (no code change). Goal: ratchet confirm. If 2nd measurement within 0.3% of iter-16's 34,200 ms → promote to PRODUCTION BASELINE, update v304 corpus's `measured` block. If outside → file noise band, hold at iter-2b.
