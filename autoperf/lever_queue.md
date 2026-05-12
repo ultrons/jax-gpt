@@ -76,26 +76,3 @@ Remaining viable variants:
 Synthesis-every-3-iters subagent (Primitive A) writes its observations
 here. Empty until first synthesis fires (after iter-19 or after a
 halt-with-revert).
-
-### iter-17b finding (2026-05-12, partial)
-
-iter-17b evicted by preemption (mk-q30b-0508 higher-priority workload).
-4 valid steps captured before kill:
-- step 2: 33.528 s (1955 TPS/chip @ 31.6% MFU)
-- step 3: 33.733 s (1943 TPS/chip @ 31.4% MFU)
-- step 4: 33.571 s (1952 TPS/chip @ 31.6% MFU)
-- avg: 33,611 ms / **1949 TPS/chip / 31.5% MFU**
-
-vs iter-16 (34,203 ms / 1916 TPS/chip): **+1.7% faster** — outside ±0.3%
-ratchet noise band. Two reads:
-1. iter-16 was on slow end of variance; iter-17b is "true" gain
-2. Per-iter variance is ~1-2%, ratchet criterion needs revisiting
-
-Direction confirmed regardless: SAVE attn_proj_out gives **+3.6% vs iter-2b**
-(was +1.8% at iter-16). Conservative move: do NOT ratchet corpus baseline yet
-(eviction = partial data). Wait for 1 more clean measurement before promoting.
-
-**Note for synthesis** (Primitive A trigger after iter-19): variance of ~1.7%
-across iter-16 vs iter-17b is the new noise band estimate — tighter than the
-±0.3% used in AUTONOMOUS_RUN.md. Updating the ratchet criterion to ±1% may
-be appropriate.

@@ -3053,18 +3053,10 @@ def forward(params, tokens, cfg: ModelConfig, return_final_x: bool = False):
             # (not offload) of attn_proj_out. Adds ~26 GB HBM but skips ~4,216
             # ms attention recompute per step (iter-6 finding). Save-path
             # avoids the broken offload-restore pipe (jax-gpt#2/#3 — iter-7
-            # tried offload of attn_proj_out and NaN'd). Measured +1.8% TPS
-            # at iter-16; iter-17b confirmed at +3.6% (per-iter variance ~1.7%).
-            # autoperf-iter18 (2026-05-12): stack with q_a + kv_a + shared_hidden.
-            # All three were rejected from OFFLOAD due to per-DUS overhead
-            # (v315 comment above) — SAVE has no DUS so the rejection doesn't
-            # apply. Adds ~15.1 GB more HBM (5.6 + 2.1 + 7.4 GB across 58
-            # layers). Combined SAVE-list footprint ~41 GB. Worst case:
-            # compile OOM (fast-fail), revert to iter-16 single name.
+            # tried offload of attn_proj_out and NaN'd). Predicted +4.5% TPS
+            # per iter-9 perfsim cross-check.
             _ckpt_policy = jax.checkpoint_policies.save_and_offload_only_these_names(
-                names_which_can_be_saved=(
-                    "attn_proj_out", "q_a", "kv_a", "shared_hidden",
-                ),
+                names_which_can_be_saved=("attn_proj_out",),
                 names_which_can_be_offloaded=("moe_layer_input",),
                 offload_src="device",
                 offload_dst="pinned_host",
