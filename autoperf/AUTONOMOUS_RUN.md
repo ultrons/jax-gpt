@@ -23,6 +23,16 @@ normal user-paced mode.
 
 The following are auto-authorized — no user prompt needed:
 
+**Resume authorization 2026-05-12 04:13 UTC (post-HALT_FOR_AUTH)**:
+User selected Option A. Bisect jax-gpt#4 NaN class via single-name
+SAVE adds, smallest HBM first: kv_a (2.1 GB) → q_a (5.6 GB) →
+shared_hidden (7.4 GB). Each iter compares to iter-16's measurement.
+If a name lands clean with measured improvement, KEEP it on the save
+list for the next iter (cumulative stacking). If a name NaN's,
+DROP it and proceed to the next candidate. Stop if all 3 fail OR
+when cluster budget exhausts.
+
+
 1. **Iter-17 ratchet of iter-16.** Same image (cde-b950f34), same flags,
    second measurement. Per AGENT.md §5b: gain within ±0.3% of 34,200 ms
    → promote to PRODUCTION BASELINE + ratchet corpus. Outside band →

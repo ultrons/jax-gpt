@@ -3053,10 +3053,15 @@ def forward(params, tokens, cfg: ModelConfig, return_final_x: bool = False):
             # (not offload) of attn_proj_out. Adds ~26 GB HBM but skips ~4,216
             # ms attention recompute per step (iter-6 finding). Save-path
             # avoids the broken offload-restore pipe (jax-gpt#2/#3 — iter-7
-            # tried offload of attn_proj_out and NaN'd). Predicted +4.5% TPS
-            # per iter-9 perfsim cross-check.
+            # tried offload of attn_proj_out and NaN'd). Measured +1.8% TPS.
+            # autoperf-iter19 (2026-05-12): bisect of jax-gpt#4 (iter-18 NaN
+            # when stacking q_a+kv_a+shared_hidden). User authorized Option A
+            # (smallest-first single-name bisect). kv_a is smallest at 36 MB
+            # × 58 = 2.1 GB. If clean + measured improvement, iter-20 adds
+            # q_a; iter-21 adds shared_hidden. If NaN: drop kv_a, try q_a
+            # alone next.
             _ckpt_policy = jax.checkpoint_policies.save_and_offload_only_these_names(
-                names_which_can_be_saved=("attn_proj_out",),
+                names_which_can_be_saved=("attn_proj_out", "kv_a"),
                 names_which_can_be_offloaded=("moe_layer_input",),
                 offload_src="device",
                 offload_dst="pinned_host",
