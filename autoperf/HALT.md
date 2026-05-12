@@ -1,218 +1,122 @@
-# HALT — autoperf cumulative session, 2026-05-08 (RESUMED 2026-05-09 — multi-iter #1 authorized: chunk-pipelining/overlap fix)
+# HALT — autoperf autonomous run, 2026-05-12
 
-**Status**: cumulative `regression_chain` halt per AGENT.md §13 — 3 consecutive failed iters with reverts. Session ends here. iter-2b remains the verified production baseline (1882 TPS/chip @ 30.5% MFU, step 34.65 s).
+**Reason**: time budget exceeded (903 min elapsed vs 720 min / 12 h target).
+Session also hit hard halt #4 mid-run (NaN class not seen — iter-18).
 
-**Workload**: `dsv3_train_full` (DSv3-671B, v7x 4×8×8, fsdp=128 ep=4 tp=1, gbs=4096)
+**Window**: 2026-05-12 01:14 → 16:48 UTC (15h 34min wall)
+**Workload**: dsv3_train_full, iter-2b baseline preserved
+**Branch**: autoperf/dsv3_train_full HEAD `37c6b8c`
+**Autonomous-mode contract**: AUTONOMOUS_RUN.md (deleted at session close)
 
-## The 3-iter chain
+---
 
-| iter | class | change | outcome | revert |
-|---|---|---|---|---|
-| 5 | Greedy | `_tgmm_tiles` tile_m=4096 (2× iter reduction) | tgmm self_us +38% (3,026 → 4,175 ms/step); step time +0.65 s; TPS/chip −1.4% | `a7e6efd` |
-| 7 | Greedy | add `"attn_proj_out"` to offload list (one-line) | NaN from step 1 across all 5 steps; loss=nan, lm=nan, aux=nan | `bbfe974` |
-| 8 | Lateral | `jax.checkpoint(prevent_cse=False → True)` (two-line) | NaN from step 1; same symptom as iter-7 | `05116ff` |
+## Session score
 
-(iter-6 Tooling between 5 and 7 doesn't break the chain — no measured outcome.)
-
-## Issues filed (per AGENT.md §13 NaN-issue-filing rule)
-
-- `ultrons/jax-gpt#2` — attn_proj_out offload produces NaN at step 1
-- `ultrons/jax-gpt#3` — prevent_cse=True produces NaN at step 1
-
-Hypothesis (cross-issue): production iter-2b is in a narrow numerically-stable groove. `prevent_cse=False` may let XLA silently CSE between fwd and recomputed-fwd, effectively bypassing the offload-restore path. With either departure (new offload marker OR prevent_cse=True), the offload-restore path is genuinely exercised and exposes a latent async-DMA / layout-drift bug. If confirmed, fixing #2 likely fixes #3.
-
-## What's been learned this session
-
-| iter | findings (now in `v7x_KNOWLEDGE.md` §3 + §5) |
+| metric | count |
 |---|---|
-| 3 | BF16 microbench grid measured + uploaded; perfsim#10 closed |
-| 4 | `moe_experts/moe_gmm_ag` decomposition: total 16,656 ms/step (48% of step), backward dominant (67%); gmm_v2 fwd kernel is at-ceiling |
-| 5 | tgmm at production shapes is **memory-bound**, not compute-bound — bigger tile_m regresses |
-| 6 | `/checkpoint/` bucket fully decomposed: 4,216 ms attention recompute is unwired-lever territory |
-| 7 | `attn_proj_out` offload broken (jax-gpt#2) |
-| 8 | `prevent_cse=True` broken (jax-gpt#3) — same root cause family as #2 |
+| iters attempted | 4 (17, 17b, 18, 19) |
+| cluster shots used | 4 of 8 budget |
+| successful trains (loss finite + ran) | 0 |
+| partial trains (steps captured) | 1 (iter-17b: 4 valid steps before preempt) |
+| NaN halts | 1 (iter-18) |
+| evictions | 3 (iter-17, iter-17b, iter-19) — broken by iter-18 NaN |
+| issues filed | 1 (jax-gpt#4) |
+| inline harness fixes | 2 (.dockerignore exclude autoperf/+cde.yaml; HALT_FOR_AUTH protocol exercised) |
+| perfsim PRs OPEN | 1 (#49 — iter-16 IMPROVED candidate corpus update) |
+| perf gain measured + clean | 0 |
+| perf gain measured + partial | +3.6% TPS (iter-17b vs iter-2b, partial profile) |
+| commits pushed | 12 (e52bfcb → 37c6b8c) |
 
-## What's the production state right now
+**Production state unchanged**: iter-2b remains baseline (1882 TPS/chip @ 30.5% MFU, 34,659 ms/step). iter-16 IMPROVED candidate (1916 TPS/chip @ 31.1% MFU) still awaits clean repeat for ratchet — iter-17b's partial measurement (1949 TPS/chip @ 31.5% MFU) is suggestive but not full-iter ratifying.
 
-- All 8 iter-N commits are in git history; iter-2b is the semantic state on disk (iter-5/7/8 reverted in-tree).
-- Image `gcr.io/tpu-vm-gke-testing/jax-gpt-dsv3:cde-fc67b5e` (iter-5 build, but iter-2b semantically) → actually current built tag is `cde-24fa4f0` (iter-8 build, post-revert it's worth a fresh build before any future iter).
-- `cde history` has `i7` and `i8` annotated REVERTED with reasons; `i2b` annotated PRODUCTION BASELINE.
+## What happened per iter
 
-## Open issues blocking next iters
+### iter-17 — EVICTED (ImagePullBackOff)
 
-- `ultrons/jax-gpt#2` — attn_proj_out offload NaN
-- `ultrons/jax-gpt#3` — prevent_cse=True NaN
-- `ultrons/perfsim#25` — Norms predicted regressed post-PR#22
-- `ultrons/perfsim#26` — bucketer doesn't match gmm_v2 fusion names
-- `ultrons/perfsim#44` — `perfsim search` yields 0 results (autoperf-blocking for Lateral search-driven slot)
+Submit 01:14, evicted 02:14 via PodsReady timeout. Root cause: autoperf/ files in docker build context caused tag drift between submit and rebuild. **Inline fix** (`1629109`): `.dockerignore` excludes `autoperf/` + `cde.yaml`. Durable harness improvement — same root cause bit iter-16's first attempt on 2026-05-11.
 
-## Recommended next-human-action
+### iter-17b — EVICTED (preempted)
 
-The `regression_chain` halt is informative — it's signaling that **single-iter Greedy/Lateral levers on iter-2b are exhausted**. The remaining viable directions are all multi-iter:
+Retry as iter-17b on `cde-41b3703`. Admitted 03:18 (55 min queue), ran 4 valid steps then preempted by `mk-q30b-0508` workload at 03:30. Step results captured:
 
-1. **Wait for jax-gpt#2 + #3 maintainer fix.** Both NaN issues likely share root cause; one fix may unblock the 4,216 ms attention-recompute headroom. After fix, iter-N can re-attempt `attn_proj_out` offload and/or `prevent_cse=True` cleanly.
-2. **Multi-iter scope: attention-only-checkpoint refactor.** Restructure `_moe_layer_body` so `jax.checkpoint` wraps only the attention part. MoE residuals saved in HBM (~14-26 GB extra HBM at peak; depending on residual selection). Risk: HBM compile-time OOM (94.75 GB conservative limit). Informative either way; would constitute an iter-9-or-later when initiated.
-3. **Multi-iter scope: custom Pallas tgmm with `vmem_limit_bytes`.** Iter-5 found megablox.tgmm has hardcoded 32 MB scoped VMEM and doesn't accept `vmem_limit_bytes` param. A custom in-tree wrapper that does could re-open the candidate-C tile-tuning lever (with proper microbench data this time, not heuristic shots).
-4. **Wait for `perfsim search` fix (perfsim#44).** Once search yields valid configs, future Lateral iters can draw from search's top-K as AGENT.md §3 step-2 envisions, instead of heuristic-table picks.
+| step | seconds | TPS/chip | MFU |
+|---|---|---|---|
+| 2 | 33.528 | 1955 | 31.6% |
+| 3 | 33.733 | 1943 | 31.4% |
+| 4 | 33.571 | 1952 | 31.6% |
 
-For the immediate next session: probably best to **NOT** start a new Greedy/Lateral on this baseline. The chain says we're at a local optimum given the current toolchain. Pick from the multi-iter list above with explicit user authorization, or wait for upstream fixes.
+Avg 33,611 ms / **1949 TPS/chip**. Confirms iter-16 direction (+3.6% vs iter-2b; +1.7% over iter-16's own 34,203 ms). Loss matches iter-2b exactly. NOT ratcheted to baseline per AGENT.md §5b — eviction = partial data.
 
-## Session-cumulative artifacts
+### iter-18 — REVERTED (nan_at_step1, NEW NaN class)
 
-- 3 jax-gpt issues filed (#2, #3) + 3 perfsim issues filed in earlier iters (#25, #26, #44, plus iter-3's #38 Dockerfile)
-- 4 `research/dsv3/` analysis docs (iter-4 bisection, iter-6 checkpoint bisection, etc.)
-- AGENT.md updates: continuous-loop mode, NaN-issue-filing protocol, AOT-LIBTPU_INIT_ARGS rule, halt-re-poll, cde reap+annotate
-- `v7x_KNOWLEDGE.md` §3+§5 substantively expanded with iter-3 microbench, iter-5 tgmm finding, iter-7 attn_proj_out broken, iter-8 prevent_cse broken
-- All committed and pushed to `autoperf/dsv3_train_full` branch
+Greedy stack of SAVE list to 4 names (`attn_proj_out + q_a + kv_a + shared_hidden`). Drafted via Primitive B during iter-17b wait. Compile clean (234s), step 1 loss=nan. Reverted (`e3ee729`). Filed **`ultrons/jax-gpt#4`** with full repro + untried-alternative-paths enumeration. Distinct from jax-gpt#2/#3 (OFFLOAD path) — this is the SAVE path failing on names beyond `attn_proj_out`.
 
-The session was fruitful for **knowledge** (we now know exactly where headroom lives and which levers are blocked) but barren for **measured perf gain on iter-2b**. iter-2b stands as the production baseline.
+### iter-19 — EVICTED (PodsReadyTimeout + cluster image-pull issues)
 
----
+User authorized Option A (bisect, smallest-first single-name): tried `kv_a` alone. Image built and pushed 04:13. Queued in Kueue for 12 hours (cluster contended). Admitted 16:17, evicted 16:47 — pods never reached Ready (cluster-wide `FailedToRetrieveImagePullSecret` warnings affecting multiple non-autoperf workloads at the same time). No measurement.
 
-## Post-halt extension (2026-05-08, user-authorized continuation)
+## Demonstration findings — insights that emerged
 
-After this HALT was committed, user explicitly authorized continuing iteration with broader permissions. The right move per advisor framing was a **Tooling deliverable** quantifying the post-fix headroom, not another single-iter Greedy gamble.
+### 1. Per-iter variance is ~1.7%, not ±0.3%
 
-### iter-9 (Tooling) — predicted post-fix headroom
+The ratchet noise band in AUTONOMOUS_RUN.md was set at ±0.3%. iter-16 measured 34,203 ms; iter-17b (identical config, just repeat) measured 33,611 ms — a 1.7% delta. **Insight**: single-iter measurements can't reliably distinguish gains smaller than ~2%. Future ratchet criterion should be ±1.5% over ≥2 clean repeats. Logged in `lever_queue.md` synthesis log.
 
-Quantified what fixing jax-gpt#2 + #3 would unlock by combining iter-6's recompute-component breakdown with `perfsim.simulator.run` cross-check at `remat_policy=full` vs `attn_only`.
+### 2. SAVE-list expansion has a NaN failure mode
 
-**Headline**: realistic upside from fixing the offload-restore pipeline is **+1.5 to +2.0 sec/step (~+4.5 to +6.0% TPS)** — comparable in magnitude to iter-2's gmm_v2 swap (+6.6%) but not transformative. iter-6's framing of ~+15% from "4,216 ms attention recompute" was over-optimistic; only ~20% of that bucket is recoverable due to overlap with MoE forward.
+iter-16 established that SAVE (HBM) is distinct from OFFLOAD (host) — different code path, different known failures. iter-18 disproved the implicit assumption that SAVE is safe-by-default. The SAVE path also has failure modes that show up only on combination expansion — likely interaction with the broader `_ckpt_policy` recompute logic when multiple names are persisted. Filed jax-gpt#4 with bisect plan.
 
-Perfsim canonical:
-- `remat=full` predicts 34,525 ms/step (matches measured 34,650 within 0.4%)
-- `remat=attn_only` predicts 33,049 ms/step (Δ −1,476 ms = +4.5% TPS)
+### 3. Cluster preemption is a hidden cost at medium priority
 
-Output: `research/dsv3/iter9_predicted_post_fix_headroom.md`
+3 of 4 cluster shots evicted this session. Higher-priority workloads (`mk-q30b-0508`, `cloud-t-ubji2w`, `olmo3-s1-2192`) compete for slices. Even when admitted (iter-17b), preemption mid-run cost ~half the measurement (step 5 profile capture cut). **Implication**: contended-cluster sessions need eviction-survival design — frequent step-time logging, partial-data acceptance, possibly priority-class bump for time-sensitive ratchet runs.
 
-### Inline perfsim fixes — PR ultrons/perfsim#45
+### 4. Build context discipline is load-bearing
 
-Two scoped fixes per AGENT.md §5 default-fix-inline:
+The `autoperf/` directory being in docker build context caused 2 ImagePullBackOff failures across the session (iter-16's first try, iter-17). Each cost ~30 min wall. The systematic fix (`.dockerignore` exclusion) prevents recurrence forever and is exactly the kind of inline tool-friction fix AGENT.md §1 calls out as "tools mature with iteration".
 
-- **#38 fix** (`098c6b5`): Dockerfile.tpu installs `google-cloud-cli` via Cloud SDK apt repo + gnupg keyring. Unblocks pod-side GCS upload that's been silently no-op'ing since iter-3.
-- **#26 fix** (`d3ec087`): `LEAF_SHAPE_QUERY_TRAINING` schema gains tuple-of-substrings fallback for shape-query. New Expert_gmm entry `("ragged-dot", "gmm_v2-")` matches both pre/post-iter-2 xplanes. Tests pass; iter-2b xplane verified "no shape mismatches" post-fix.
+## Three autonomous primitives — how they performed
 
-Both PR'd against `ultrons/perfsim:main` from `autoperf-loop`; awaiting reviewer-agent + human merge.
+### Primitive A — Synthesis-every-3-iters
 
-## Updated next-iter recommendation (post-extension)
+**Status**: Did not fire formally (session halted at iter-18 + iter-19 before reaching iter count for synthesis). Hypotheses surfaced informally in `lever_queue.md` synthesis log (variance noise band, ratchet criterion update). For next session: synthesis should trigger off the iter-18 NaN halt, not just iter count.
 
-The iter-9 sizing reframes the "fix #2 + #3" priority: it unlocks ~+5% TPS, real but bounded. Other potentially-bigger options (multi-iter scope) need explicit user authorization:
+### Primitive B — Parallel iter pipelining
 
-1. **Wait for jax-gpt#2 + #3 maintainer fix** — unblocks ~+5% TPS once the offload-restore pipeline is fixed.
-2. **Multi-iter: attention-only-checkpoint refactor** — same predicted ceiling (+4.5% per perfsim) but doesn't depend on #2/#3 fix; needs HBM headroom analysis (model already at 96/101.7 GB).
-3. **Multi-iter: custom Pallas tgmm with `vmem_limit_bytes`** — re-opens iter-5 candidate-C with proper VMEM control. Requires upstream JAX changes OR custom in-tree kernel.
-4. **Wait for `perfsim#44` fix** — unblocks search-driven Lateral picks.
+**Status**: Worked. iter-18 was fully drafted in `lever_queue.md` during iter-17b's queue wait. Saved ~10 min wall when iter-17b completed and the agent immediately applied the patch + submitted. Single-stream cluster execution + parallel agent design is the right balance for medium-priority contended clusters.
 
-For overnight progress without user check-in: the Tooling deliverable + perfsim PR is what was achievable. Further single-iter Greedy/Lateral on iter-2b would gamble against the now-quantified small ceiling and risk further reverts.
+### Primitive C — Self-authorization within risk envelope
 
----
+**Status**: Worked, and **HALT_FOR_AUTH protocol triggered correctly** on iter-18's new NaN class. Agent did NOT continue blindly bisecting; halted and surfaced 4 options. User selected Option A, agent resumed. This is the primitive working as designed — autonomous within envelope, halts on novel failure class.
 
-## iter-10 (post-iter-9-revision) — empirical ceiling confirmation
+## State on disk at session close
 
-User asked "what's stopping us from testing perfsim's recommended sharding?". Nothing was — submitted as iter-10. **Plan tested: tp=2 ep=8 cp=8 fsdp=32 dp=1 pp=1 ep_cp_shared=True** (perfsim search rank-3). [ep_cp_shared=True requires ep == cp per perfsim/search.py:342, so cp=8 is mandatory; in jax-gpt this maps to omitting `--no_cp` so cfg.use_cp=True activates CP-on-EP-axis.] **Result: perfsim's prediction was 11× over-optimistic; the rank-3 plan is a -46% TPS regression.**
+- `autoperf/iter_log.md`: iter-17/17b/18 sections + rehydration block (iter-19 not logged because no measurement)
+- `autoperf/lever_queue.md`: iter-18 candidate + iter-17b synthesis findings + iter-19 plan
+- `autoperf/BLOCKED.md`: jax-gpt#4 needs adding (file existed before session; add this iter)
+- `autoperf/v7x_KNOWLEDGE.md`: 3 new operational findings (SAVE-vs-OFFLOAD, cde.yaml build-hash, cluster reset)
+- `jax_gpt/models/dsv3/model.py:3059`: SAVE list at `("attn_proj_out", "kv_a")` from iter-19 commit `37c6b8c`. This is **un-tested live state** — kv_a was never validated on cluster. Next session should either (a) re-submit iter-19 for kv_a bisect, or (b) revert to iter-16's single-name state.
+- `autoperf/AUTONOMOUS_RUN.md`: DELETED at session close.
+- `autoperf/HALT_FOR_AUTH.md`: DELETED (was the iter-18 surface; resolved by user Option A authorization).
+- jax-gpt issues open: #2 (offload attn_proj_out NaN), #3 (prevent_cse NaN), #4 (SAVE-list expansion NaN, NEW this session).
+- perfsim PR open: #49 (iter-16 IMPROVED corpus update, needs review/merge).
 
-| | step time | TPS/chip | MFU | perfsim error |
-|---|---|---|---|---|
-| iter-2b production | 34,650 ms | 1882 | 30.5% | matches within 0.4% |
-| iter-10 rank-3 (cluster) | 64,700 ms | 1013 | 16.4% | **11.2× off** |
-| iter-10 rank-3 (perfsim) | 5,762 ms | 11,277 | 26.8% | (the prediction) |
+## Recommended next user actions
 
-**Implications**:
-1. The "iter-2b is +83% from optimal" hypothesis from iter-9-revised was WRONG. Production IS near a local optimum.
-2. Perfsim search isn't calibrated for non-production-class sharding plans (those involving `ep_cp_shared=True`, `cp>1`, `dp>1`, or `tp>1`). Filed perfsim#47.
-3. Until perfsim is recalibrated, search top-K predictions on alternative-sharding plans should NOT be acted upon as Lateral lever sources.
+1. **Resolve iter-19's un-validated state**: either revert `model.py:3059` back to iter-16's single-name SAVE list, or rerun iter-19 in a fresh session (cluster permitting). Currently the on-disk state has `kv_a` added — if you build + submit without verification, that's the iter-18-class NaN risk.
 
-**Final session score (now updated post-iter-10)**:
-- 4 cluster shots, all reverted (iter-5/7/8/10)
-- 4 issues filed (jax-gpt#2 attn_proj_out NaN, jax-gpt#3 prevent_cse NaN, perfsim#44 search budget, perfsim#47 search calibration miss)
-- 2 perfsim PRs landed (PR#45 closes #26 + #38, PR#46 closes #44)
-- Production state preserved at iter-2b (1882 TPS/chip @ 30.5% MFU)
-- iter-10's most surprising finding: **perfsim search predictions are aspirational, not actionable** until calibrated against non-production-class plans
+2. **Merge perfsim PR#49** to land the iter-16 IMPROVED candidate in the corpus.
 
-The thesis is now empirically grounded: iter-2b is within ~5-8% of the cluster-achievable ceiling on this hardware/model/toolchain. Multi-iter scope changes (custom Pallas tgmm, attention-only-checkpoint refactor) remain the only path to >+5% gains.
+3. **Triage jax-gpt#4** with the bisect plan in the issue body. If a maintainer can identify which name(s) NaN individually, autoperf can pick up the safe ones in a future session.
 
----
+4. **Cluster scheduling improvement (optional)**: the medium-priority preemption pattern bit 3/4 cluster shots this session. Consider either (a) higher priority class for ratchet/critical iters, (b) different cluster context with less contention, or (c) accept the eviction-survival overhead.
 
-## iter-12 — single-iter prior-art levers exhausted; cumulative HALT (post-AGENT.md-revision)
+## Demo verdict — "insights emerge from running experiments"
 
-iter-11 backfilled corpus entries; iter-12 was the **first iter under the
-revised §13** which requires ≥1 diagnosis-derived attempt that produced no
-actionable single-iter lever before cumulative regression_chain halt.
+**Met partially.** 4 insights emerged that single-iter mode would not have surfaced:
+- Per-iter variance is ~1.7% (cross-iter comparison)
+- SAVE list has expansion-mode NaN failure (combination probe)
+- Build-context discipline is load-bearing (failure-pattern repetition)
+- Cluster preemption hidden cost (eviction-rate statistic)
 
-**Method**: Lateral, lever_source=prior-art survey. Subagent surveyed
-public MoE-optimization writeups; primary recommendation (MoE local-reduce
-reorder) was diagnosed inapplicable on direct code reading
-— `model.py:1848` already does the local K-way reduce before `psum_scatter`,
-so the (B*K, D)→(B, D) shrink that pattern describes is already in place.
-Pivot: verify-then-apply combiner-threshold flag (subagent's secondary
-pattern). HLO inspection on iter-2b's xplane (delegated to subagent for
-context safety): two distinct `reduce-scatter` ops at IDs 84/94,
-single-operand each — combiner is **NOT firing**. The flag is a no-op for
-this workload.
+**Did NOT meet**: no NEW perf measurement landed cleanly. iter-2b remains baseline. iter-16's +1.8% candidate remains un-ratcheted. The session's measured value is the insights + harness improvements, not a new perf number.
 
-**Result**: no cluster shot. Lever pattern exhausted in single-iter scope.
-
-**§13 conditions for cumulative halt now both satisfied**:
-1. Regressions across ≥2 distinct lever classes:
-   - offload-pipeline (iter-5 tile_m, iter-7 attn_proj_out NaN, iter-8 prevent_cse NaN)
-   - sharding (iter-10 rank-3 -46% TPS)
-2. ≥1 diagnosis-derived attempt: iter-12 (pattern-survey + HLO verification, found inapplicable per advisor).
-
-Cumulative HALT fires.
-
-**Durable iter-12 findings (in v7x_KNOWLEDGE.md §3)**:
-- Chunk pipelining without compute/collective overlap: 2 reduce-scatters at
-  distinct IDs (~6.8 s self-time each, ~13.4 s combined exposed stall, ~2.4%
-  of step). The chunked psum_scatter pattern is correctly NOT being merged by
-  the combiner, but XLA scheduler isn't achieving the intended compute/
-  collective overlap either. ~2.4% TPS sits in this overlap gap.
-
-## Recommended next-human-action (post-iter-12)
-
-Single-iter scope is now provably exhausted on iter-2b under the current
-toolchain. The remaining viable paths all require multi-iter authorization:
-
-1. **Multi-iter: chunk-pipelining/overlap fix** (NEW, fresh from iter-12).
-   Investigate why XLA scheduler isn't overlapping `reduce-scatter.84/94`
-   with compute in the moe gmm_ag region. Approaches: explicit
-   `optimization_barrier` placement, collective-ordering hints,
-   staggered_call wrapper. ~2.4% TPS recoverable. Lowest-cost iter-12
-   follow-up because the bottleneck is now well-characterized.
-
-2. **Multi-iter: attention-only-checkpoint refactor**. Doesn't depend on
-   jax-gpt#2/#3 fixes. Predicted +4.5% per iter-9 perfsim cross-check.
-   HBM headroom analysis required (96 / 101.7 GB at peak).
-
-3. **Multi-iter: custom Pallas tgmm with `vmem_limit_bytes`**. Re-opens
-   iter-5 candidate-C with proper VMEM control.
-
-4. **Wait for jax-gpt#2 + #3 maintainer fix**. Unblocks ~+5% TPS via the
-   offload-restore pipeline once fixed. Also re-opens iter-7's
-   `attn_proj_out` offload as a clean single-iter Lateral.
-
-5. **Wait for perfsim#47 fix**. Recalibrates search top-K for
-   non-production-class plans, re-opening search-driven Lateral picks.
-
-**For overnight progress without user check-in**: the iter-11 corpus
-backfill (PR ultrons/perfsim#48) is the durable deliverable. Further
-single-iter Greedy/Lateral on iter-2b will gamble against the now-
-provable single-iter exhaustion ceiling. Best to halt here and surface
-the multi-iter list for explicit authorization next session.
-
-**Final session score (post-iter-12)**:
-- 6 cluster shots total across the session (iter-2b + iter-5/7/8/10 + iter-3
-  microbench)
-- 4 issues filed (jax-gpt#2 attn_proj_out NaN, jax-gpt#3 prevent_cse NaN,
-  perfsim#44 search budget, perfsim#47 search calibration miss)
-- 3 perfsim PRs landed (#45 closes #26 + #38, #46 closes #44, #48 corpus
-  backfill OPEN)
-- Production state preserved at iter-2b (1882 TPS/chip @ 30.5% MFU)
-- Corpus growth: 1 entry refreshed (v304→production, tolerance 0.10) +
-  1 new (iter-10 rank-3, perfsim#47 regression target)
-- Harness self-improvements: AGENT.md got §1 dual-deliverable framing +
-  Step 12.5 corpus-write rule + §13 lever-class halt softening + Step 14
-  rehydration block + §1 subagent delegation pattern
-
-The thesis is empirically grounded: iter-2b is within ~5-8% of the
-single-iter cluster-achievable ceiling on this hardware/model/toolchain.
-Multi-iter scope changes are the only path to >+5% gains.
+The autonomous primitives functioned correctly — the limiting factor was cluster availability (3 of 4 cluster shots evicted) plus user-authorization gates (correct behavior on novel NaN, but a real wall-clock cost on the Option A delay).
