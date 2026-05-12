@@ -36,10 +36,17 @@ Remaining viable variants:
 ### Single-iter Greedy candidates
 
 - (after iter-17 ratchet) Promote iter-16 to BASELINE, ratchet corpus
-- Audit prior `checkpoint_named` calls in attention path for additional
-  SAVE-list candidates (q_a, kv_a, shared_hidden — comments at
-  model.py:568,575,2676 indicate per-DUS overhead was the rejection
-  reason for OFFLOAD; SAVE has no DUS so may be net positive)
+- **iter-18 candidate** (drafted via Primitive B during iter-17 wait):
+  add q_a + kv_a + shared_hidden to `names_which_can_be_saved` in
+  `_ckpt_policy`. Sizes: 5.6 + 2.1 + 7.4 = 15.1 GB additional HBM
+  across L_moe=58 layers. Combines with iter-16's attn_proj_out (26 GB)
+  for a total ~41 GB SAVE-list footprint. Worst case: compile OOM
+  (fast-fail ~10 min), pivot to smallest first. Best case: +0.5-1.5%
+  additional TPS stacking on iter-16. Patch is a 1-line edit to
+  `model.py:3053` extending the saved tuple from `("attn_proj_out",)`
+  to `("attn_proj_out", "q_a", "kv_a", "shared_hidden")`. The
+  rejection logic at model.py:3047-3051 only applies to OFFLOAD
+  (per-DUS overhead); SAVE has no DUS so the comment doesn't bind.
 
 ### Tooling candidates
 
