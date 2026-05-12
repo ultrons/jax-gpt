@@ -13,3 +13,9 @@ manifests/
 .pytest_cache/
 __pycache__/
 *.pyc
+# autoperf agent state — read by the cde wrapper / harness, not the
+# trainer container. Including these poisons the build hash whenever
+# the agent edits iter_log/lever_queue/BLOCKED/etc. iter-17 failed
+# 2× ImagePullBackOff for this exact reason (2026-05-12).
+autoperf/
+cde.yaml
