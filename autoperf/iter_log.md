@@ -1373,3 +1373,102 @@ iter-2b as baseline and file the noise band finding.
 - BLOCKED rows opened/closed: none new; perfsim#48 closed (merged); perfsim#49 OPEN
 - in-flight cluster runs: none
 - next-iter starting point: iter-17 = repeat cluster shot on same image cde-b950f34 with same flags (no code change). Goal: ratchet confirm. If 2nd measurement within 0.3% of iter-16's 34,200 ms → promote to PRODUCTION BASELINE, update v304 corpus's `measured` block. If outside → file noise band, hold at iter-2b.
+
+---
+
+## iter 17 / 17b — Ratchet of iter-16 (autonomous run, partial)
+
+**Class**: Lateral (ratchet). **Lever source**: AUTONOMOUS_RUN.md scope #1.
+**auth**: auto.
+
+### iter-17 — EVICTED (ImagePullBackOff)
+
+Submitted at 01:14 UTC; image cde-e10f404 (stale hash). Autoperf/
+in build context caused hash drift between iter-17 submit and rebuild.
+Eviction reason: PodsReady timeout (pods couldn't pull image).
+
+**Inline fix** (commit `1629109`): added `autoperf/` and `cde.yaml`
+to `.dockerignore`. Future autoperf/ commits no longer poison build
+hash. **This is a durable harness improvement** — bit iter-16's first
+try AND iter-17.
+
+### iter-17b — EVICTED (preempted mid-step-5)
+
+Image cde-41b3703. Admitted 03:18 (55 min queue wait); pods Ready
+03:19; compile 229s; 4 valid steps captured before kill at 03:30:
+- step 2: 33.528 s, 1955 TPS/chip, MFU 31.6%, loss matches
+- step 3: 33.733 s, 1943 TPS/chip, MFU 31.4%, loss matches
+- step 4: 33.571 s, 1952 TPS/chip, MFU 31.6%, loss matches
+- avg: **33,611 ms / 1949 TPS-chip / 31.5% MFU**
+
+Eviction cause: higher-priority workload `mk-q30b-0508` preempted.
+
+**Confirms iter-16 direction** (+1.7% faster than iter-16, +3.6% vs
+iter-2b). Per-iter variance ~1.7% — wider than the ±0.3% noise band
+documented in AUTONOMOUS_RUN.md (noted for ratchet criterion update).
+
+**Step 12.5**: Conservative — do NOT ratchet corpus baseline yet
+(eviction = partial data, no full profile). Append iter-17b to
+`_iter_history` of perfsim corpus when next clean iter lands.
+
+## iter 18 — REVERTED (nan_at_step1, NEW NaN class)
+
+**Class**: Greedy. **Lever source**: lever_queue iter-18 draft (q_a +
+kv_a + shared_hidden SAVE-list stack). **auth**: auto.
+
+**Patch** (`a7f7fa9`, reverted in `e3ee729`):
+```python
+names_which_can_be_saved=(
+    "attn_proj_out", "q_a", "kv_a", "shared_hidden",
+)
+```
+
+**Cluster result on `dsv3train-i18`**:
+- Compile: 234.3 s (similar to iter-16's 240 s — no OOM, fast)
+- Step 1: 232 s warmup, loss=nan
+- Steps 2-4: 32.5-32.7 s (TPS 2009-2012/chip; ILLUSORY — NaN propagation)
+- Step 5: 99.8 s profile capture, loss=nan throughout
+
+initial_loss=415.491 correct (matches iter-2b/iter-16). NaN appears
+between initial-eval and step-1-output → BWD path corruption.
+
+**Filed `ultrons/jax-gpt#4`** with full repro + untried-alternative-paths
+checklist (kv_a alone, q_a alone, shared_hidden alone, all-three with
+prevent_cse=True, save_only_these_names variant) per AGENT.md §13
+NaN-filing rule + §5c checkpoint-policy enumeration template.
+
+**Why this is a NEW NaN class** (not jax-gpt#2/#3 family):
+- jax-gpt#2: OFFLOAD attn_proj_out → NaN (offload-restore pipe)
+- jax-gpt#3: prevent_cse=True → NaN (likely same offload-restore family)
+- jax-gpt#4: SAVE q_a+kv_a+shared_hidden → NaN (SAVE path, no host roundtrip)
+
+The SAVE code path is structurally different (HBM-resident, no DMA).
+This is novel. Per AUTONOMOUS_RUN.md hard halt #4: **autonomous run
+halts here for user decision** — HALT_FOR_AUTH.md written with 4
+options for user.
+
+## Session-cumulative score (3 hours in, halted at iter-18)
+
+| metric | count |
+|---|---|
+| iters run | 4 (17, 17b, 18, + iter-18 revert) |
+| cluster shots | 3 of 8 budget |
+| successful runs | 1 (iter-18 — wrong output, but ran) |
+| evictions | 2 (iter-17, iter-17b) — counter reset after iter-18 succeeded |
+| NaN halts | 1 (iter-18) |
+| issues filed | 1 (jax-gpt#4) |
+| inline harness fixes | 1 (.dockerignore exclude autoperf/+cde.yaml) |
+| perf gain measured | 0 (iter-17b partial confirms iter-16; no clean ratchet yet) |
+| commits pushed | 8 (4be94f3 → e3ee729) |
+
+Cluster_unhealthy counter: 0 (iter-18 broke the eviction streak).
+
+## Rehydrate (compaction-survival contract):
+
+- iter: 18 | sha: e3ee729 (post-revert) | class: Greedy | lever-source: lever_queue draft (Primitive B)
+- outcome: REVERTED nan_at_step1 (NEW NaN class) | metric: n/a (NaN)
+- corpus_anchor: none new (iter-17b partial measurement noted in lever_queue.md synthesis log)
+- trust-state delta: NEW broken lever class — SAVE-list expansion beyond attn_proj_out (jax-gpt#4)
+- BLOCKED rows: jax-gpt#4 OPEN; jax-gpt#2/#3 still open
+- in-flight cluster runs: none (iter-18 reverted)
+- next-iter starting point: **READ `autoperf/HALT_FOR_AUTH.md`** first. Autonomous loop is paused awaiting user decision on 4 options (bisect, pivot to multi-iter #3, clean ratchet of iter-16, end session). When user authorizes one, AUTONOMOUS_RUN.md gets updated and the agent resumes.
