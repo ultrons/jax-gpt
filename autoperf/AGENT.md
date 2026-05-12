@@ -194,6 +194,14 @@ a0. **If this session was auto-compacted (or is fresh after a prior
    Then continue to (a). [Why: auto-compaction strips conversation
    history; the rehydration block is the durable handoff per Step 14.]
 
+a0b. **Check for `autoperf/AUTONOMOUS_RUN.md`**. If present and not
+   yet expired (time budget, cluster budget per §8b), the session
+   runs in autonomous mode — the 3 primitives in §8b are active and
+   the agent does NOT stop at decision boundaries that match the
+   pre-authorized scope in AUTONOMOUS_RUN.md. Read AUTONOMOUS_RUN.md
+   in full before continuing to (a). If the file is absent → default
+   user-paced mode.
+
 a. **Check open BLOCKED rows.** `gh issue view <repo>#<issue> --json state` for
    each `open` row in `autoperf/BLOCKED.md`. Closed → mark `resolved <date>`,
    `git -C ~/autoperf/repos/<repo> pull`, redo the previously-blocked change.
@@ -870,6 +878,48 @@ Per-iteration artifacts:
 
 End-of-session artifacts:
 - `autoperf/HALT.md` (when you halt; explains why + next steps)
+
+---
+
+## 8b. Autonomous-mode session contract (when AUTONOMOUS_RUN.md is present)
+
+If `autoperf/AUTONOMOUS_RUN.md` is present at session start, the agent
+runs in **autonomous mode** with three additional primitives. Read
+AUTONOMOUS_RUN.md FIRST in Step 1 — it overrides the user-paced default
+of "stop at decision boundaries".
+
+**Primitive A — Synthesis-every-3-iters.** Every 3 iters (or after every
+halt-with-revert, whichever first), spawn a `general-purpose` subagent
+to review the last 3-5 iter sections + new issues + new corpus anchors,
+find ONE cross-iter pattern, and suggest ONE specific experiment.
+Output lands at top of `autoperf/lever_queue.md`. Next iter's
+lever-pick draws from this queue first.
+
+**Primitive B — Parallel iter pipelining.** After submitting cluster
+run for iter-N (in background via cde), IMMEDIATELY draft iter-N+1
+candidates from the queue. When iter-N completes, evaluate and either
+apply the draft or pivot. Single cluster job in flight at a time
+(safety); the "parallel" is agent-design vs cluster-execution.
+
+**Primitive C — Self-authorization within risk envelope.** For each
+candidate iter, match against AUTONOMOUS_RUN.md's "Pre-authorized
+scope" → auto-proceed. If unmatched but diagnosis-derived simple
+Greedy/Lateral → call advisor(); proceed if advisor approves. If
+multi-iter scope opening or >5-file change → write
+HALT_FOR_AUTH.md and stop autonomous run.
+
+Log self-authorization in iter_log: `auth=auto`, `auth=advisor-proceed`,
+or `auth=halt-for-user`.
+
+**Hard halts in autonomous mode** (write HALT.md, stop, do NOT continue):
+time budget, cluster shot budget, §13 cumulative HALT, NaN class not
+seen before, cluster_unhealthy, synthesis-concludes-search-exhausted.
+
+**Conclusion**: when the session ends (any halt or budget), delete
+AUTONOMOUS_RUN.md so the next session starts user-paced.
+
+See `~/jax-gpt/autoperf/AUTONOMOUS_RUN.md` for the session-specific
+risk envelope (cluster budget, time budget, pre-authorized scope).
 
 ---
 
