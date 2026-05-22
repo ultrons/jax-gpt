@@ -132,6 +132,14 @@ class ModelConfig:
                                          # points in _expert_mlp_gmm_ag_body (post-AG, post-sort,
                                          # post-ragged_dot×3, post-scatter, pre-psum_scatter).
                                          # Halts in pdb on first NaN. v304 default is OFF.
+    moe_use_kernel_agent_ffn: bool = False  # swap the 3 ragged_dot/gmm_v2 calls inside
+                                         # _expert_mlp_gmm_ag_body for the vendored
+                                         # kernel-agent Pallas expert_ffn_v_outside (D.6 D-tiled
+                                         # for full D=7168). Surrounding AG-dispatch + sort
+                                         # + scatter + psum_scatter unchanged. See
+                                         # jax_gpt/models/dsv3/kernels/kernel_agent/.
+                                         # Incompatible with moe_use_gmm_v2 and moe_fp8_weights.
+                                         # bf16-only; backward via jax.vjp on the kernel.
 
     @property
     def L_moe(self) -> int:
@@ -1687,7 +1695,8 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
                               n_chunks: int = 2, use_sc_scatter: bool = False,
                               use_gmm_v2: bool = False,
                               use_fp8_weights: bool = False,
-                              debug_nans: bool = False):
+                              debug_nans: bool = False,
+                              use_kernel_agent_ffn: bool = False):
     """AG-dispatch MoE body with token chunking for compute/comm overlap.
 
     Chunks the post-AG processing into n_chunks token chunks. Per-chunk
@@ -1787,8 +1796,33 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
             starts_c = jnp.searchsorted(local_eids_c, jnp.arange(E_local))
             group_sizes_c = (ends_c - starts_c).astype(jnp.int32)
 
-            # Phase 3: ragged_dots.
-            if use_gmm_v2:
+            # Phase 3: ragged_dots (or vendored kernel-agent fused FFN).
+            if use_kernel_agent_ffn:
+                # Vendored kernel-agent expert_ffn_v_outside (D.6 D-tiled for full
+                # DSv3 D=7168). Computes gate+up+silu+down in a single Pallas
+                # pallas_call per (bt-tile, expert, d_out-tile) grid step. Returns
+                # f32; cast to wo_f.dtype to match downstream weight-scale + scatter.
+                # See jax_gpt/models/dsv3/kernels/kernel_agent/expert_ffn.py.
+                #
+                # NOTE: kernel does dense per-expert matmul with int-arithmetic mask
+                # (NOT ragged_dot); invalid rows get attributed to expert 0 and are
+                # zeroed downstream by local_ws_c[invalid]=0 — same waste pattern
+                # as the ragged_dot branch.
+                from .kernels.kernel_agent import expert_ffn_v_outside
+                # wi_0_t = (E_local, D, F_full)  — gate proj
+                # wi_1_t = (E_local, D, F_full)  — up   proj
+                # Kernel expects W1 = (E_local, D, 2F_full) with [gate | up] layout.
+                W1_fused = jnp.concatenate([wi_0_t, wi_1_t], axis=2)
+                out_local_c_f32 = expert_ffn_v_outside(
+                    local_x_c.astype(W1_fused.dtype),
+                    local_eids_c,
+                    W1_fused,
+                    wo_f,
+                    bt=128,
+                )
+                out_local_c = out_local_c_f32.astype(wo_f.dtype)
+                _maybe_check_finite("post_kernel_agent_ffn", out_local_c, c, debug_nans)
+            elif use_gmm_v2:
                 # Pallas gmm_v2 with fused gate+up+silu; jax.vjp backward through ragged_dot reference.
                 from .kernels.gmm_v2_train import gmm_v2_train, gmm_v2_fused_silu_train
                 # Fused gate+up+silu: 3 ragged_dots → 2 gmm_v2 calls.
@@ -1871,12 +1905,13 @@ def _expert_mlp_gmm_ag_body(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights,
     return jnp.concatenate(chunks, axis=0)   # (T, D)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
 def _moe_gmm_ag(fx, fi, fw, w0, w1, wout,
                 mesh, K: int, act_spec, ep_axis: str, max_tpe: int,
                 use_sc_scatter: bool = False, use_gmm_v2: bool = False,
                 n_chunks: int = 2, use_fp8_weights: bool = False,
-                debug_nans: bool = False):
+                debug_nans: bool = False,
+                use_kernel_agent_ffn: bool = False):
     """AG-dispatch GMM — AllGather tokens on EP + AllGather F on FSDP."""
     from jax.experimental.shard_map import shard_map
     ep = mesh.shape.get("ep", 1) if mesh else 1
@@ -1899,21 +1934,23 @@ def _moe_gmm_ag(fx, fi, fw, w0, w1, wout,
                                        use_sc_scatter=use_sc_scatter,
                                        use_gmm_v2=use_gmm_v2,
                                        use_fp8_weights=use_fp8_weights,
-                                       debug_nans=debug_nans)
+                                       debug_nans=debug_nans,
+                                       use_kernel_agent_ffn=use_kernel_agent_ffn)
     return _fn(fx, fi, fw, w0, w1, wout)
 
 
 def _moe_gmm_ag_fwd(fx, fi, fw, w0, w1, wout,
                     mesh, K, act_spec, ep_axis, max_tpe, use_sc_scatter, use_gmm_v2,
-                    n_chunks, use_fp8_weights, debug_nans):
+                    n_chunks, use_fp8_weights, debug_nans, use_kernel_agent_ffn):
     out = _moe_gmm_ag(fx, fi, fw, w0, w1, wout, mesh, K, act_spec, ep_axis,
                       max_tpe, use_sc_scatter, use_gmm_v2, n_chunks, use_fp8_weights,
-                      debug_nans)
+                      debug_nans, use_kernel_agent_ffn)
     return out, (fx, fi, fw, w0, w1, wout)
 
 
 def _moe_gmm_ag_bwd(mesh, K, act_spec, ep_axis, max_tpe, use_sc_scatter, use_gmm_v2,
-                    n_chunks, use_fp8_weights, debug_nans, res, g):
+                    n_chunks, use_fp8_weights, debug_nans, use_kernel_agent_ffn,
+                    res, g):
     from jax.experimental.shard_map import shard_map
     ep = mesh.shape.get("ep", 1) if mesh else 1
     if ep > 1:
@@ -1940,7 +1977,8 @@ def _moe_gmm_ag_bwd(mesh, K, act_spec, ep_axis, max_tpe, use_sc_scatter, use_gmm
                                            use_sc_scatter=use_sc_scatter,
                                            use_gmm_v2=use_gmm_v2,
                                            use_fp8_weights=use_fp8_weights,
-                                           debug_nans=debug_nans)
+                                           debug_nans=debug_nans,
+                                           use_kernel_agent_ffn=use_kernel_agent_ffn)
         return _fn(fx_, fi, fw_, w0_, w1_, wout_)
 
     _, vjp_fn = jax.vjp(_fwd, fx, fw, w0, w1, wout)
@@ -1979,13 +2017,23 @@ def expert_mlp_gmm_ag(x, wi_0, wi_1, wo, top_k_weights, top_k_indices,
     T_local   = B * S // (fsdp_size * max(ep_size, 1))
     max_tpe   = max(1, 2 * T_local * K // cfg.E)
 
+    # Mutually-exclusive FFN-implementation flags.
+    if cfg.moe_use_kernel_agent_ffn:
+        if cfg.moe_use_gmm_v2:
+            raise ValueError("moe_use_kernel_agent_ffn is incompatible with moe_use_gmm_v2 "
+                             "(both choose the FFN implementation inside the chunk body)")
+        if cfg.moe_fp8_weights:
+            raise ValueError("moe_use_kernel_agent_ffn is incompatible with moe_fp8_weights "
+                             "(vendored kernel is bf16-only at b4b63d1)")
+
     with jax.named_scope("moe_gmm_ag"):
         out = _moe_gmm_ag(flat_x, flat_indices, flat_weights,
                           wi_0, wi_1, wo,
                           cfg.mesh, K, act_spec, "ep", max_tpe,
                           cfg.moe_use_sc_scatter, cfg.moe_use_gmm_v2,
                           cfg.moe_n_chunks, cfg.moe_fp8_weights,
-                          cfg.moe_debug_nans)
+                          cfg.moe_debug_nans,
+                          cfg.moe_use_kernel_agent_ffn)
     return out.reshape(B, S, D)
 
 
@@ -3061,7 +3109,7 @@ def forward(params, tokens, cfg: ModelConfig, return_final_x: bool = False):
             # q_a; iter-21 adds shared_hidden. If NaN: drop kv_a, try q_a
             # alone next.
             _ckpt_policy = jax.checkpoint_policies.save_and_offload_only_these_names(
-                names_which_can_be_saved=("attn_proj_out", "kv_a"),
+                names_which_can_be_saved=("attn_proj_out",),
                 names_which_can_be_offloaded=("moe_layer_input",),
                 offload_src="device",
                 offload_dst="pinned_host",
