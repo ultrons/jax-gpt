@@ -890,12 +890,17 @@ def expert_mlp_jax(x, wi_0, wi_1, wo, top_k_weights, top_k_indices, cfg: ModelCo
 
     if ep_size == 1:
         # EP=1: simple einsum over all E experts.
+        # Weights are stored as (E, D_moe, D) per init_params:2929 — D_moe is
+        # the middle axis, D the last.  The gate/up einsums label wi_0 / wi_1
+        # as "emd" (e=E, m=D_moe, d=D), contracting on `d`.  Down-projection
+        # wo is also (E, D_moe, D); contraction on `m` matches its middle
+        # axis directly so its einsum is unchanged.
         E = cfg.E
         dispatch = jnp.zeros((B * S, E), dtype=x.dtype)
         token_idx = jnp.arange(B * S)[:, None]
         dispatch = dispatch.at[token_idx, flat_indices].add(flat_weights)
-        gate_all = jax.nn.silu(jnp.einsum("td,edm->tem", flat_x, wi_0))
-        up_all   = jnp.einsum("td,edm->tem", flat_x, wi_1)
+        gate_all = jax.nn.silu(jnp.einsum("td,emd->tem", flat_x, wi_0))
+        up_all   = jnp.einsum("td,emd->tem", flat_x, wi_1)
         out_all  = jnp.einsum("tem,emd->ted", gate_all * up_all, wo)
         return jnp.einsum("ted,te->td", out_all, dispatch).reshape(B, S, D)
 
@@ -2293,9 +2298,14 @@ def _ragged_dot_no_mesh(flat_x, wi_0, wi_1, wo, flat_indices, flat_weights, K, E
         ends        = jnp.searchsorted(sorted_exp_ids, jnp.arange(1, E + 1))
         starts      = jnp.searchsorted(sorted_exp_ids, jnp.arange(E))
         group_sizes = (ends - starts).astype(jnp.int32)
+        # ragged_dot expects rhs of shape (G, K, N).  Weights are stored
+        # (E, D_moe, D); for gate/up the contracting dim is D (last axis),
+        # so swap the last two axes.  wo's contracting dim is D_moe (middle
+        # axis) which already matches ragged_dot's expectation.
         gate = jax.nn.silu(jax.lax.ragged_dot(
-            sorted_x.astype(wi_0.dtype), wi_0, group_sizes))
-        up   = jax.lax.ragged_dot(sorted_x.astype(wi_1.dtype), wi_1, group_sizes)
+            sorted_x.astype(wi_0.dtype), wi_0.swapaxes(-1, -2), group_sizes))
+        up   = jax.lax.ragged_dot(
+            sorted_x.astype(wi_1.dtype), wi_1.swapaxes(-1, -2), group_sizes)
         out_sorted = jax.lax.ragged_dot(
             (gate * up).astype(wo.dtype), wo, group_sizes)
         out_sorted = out_sorted * sorted_weights[:, None].astype(out_sorted.dtype)
