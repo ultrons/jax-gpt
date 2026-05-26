@@ -1,0 +1,162 @@
+# DSv3 Fused EP-MoE — Residual Policy (per SPEC v0.4 §5.2)
+#
+# Per-residual decision: SAVE-HBM / RECOMPUTE / OFFLOAD-HOST.
+# - SAVE-HBM: forward writes to HBM, bwd reads. Only allowed for residuals ≤ threshold_mb.
+# - RECOMPUTE: forward drops; bwd recomputes from saved routing + inputs.
+# - OFFLOAD-HOST: forward DMAs to host RAM via PCIe; bwd prefetches back. Opt-in only.
+#
+# Sizes are per-device at SPEC v0.4 production sharding (EP=4, FSDP=128, BS=2048,
+# seq=4096 → T_local=65536, E_local=64, F_shard=16, max_tpe=16384).
+#
+# Schema reference: distilled/patterns/residual-policy.md §8
+# Override mechanism: agent reads this file at build time; user edits to override
+# defaults without modifying the SPEC.
+---
+defaults:
+  threshold_mb: 32      # SPEC §5.2 binding rule: residuals > 32 MB default RECOMPUTE.
+
+residuals:
+
+  # ---------------------------------------------------------------------------
+  # Large activation residuals — RECOMPUTE (default for >32 MB)
+  # ---------------------------------------------------------------------------
+
+  tok_e_buf:
+    shape: "(E_local=64, max_tpe=16384, D=7168) bf16"
+    size_mb: 15032               # ~15 GB per device
+    mode: RECOMPUTE
+    recompute_mechanism: "§4.0a re-A2A using saved routing residuals (sorted_token_ids, send_offsets, all_send_counts). Cost: ~18.75 ms per layer."
+    note: "Saving 15 GB × 64 layers = 960 GB residency — infeasible. PCIe offload would be ~1.25 s. Re-A2A is 60× faster."
+
+  out_e_pre_scale:
+    shape: "(E_local=64, max_tpe=16384, D=7168) bf16"
+    size_mb: 15032
+    mode: RECOMPUTE
+    recompute_mechanism: "§3'.2b: computed block-by-block inside per-expert bwd loop, never materialized full."
+    note: "Used only for d_top_weights per-token computation; per-tile reduction avoids HBM materialization (E3 antipattern)."
+
+  gate_buf:
+    shape_v_inside: "(E_local=64, max_tpe=16384, F_shard=16) bf16 — 32 MB"
+    shape_v_outside: "(E_local=64, max_tpe=16384, F=2048) bf16 — 4 GB"
+    size_mb_v_inside: 32          # exactly at threshold
+    size_mb_v_outside: 4096
+    mode: RECOMPUTE
+    recompute_mechanism: "§3'.0b inside per-expert bwd loop: re-execute gate+up matmul on tok_e."
+    note: "v_inside lands EXACTLY at 32 MB SAVE threshold; kept RECOMPUTE for symmetry with v_outside (4 GB) and zero residency cost. User may override v_inside to SAVE-HBM if profiling shows recompute on critical path."
+
+  up_buf:
+    shape_v_inside: "(E_local=64, max_tpe=16384, F_shard=16) bf16 — 32 MB"
+    shape_v_outside: "(E_local=64, max_tpe=16384, F=2048) bf16 — 4 GB"
+    size_mb_v_inside: 32
+    size_mb_v_outside: 4096
+    mode: RECOMPUTE
+    recompute_mechanism: "§3'.0b: same matmul produces gate+up; same recompute."
+    note: "Always paired with gate_buf — same policy."
+
+  act_buf:
+    shape_v_inside: "(E_local=64, max_tpe=16384, F_shard=16) bf16 — 32 MB"
+    shape_v_outside: "(E_local=64, max_tpe=16384, F=2048) bf16 — 4 GB"
+    size_mb_v_inside: 32
+    size_mb_v_outside: 4096
+    mode: RECOMPUTE
+    recompute_mechanism: "§3'.0c: act = silu(gate) * up after recomputing gate_buf + up_buf in §3'.0b."
+    note: "Cheap once gate/up are recomputed (single VPU pass)."
+
+  # ---------------------------------------------------------------------------
+  # Small routing residuals — SAVE-HBM (default for ≤32 MB)
+  # ---------------------------------------------------------------------------
+
+  top_weights_renorm:
+    shape: "(T_local=65536, K=8) bf16"
+    size_mb: 1.0
+    mode: SAVE-HBM
+    consumer: "§3.5 fwd per-token scaling; §1'.2 bwd inner-product against d_top_w"
+    note: "Saving the renormalized weights avoids re-running the renormalize divide in bwd."
+
+  top_weights_unnorm_sum:
+    shape: "(T_local=65536, 1) bf16"
+    size_mb: 0.13
+    mode: SAVE-HBM
+    consumer: "§1'.2 bwd: the denominator `s` in d_top_w_unnorm = (d_top_w − ⟨d_top_w, top_w_renorm⟩) / s"
+    note: "Tiny; trivially saved."
+
+  expert_ids:
+    shape: "(T_local=65536, K=8) int32"
+    size_mb: 2.1
+    mode: SAVE-HBM
+    consumer: "§1'.3 scatter d_top_weights to (T_local, E); §4.0a re-A2A target peer derivation"
+    note: "E4: never recompute routing (numerical drift between fwd top-K and bwd top-K)."
+
+  sorted_token_ids:
+    shape: "(T_local·K=524288,) int32"
+    size_mb: 2.1
+    mode: SAVE-HBM
+    consumer: "§4.0a re-A2A; fwd 4.3 inverse-sort target; bwd 2'.3 unsort"
+    note: "E4."
+
+  sort_idx:
+    shape: "(T_local·K=524288,) int32"
+    size_mb: 2.1
+    mode: SAVE-HBM
+    consumer: "Invertible sort permutation; bwd uses argsort(sort_idx) to derive inverse_sort_idx if needed"
+    note: "E4."
+
+  expert_offsets:
+    shape: "(E_local+1=65,) int32"
+    size_kb: 0.26
+    mode: SAVE-HBM
+    consumer: "Per-expert slicing in §3'.0a, §3'.1 bwd extracts"
+    note: "Trivial."
+
+  send_offsets:
+    shape: "(E+1=257,) int32"
+    size_kb: 1.03
+    mode: SAVE-HBM
+    consumer: "A2A peer slicing in §4.0a re-A2A"
+    note: "Trivial."
+
+  send_counts:
+    shape: "(E=256,) int32"
+    size_kb: 1.0
+    mode: SAVE-HBM
+    consumer: "Pre-stage to all_send_counts; also retained for symmetry"
+    note: "Trivial."
+
+  all_send_counts:
+    # NEW in SPEC v0.4 — added by §3 step 1.8 metadata exchange
+    shape: "(EP=4, E=256) int32"
+    size_kb: 4.0
+    mode: SAVE-HBM
+    consumer: "§4.0a re-A2A: receiver-side offsets per peer"
+    note: "Result of step 1.8 ICI all-gather. Required because §4.0a re-A2A can't recompute it without re-running step 1.8 (which would need recv_buf already in place — chicken-and-egg)."
+
+# ---------------------------------------------------------------------------
+# Per-variant totals (computed at v0.4 production sharding)
+# ---------------------------------------------------------------------------
+# v_inside  SAVE-HBM total: ~10 MB per device per layer × 64 layers ≈ 640 MB residency
+# v_outside SAVE-HBM total: ~10 MB per device per layer × 64 layers ≈ 640 MB residency
+# (identical since SAVE-HBM residuals are the small routing ones; activation
+# differences are all RECOMPUTE)
+#
+# RECOMPUTE residuals add zero residency (transient during bwd only).
+#
+# OFFLOAD-HOST: NO residual currently chooses this default. The code path must
+# still exist per SPEC §5.2 last paragraph — future targets (e.g. attention KV
+# cache) will use it. See distilled/patterns/pcie-host-offload-dma.md (still
+# [2B-PENDING] as of 2026-05-08).
+
+# ---------------------------------------------------------------------------
+# Override examples (commented; uncomment to apply)
+# ---------------------------------------------------------------------------
+# overrides:
+#   # Profile-driven override: if v_inside gate/up recompute shows up on critical
+#   # path (Phase D xla-shell), switch to SAVE-HBM (32 MB × 64 layers = 2 GB
+#   # residency — fits at v0.4 HBM budget).
+#   gate_buf:
+#     mode_v_inside: SAVE-HBM
+#     reason: "xla-shell llo_analysis dated <YYYY-MM-DD>: §3'.0b recompute > 5% of bwd time"
+#
+#   # Hypothetical OFFLOAD-HOST example for a future residual:
+#   # some_residual_50mb:
+#   #   mode: OFFLOAD-HOST
+#   #   reason: "recompute requires full-D matmul (~20 ms); PCIe offload ~4 ms hidden behind compute"

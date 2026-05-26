@@ -523,6 +523,12 @@ def main():
                              "post-scatter, post-psum_scatter). Logs NaN/Inf/max-abs per "
                              "chunk with ordered=True so the first non-finite tensor is "
                              "easy to find in kubectl logs. Slow due to host-device sync.")
+    parser.add_argument("--moe_use_kernel_agent_ffn", action="store_true",
+                        help="Swap the 3 ragged_dot/gmm_v2 calls inside _expert_mlp_gmm_ag_body "
+                             "for the vendored kernel-agent fused expert FFN (D.7 F-tiled). "
+                             "Surrounding AG-dispatch + sort + scatter + psum_scatter "
+                             "unchanged. bf16-only; incompatible with --moe_use_gmm_v2 "
+                             "and --moe_fp8_weights. See research/dsv3/kernel_agent_integration_notes.md.")
     args = parser.parse_args()
 
     cfg = CONFIGS[args.config]()
@@ -561,6 +567,8 @@ def main():
         cfg.moe_debug_nans = True
         from . import model as _model
         _model._MOE_NO_WEIGHT_AG = True
+    if args.moe_use_kernel_agent_ffn:
+        cfg.moe_use_kernel_agent_ffn = True
 
     shard_cfg = ShardConfig(fsdp=args.fsdp, ep=args.ep, tp=args.tp,
                             explicit_axes=False)  # AG path uses an inline Explicit mesh
